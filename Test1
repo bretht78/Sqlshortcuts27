@@ -1,5 +1,5 @@
 -- =============================================================================
--- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v4
+-- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v5
 -- =============================================================================
 -- Goal: every BEM and WLM market trip built before the Aug 12 config change
 -- becomes an exact copy of its IBE or IWA property trip. That is what the
@@ -13,6 +13,14 @@
 --   PART 6  Validation, with VAM/CDA as a control group.
 --   PART 7  Prod wrapper: backups, pause/resume, chunk order, TIBCO heads-up.
 --   PART 8  Rollback from the log (works even after the archival sweep).
+--
+-- Changed in v5, after the first UAT plan (Part 4):
+--   * Part 4 is rebuilt before every chunk in UAT too (v4 said "build once",
+--     which would copy July 2026 twice when the 2026 chunk runs).
+--   * Part 5 is safe to rerun: 5.0 skips property trips that already have a
+--     market twin, 5.1 logs only trips still live, and 5.4 retires exactly
+--     what 5.1 logged.
+--   * Part 2 records the Oct 8 check that neither table existed beforehand.
 --
 -- Changed in v4, because DAAS_TEAM can't create schemas or sequences in UAT:
 --   * UAT runs in the shared schema DAAS_UAT.DAAS_TEMP_WORK, with no sequences.
@@ -162,11 +170,8 @@ WHERE b.trip_type = 'MARKET'
 CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER CLONE DAAS_PROD.DAAS_CORE.TRIP_MASTER;
 CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL CLONE DAAS_PROD.DAAS_CORE.TRIP_DETAIL;
 
--- Because the schema is shared: CREATE OR REPLACE would have silently replaced
--- anyone's existing TRIP_MASTER or TRIP_DETAIL here. A dropped row created
--- before today means it did; that table can come back within the schema's
--- Time Travel window (rename ours, then UNDROP theirs).
-SHOW TABLES HISTORY LIKE 'TRIP_%' IN SCHEMA DAAS_UAT.DAAS_TEMP_WORK;
+-- Checked Oct 8, before creating them: neither table existed in this schema,
+-- so the CREATE OR REPLACE replaced nothing.
 
 -- What UAT proves: Parts 4-6 are correct on real prod data, every year of it.
 -- What it can't prove: the summary layer, which only rebuilds through the
@@ -211,7 +216,10 @@ SET log_tbl   = $work || '.DAASI_3641_LOG';  -- every chunk's retire/copy rows; 
 -- play covered twice or not at all. An island is in scope only if it holds at
 -- least one market trip built before the cutoff; islands made only of newer
 -- trips stay in the table, flagged in_scope = 0, for the follow-up ticket.
--- UAT: build once. Prod: rebuild at the start of every chunk, chain paused.
+-- Rebuild it before every chunk, in UAT and prod (prod: with the chain
+-- paused). A chunk window can include islands an earlier chunk already fixed
+-- (July 2026 sits inside 2026); Part 5 also skips those, so a stale list
+-- can't copy a trip twice.
 -- =============================================================================
 CREATE OR REPLACE TRANSIENT TABLE IDENTIFIER($work_tbl) AS
 WITH prop AS (
@@ -294,6 +302,9 @@ FROM islands;
 
 -- The plan, by market and island start year. In-scope totals should land
 -- close to pre-check B1 (BEM 329,248 retire / 841,959 copy; WLM 69,913 / 138,584).
+-- WLM lands higher, because islands also take in newer trips that overlap the
+-- old ones; B1 counted only trips built before the cutoff. On the Oct 9 clone:
+-- BEM 329,245 / 841,952; WLM 70,252 / 142,190 (+339 / +3,606).
 -- out_of_scope = newer residue, left for the follow-up ticket.
 SELECT market_cd,
        YEAR(island_start_dt)                       AS island_year,
@@ -327,18 +338,26 @@ SET run_id  = (SELECT TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS'));  --
 DROP TABLE IF EXISTS IDENTIFIER($copy_tbl);  -- so a failed 5.0 can't leave the last chunk's list behind
 CREATE OR REPLACE TRANSIENT TABLE IDENTIFIER($copy_tbl) AS
 SELECT
-       (SELECT MAX(trip_master_id) FROM IDENTIFIER($clone_tm)) + ROW_NUMBER() OVER (ORDER BY trip_master_id) AS new_trip_master_id,  -- UAT
---     TRIP_MASTER_SEQ.NEXTVAL AS new_trip_master_id,                                                                              -- PROD
-       trip_master_id          AS source_trip_master_id,
-       guest_unique_id,
-       market_cd,
-       trip_start_dt,
-       trip_end_dt
-FROM IDENTIFIER($work_tbl)
-WHERE action = 'COPY'
-  AND in_scope = 1
-  AND island_start_dt >= $from_dt
-  AND island_start_dt <  $to_dt;
+       (SELECT MAX(trip_master_id) FROM IDENTIFIER($clone_tm)) + ROW_NUMBER() OVER (ORDER BY w.trip_master_id) AS new_trip_master_id,  -- UAT
+--     TRIP_MASTER_SEQ.NEXTVAL AS new_trip_master_id,                                                                                -- PROD
+       w.trip_master_id        AS source_trip_master_id,
+       w.guest_unique_id,
+       w.market_cd,
+       w.trip_start_dt,
+       w.trip_end_dt
+FROM IDENTIFIER($work_tbl) w
+WHERE w.action = 'COPY'
+  AND w.in_scope = 1
+  AND w.island_start_dt >= $from_dt
+  AND w.island_start_dt <  $to_dt
+  -- skip a property trip that already has a live market twin (stale list or rerun)
+  AND NOT EXISTS (SELECT 1 FROM TRIP_MASTER m
+                  WHERE m.trip_type       = 'MARKET'
+                    AND m.delete_ind      = 'N'
+                    AND m.market_cd       = w.market_cd
+                    AND m.guest_unique_id = w.guest_unique_id
+                    AND m.trip_start_dt   = w.trip_start_dt
+                    AND m.trip_end_dt     = w.trip_end_dt);
 
 -- The log survives every chunk (the work and copy tables are rebuilt each time).
 CREATE TRANSIENT TABLE IF NOT EXISTS IDENTIFIER($log_tbl) (
@@ -365,15 +384,19 @@ SET d_to   = (SELECT TO_VARCHAR(DATEADD(day,  31, MAX(trip_end_dt)), 'YYYY-MM-DD
 
 BEGIN;
 
--- 5.1 Log the chunk first, inside the same transaction as the changes.
+-- 5.1 Log the chunk first, inside the same transaction as the changes. Only
+--     trips still live are logged, so the log lists exactly what 5.4 retires.
 INSERT INTO IDENTIFIER($log_tbl)
 SELECT $run_id, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, $from_dt, $to_dt, 'RETIRE',
-       trip_master_id, NULL, market_cd, trip_start_dt, trip_end_dt
-FROM IDENTIFIER($work_tbl)
-WHERE action = 'RETIRE'
-  AND in_scope = 1
-  AND island_start_dt >= $from_dt
-  AND island_start_dt <  $to_dt;
+       w.trip_master_id, NULL, w.market_cd, w.trip_start_dt, w.trip_end_dt
+FROM IDENTIFIER($work_tbl) w
+WHERE w.action = 'RETIRE'
+  AND w.in_scope = 1
+  AND w.island_start_dt >= $from_dt
+  AND w.island_start_dt <  $to_dt
+  AND EXISTS (SELECT 1 FROM TRIP_MASTER t
+              WHERE t.trip_master_id = w.trip_master_id
+                AND t.delete_ind     = 'N');
 
 INSERT INTO IDENTIFIER($log_tbl)
 SELECT $run_id, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, $from_dt, $to_dt, 'COPY',
@@ -425,9 +448,8 @@ UPDATE TRIP_DETAIL
  WHERE delete_ind = 'N'
    AND business_start_dt BETWEEN $d_from AND $d_to
    AND trip_master_id IN (SELECT trip_master_id
-                          FROM IDENTIFIER($work_tbl)
-                          WHERE action = 'RETIRE' AND in_scope = 1
-                            AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
+                          FROM IDENTIFIER($log_tbl)
+                          WHERE run_id = $run_id AND action = 'RETIRE');
 
 UPDATE TRIP_MASTER
    SET delete_ind   = 'Y',
@@ -438,9 +460,8 @@ UPDATE TRIP_MASTER
  WHERE delete_ind = 'N'
    AND trip_start_dt BETWEEN $d_from AND $d_to
    AND trip_master_id IN (SELECT trip_master_id
-                          FROM IDENTIFIER($work_tbl)
-                          WHERE action = 'RETIRE' AND in_scope = 1
-                            AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
+                          FROM IDENTIFIER($log_tbl)
+                          WHERE run_id = $run_id AND action = 'RETIRE');
 
 COMMIT;
 
