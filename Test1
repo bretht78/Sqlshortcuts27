@@ -1,151 +1,106 @@
 
+
 -- =============================================================================
--- PART 1. DECISION CHECKS
+-- PART 1h. FOUR MORE READ-ONLY CHECKS (prod). They don't block UAT; run them
+-- before the prod pilot. 1g can be skipped: 1b and 1h-1 cover the layers that
+-- matter.
 -- =============================================================================
 
-WITH snap AS (
-    SELECT GREATEST(MAX(created_dttm), MAX(updated_dttm)) AS backup_as_of
-    FROM DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3376_20260812
-),
-before_ AS (
-    SELECT trip_master_id
-    FROM DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3376_20260812
-    WHERE trip_type = 'MARKET' AND market_cd = 'VAM'
-),
-now_ AS (
+-- 1h-1. Do the other downstream layers drop soft-deleted trips, or keep them?
+--       Uses trips the pipeline soft-deleted 2+ days ago, so daily jobs have run.
+--       0 = that layer drops retired trips by itself. Anything else = Part 6.6
+--       must watch that layer, and the archival sweep is what finally clears it.
+WITH deleted AS (
     SELECT trip_master_id
     FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
-    WHERE trip_type = 'MARKET' AND market_cd = 'VAM'
+    WHERE delete_ind = 'Y'
+      AND updated_dttm < DATEADD(day, -2, CURRENT_DATE())
+      AND ((trip_type = 'MARKET'   AND market_cd   IN ('VAM', 'BEM', 'WLM'))
+        OR (trip_type = 'PROPERTY' AND property_cd IN ('CDA', 'IBE', 'IWA')))
 )
-SELECT s.backup_as_of,
-       COUNT_IF(n.trip_master_id IS NULL)                                      AS vam_trips_gone,
-       COUNT_IF(b.trip_master_id IS NULL)                                      AS vam_trips_new,
-       COUNT_IF(b.trip_master_id IS NOT NULL AND n.trip_master_id IS NOT NULL) AS vam_trips_kept
-FROM before_ b
-FULL OUTER JOIN now_ n
-  ON n.trip_master_id = b.trip_master_id
-CROSS JOIN snap s
-GROUP BY s.backup_as_of;
-
-
-WITH gone AS (
-    SELECT b.trip_master_id
-    FROM DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3376_20260812 b
-    LEFT JOIN DAAS_PROD.DAAS_CORE.TRIP_MASTER t
-           ON t.trip_master_id = b.trip_master_id
-    WHERE b.trip_type = 'MARKET'
-      AND b.market_cd = 'VAM'
-      AND t.trip_master_id IS NULL
-)
-SELECT 'TRIP_DETAIL'                    AS downstream_table,
-       COUNT(DISTINCT x.trip_master_id) AS replaced_trips_still_there
-FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL x
-JOIN gone g ON g.trip_master_id = x.trip_master_id
+SELECT 'soft-deleted 2+ days ago' AS layer, COUNT(*) AS trips FROM deleted
 UNION ALL
-SELECT 'TRIP_SUMMARY', COUNT(DISTINCT x.trip_master_id)
-FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY x
-JOIN gone g ON g.trip_master_id = x.trip_master_id
-UNION ALL
-SELECT 'DAILY_ACTIVITY_SUMMARY', COUNT(DISTINCT x.trip_master_id)
+SELECT 'still in DAILY_ACTIVITY_SUMMARY', COUNT(DISTINCT x.trip_master_id)
 FROM DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY x
-JOIN gone g ON g.trip_master_id = x.trip_master_id
+JOIN deleted d ON d.trip_master_id = x.trip_master_id
 UNION ALL
-SELECT 'DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT', COUNT(DISTINCT x.trip_master_id)
+SELECT 'still in DAILY_SUMMARY_DT', COUNT(DISTINCT x.trip_master_id)
+FROM DAAS_PROD.DAAS_CORE.DAILY_SUMMARY_DT x
+JOIN deleted d ON d.trip_master_id = x.trip_master_id
+UNION ALL
+SELECT 'still in DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT', COUNT(DISTINCT x.trip_master_id)
 FROM DAAS_PROD.DAAS_CORE.DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT x
-JOIN gone g ON g.trip_master_id = x.trip_master_id;
+JOIN deleted d ON d.trip_master_id = x.trip_master_id
+UNION ALL
+SELECT 'still in TIBCO_SMART.TRIP_SUMMARY', COUNT(DISTINCT x.trip_master_id)
+FROM DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY x
+JOIN deleted d ON d.trip_master_id = x.trip_master_id;
 
 
--- 1c. The platform's own rebuild queue. First, see its columns:
-SELECT * FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE LIMIT 5;
-
---     Then: what was queued around Aug 12, labeled by market from the Aug 12 backup.
---     (If CREATED_DTTM isn't a column, use whichever timestamp the peek shows.)
---       VAM only    -> BEM/WLM were never queued; the native path deserves a pilot.
---       BEM/WLM too -> they were queued and still not split; use the copy fix.
-SELECT DATE_TRUNC('hour', q.created_dttm)                      AS queued_hour,
-       b.trip_type,
-       IFF(b.trip_type = 'MARKET', b.market_cd, b.property_cd) AS trip_owner,
-       COUNT(*)                                                AS queued_rows
-FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE q
-LEFT JOIN DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3376_20260812 b
-       ON b.trip_master_id = q.trip_master_id
-WHERE q.created_dttm >= '2026-08-11'
-  AND q.created_dttm <  '2026-08-14'
-GROUP BY ALL
-ORDER BY 1, 4 DESC;
+-- 1h-2. How long soft-deleted trips survive before the archival task sweeps them.
+--       oldest_delete is roughly the sweep horizon, and so the window in which
+--       a rollback can simply flip DELETE_IND back (Part 8 handles both cases).
+SELECT trip_type,
+       COUNT(*)          AS soft_deleted_now,
+       MIN(updated_dttm) AS oldest_delete,
+       MAX(updated_dttm) AS newest_delete
+FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+WHERE delete_ind = 'Y'
+  AND ((trip_type = 'MARKET'   AND market_cd   IN ('VAM', 'BEM', 'WLM'))
+    OR (trip_type = 'PROPERTY' AND property_cd IN ('CDA', 'IBE', 'IWA')))
+GROUP BY 1;
 
 
-SHOW TASKS LIKE 'INSERT_TRIP_RECALC_QUEUE' IN SCHEMA DAAS_PROD.DAAS_ADHOC;
-SELECT "definition" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
-
-SELECT procedure_name,
-       procedure_definition ILIKE '%trip_config%'          AS reads_trip_config,
-       procedure_definition ILIKE '%recalc_queue%'         AS reads_recalc_queue,
-       procedure_definition ILIKE '%delete from%'          AS hard_deletes,
-       procedure_definition ILIKE '%delete_ind%'           AS uses_delete_ind,
-       procedure_definition ILIKE '%trip_identifier_proc%' AS calls_trip_identifier,
-       LENGTH(procedure_definition)                        AS source_chars
-FROM SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES
-WHERE procedure_catalog = 'DAAS_PROD'
-  AND deleted IS NULL
-  AND procedure_name IN ('TRIP_RECALCULATION_PROC', 'TRIP_CONFIG_UPDATE_PROC');
-
-
-SELECT tm.property_cd,
-       YEAR(tm.trip_start_dt)                                   AS start_year,
-       IFF(h.trip_master_id IS NULL, 'no hotel', 'hotel')       AS stay,
-       COUNT(*)                                                 AS over_cap_trips,
-       MAX(DATEDIFF(day, tm.trip_start_dt, tm.trip_end_dt) + 1) AS longest_days
+-- 1h-3. The 6 deleted trips TIBCO SMART still had in 1f. If every deleted_at is
+--       after the most recent 7:00 AM PT, it's just SMART's once-a-day refresh.
+SELECT tm.trip_master_id,
+       tm.trip_type,
+       IFF(tm.trip_type = 'MARKET', tm.market_cd, tm.property_cd) AS trip_owner,
+       tm.updated_dttm                                            AS deleted_at
 FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER tm
-LEFT JOIN (
-    SELECT DISTINCT trip_master_id
-    FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL
-    WHERE transaction_type = 'HOTEL'
-      AND delete_ind = 'N'
-      AND property_cd IN ('IBE', 'IWA')
-) h ON h.trip_master_id = tm.trip_master_id
-WHERE tm.trip_type = 'PROPERTY'
-  AND tm.delete_ind = 'N'
-  AND tm.property_cd IN ('IBE', 'IWA')
-  AND DATEDIFF(day, tm.trip_start_dt, tm.trip_end_dt) + 1
-      > DECODE(tm.property_cd, 'IBE', 1, 'IWA', 3)
-GROUP BY ALL
-ORDER BY 1, 2, 3;
-
-
-SELECT COUNT(DISTINCT tm.trip_master_id)  AS deleted_trips,
-       COUNT(DISTINCT t18.trip_master_id) AS still_in_tibco_18mo,
-       COUNT(DISTINCT dws.trip_master_id) AS still_in_tibco_dws,
-       COUNT(DISTINCT sm.trip_master_id)  AS still_in_tibco_smart
-FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER tm
-LEFT JOIN DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY_18MO t18
-       ON t18.trip_master_id = tm.trip_master_id
-LEFT JOIN DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY dws
-       ON dws.trip_master_id = tm.trip_master_id
-LEFT JOIN DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY sm
-       ON sm.trip_master_id = tm.trip_master_id
+JOIN DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY sm
+  ON sm.trip_master_id = tm.trip_master_id
 WHERE tm.delete_ind = 'Y'
   AND ((tm.trip_type = 'MARKET'   AND tm.market_cd   IN ('VAM', 'BEM', 'WLM'))
-    OR (tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('CDA', 'IBE', 'IWA')));
+    OR (tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('CDA', 'IBE', 'IWA')))
+ORDER BY deleted_at DESC;
 
 
-SELECT table_schema, table_name, row_count
-FROM TABLE(RESULT_SCAN('<paste C1 query ID here>'))
-WHERE trip_columns ILIKE '%TRIP_MASTER_ID%'
-  AND table_type = 'BASE TABLE'
-  AND table_catalog = 'DAAS_PROD'
-  AND table_schema <> 'DAAS_BACKUP'
-ORDER BY row_count DESC;
+-- 1h-4. Optional, for the RCA: did the merge step rebuild VAM on Aug 12?
+--       Counts VAM trips from the 9:38 AM Aug 12 backup that entered
+--       TRIP_MERGE_PROCESSED after that backup. Near 739,194 = the merge step
+--       did it. Near 0 = ask FJOHNSON1 (who built the Aug 12 replay list).
+WITH merged_since_backup AS (
+    SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE.TRIP_MERGE_PROCESSED
+    MINUS
+    SELECT trip_master_id FROM DAAS_PROD.DAAS_BACKUP.TRIP_MERGE_PROCESSED_DAASI_3376_20260812
+)
+SELECT COUNT(*) AS vam_trips_merged_since_backup
+FROM merged_since_backup m
+JOIN DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3376_20260812 b
+  ON b.trip_master_id = m.trip_master_id
+WHERE b.trip_type = 'MARKET'
+  AND b.market_cd = 'VAM';
 
 
 -- =============================================================================
--- PART 2. 
+-- PART 2. UAT SETUP
+-- DAAS_UAT is in the same Snowflake account as DAAS_PROD (C3 shows both), so
+-- zero-copy clones work: nothing is physically copied, and storage is charged
+-- only for what the test changes. This isolated schema never touches UAT's own
+-- pipeline tables.
 -- =============================================================================
 CREATE SCHEMA IF NOT EXISTS DAAS_UAT.DAASI_3641;
 CREATE OR REPLACE TABLE    DAAS_UAT.DAASI_3641.TRIP_MASTER     CLONE DAAS_PROD.DAAS_CORE.TRIP_MASTER;
 CREATE OR REPLACE TABLE    DAAS_UAT.DAASI_3641.TRIP_DETAIL     CLONE DAAS_PROD.DAAS_CORE.TRIP_DETAIL;
 CREATE OR REPLACE SEQUENCE DAAS_UAT.DAASI_3641.TRIP_MASTER_SEQ CLONE DAAS_PROD.DAAS_CORE.TRIP_MASTER_SEQ;
 CREATE OR REPLACE SEQUENCE DAAS_UAT.DAASI_3641.TRIP_DETAIL_SEQ CLONE DAAS_PROD.DAAS_CORE.TRIP_DETAIL_SEQ;
+-- If a sequence clone is refused, create the sequence instead, with START set
+-- above the clone's MAX(trip_master_id) or MAX(trip_detail_id).
+--
+-- What UAT proves: Parts 4-6 are correct on real prod data, every year of it.
+-- What it can't prove: the summary layer, which only rebuilds through the
+-- hourly chain. That proof comes from the one-month prod pilot (Part 7).
 
 
 -- =============================================================================
@@ -161,14 +116,22 @@ SET work = 'DAAS_UAT.DAASI_3641';
 
 SET cutoff    = '2026-08-12 11:16:26';       -- the config update; trips built before it are in scope
 SET tag       = 'DAASI-3641';                -- CREATED_BY / UPDATED_BY on every row the fix writes
-SET fix_batch = 3641;                        -- BATCH_ID on every row the fix writes
-SET work_tbl  = $work || '.DAASI_3641_WORK'; -- both sides of the regrouping
-SET copy_tbl  = $work || '.DAASI_3641_COPY'; -- property trips to copy, with their new IDs
+SET fix_batch = -3641;                       -- BATCH_ID on every row the fix writes (synthetic on purpose)
+SET work_tbl  = $work || '.DAASI_3641_WORK'; -- both sides of the regrouping, rebuilt per chunk
+SET copy_tbl  = $work || '.DAASI_3641_COPY'; -- this chunk's property trips to copy, with new IDs
+SET log_tbl   = $work || '.DAASI_3641_LOG';  -- every chunk's retire/copy rows; keep until sign-off
 
 
 -- =============================================================================
 -- PART 4. WORK LIST
---
+--   RETIRE = market trips with no identical property trip.
+--   COPY   = property trips with no identical market trip.
+-- Overlapping trips of one guest form an "island", and an island is always
+-- fixed whole, in the chunk that holds its start date, so no run can leave
+-- play covered twice or not at all. An island is in scope only if it holds at
+-- least one market trip built before the cutoff; islands made only of newer
+-- trips stay in the table, flagged in_scope = 0, for the follow-up ticket.
+-- UAT: build once. Prod: rebuild at the start of every chunk, chain paused.
 -- =============================================================================
 CREATE OR REPLACE TRANSIENT TABLE IDENTIFIER($work_tbl) AS
 WITH prop AS (
@@ -237,12 +200,6 @@ islands AS (
                                  ORDER BY trip_start_dt, trip_end_dt, trip_master_id
                                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS island_no
     FROM starts s
-),
-scoped AS (
-    SELECT i.*,
-           MAX(is_seed) OVER (PARTITION BY guest_unique_id, market_cd, island_no) AS island_in_scope,
-           YEAR(MIN(trip_start_dt) OVER (PARTITION BY guest_unique_id, market_cd, island_no)) AS chunk_year
-    FROM islands i
 )
 SELECT action,
        trip_master_id,      -- RETIRE: the market trip itself.  COPY: the source property trip.
@@ -251,46 +208,90 @@ SELECT action,
        trip_start_dt,
        trip_end_dt,
        island_no,
-       chunk_year
-FROM scoped
-WHERE island_in_scope = 1;
+       MIN(trip_start_dt) OVER (PARTITION BY guest_unique_id, market_cd, island_no) AS island_start_dt,
+       MAX(is_seed)       OVER (PARTITION BY guest_unique_id, market_cd, island_no) AS in_scope
+FROM islands;
 
--- New market trip IDs come from the pipeline's own sequence.
-CREATE OR REPLACE TRANSIENT TABLE IDENTIFIER($copy_tbl) AS
-SELECT TRIP_MASTER_SEQ.NEXTVAL AS new_trip_master_id,
-       trip_master_id          AS source_trip_master_id,
-       guest_unique_id,
-       market_cd,
-       trip_start_dt,
-       trip_end_dt,
-       chunk_year
-FROM IDENTIFIER($work_tbl)
-WHERE action = 'COPY';
-
--- The plan, by market and chunk. Totals should land close to pre-check B1
--- (BEM 329,248 retire / 841,959 copy; WLM 69,913 / 138,584).
+-- The plan, by market and island start year. In-scope totals should land
+-- close to pre-check B1 (BEM 329,248 retire / 841,959 copy; WLM 69,913 / 138,584).
+-- out_of_scope = newer residue, left for the follow-up ticket.
 SELECT market_cd,
-       chunk_year,
-       COUNT_IF(action = 'RETIRE') AS trips_to_retire,
-       COUNT_IF(action = 'COPY')   AS trips_to_copy
+       YEAR(island_start_dt)                       AS island_year,
+       COUNT_IF(in_scope = 1 AND action = 'RETIRE') AS trips_to_retire,
+       COUNT_IF(in_scope = 1 AND action = 'COPY')   AS trips_to_copy,
+       COUNT_IF(in_scope = 0)                       AS out_of_scope
 FROM IDENTIFIER($work_tbl)
 GROUP BY ALL
 ORDER BY 1, 2;
 
 
 -- =============================================================================
--- PART 5. RUN ONE CHUNK. Pilot with 2026, then 2025 back to the earliest year.
--- 
+-- PART 5. RUN ONE CHUNK: every in-scope island that starts in [from_dt, to_dt).
+-- Prod pilot: July 2026 (the last full month of pre-cutoff trips). Then whole
+-- years, newest first. Rebuild Part 4 before each chunk; finished islands drop
+-- out of a fresh list, so overlapping windows are harmless.
 -- =============================================================================
-SET chunk  = 2026;
+SET from_dt = '2026-07-01';
+SET to_dt   = '2026-08-01';
+-- Next: '2026-01-01' / '2027-01-01', then '2025-01-01' / '2026-01-01', and so on.
+SET run_id  = (SELECT TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS'));  -- names this run in the log
+
+-- 5.0 This chunk's copy list. New IDs come from the pipeline's own sequence,
+--     drawn only for this chunk.
+CREATE OR REPLACE TRANSIENT TABLE IDENTIFIER($copy_tbl) AS
+SELECT TRIP_MASTER_SEQ.NEXTVAL AS new_trip_master_id,
+       trip_master_id          AS source_trip_master_id,
+       guest_unique_id,
+       market_cd,
+       trip_start_dt,
+       trip_end_dt
+FROM IDENTIFIER($work_tbl)
+WHERE action = 'COPY'
+  AND in_scope = 1
+  AND island_start_dt >= $from_dt
+  AND island_start_dt <  $to_dt;
+
+-- The log survives every chunk (the work and copy tables are rebuilt each time).
+CREATE TRANSIENT TABLE IF NOT EXISTS IDENTIFIER($log_tbl) (
+    run_id             VARCHAR(20),
+    logged_at          TIMESTAMP_NTZ,
+    from_dt            DATE,
+    to_dt              DATE,
+    action             VARCHAR(10),
+    trip_master_id     NUMBER(38,0),  -- RETIRE: the old market trip.  COPY: the source property trip.
+    new_trip_master_id NUMBER(38,0),  -- COPY only: the new market trip
+    market_cd          VARCHAR(100),
+    trip_start_dt      DATE,
+    trip_end_dt        DATE
+);
+
+-- A date window around the chunk, only so Snowflake can skip unrelated storage
+-- (both tables are clustered by date). Check 6.4 proves nothing was missed.
 SET d_from = (SELECT TO_VARCHAR(DATEADD(day, -31, MIN(trip_start_dt)), 'YYYY-MM-DD')
-              FROM IDENTIFIER($work_tbl) WHERE chunk_year = $chunk);
+              FROM IDENTIFIER($work_tbl)
+              WHERE in_scope = 1 AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
 SET d_to   = (SELECT TO_VARCHAR(DATEADD(day,  31, MAX(trip_end_dt)), 'YYYY-MM-DD')
-              FROM IDENTIFIER($work_tbl) WHERE chunk_year = $chunk);
+              FROM IDENTIFIER($work_tbl)
+              WHERE in_scope = 1 AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
 
 BEGIN;
 
--- 5.1 New market trips: exact copies of this chunk's property trips.
+-- 5.1 Log the chunk first, inside the same transaction as the changes.
+INSERT INTO IDENTIFIER($log_tbl)
+SELECT $run_id, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, $from_dt, $to_dt, 'RETIRE',
+       trip_master_id, NULL, market_cd, trip_start_dt, trip_end_dt
+FROM IDENTIFIER($work_tbl)
+WHERE action = 'RETIRE'
+  AND in_scope = 1
+  AND island_start_dt >= $from_dt
+  AND island_start_dt <  $to_dt;
+
+INSERT INTO IDENTIFIER($log_tbl)
+SELECT $run_id, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, $from_dt, $to_dt, 'COPY',
+       source_trip_master_id, new_trip_master_id, market_cd, trip_start_dt, trip_end_dt
+FROM IDENTIFIER($copy_tbl);
+
+-- 5.2 New market trips: exact copies of this chunk's property trips.
 INSERT INTO TRIP_MASTER
        (trip_master_id, guest_unique_id, property_cd, market_cd, trip_type,
         trip_start_dt, trip_end_dt, delete_ind,
@@ -300,10 +301,9 @@ SELECT c.new_trip_master_id, c.guest_unique_id, 'N/A', c.market_cd, 'MARKET',
        c.trip_start_dt, c.trip_end_dt, 'N',
        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, $tag, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, $tag,
        $fix_batch, NULL, 'I'
-FROM IDENTIFIER($copy_tbl) c
-WHERE c.chunk_year = $chunk;
+FROM IDENTIFIER($copy_tbl) c;
 
--- 5.2 Their detail rows: every live detail row on the source property trip,
+-- 5.3 Their detail rows: every live detail row on the source property trip,
 --     all transaction types (B2), pointed at the new market trip.
 INSERT INTO TRIP_DETAIL
        (trip_detail_id, trip_master_id, transaction_table_sk, transaction_table,
@@ -319,12 +319,11 @@ SELECT TRIP_DETAIL_SEQ.NEXTVAL, c.new_trip_master_id, d.transaction_table_sk, d.
 FROM IDENTIFIER($copy_tbl) c
 JOIN TRIP_DETAIL d
   ON d.trip_master_id = c.source_trip_master_id
-WHERE c.chunk_year = $chunk
-  AND d.delete_ind = 'N'
+WHERE d.delete_ind = 'N'
   AND d.business_start_dt BETWEEN $d_from AND $d_to;
 
--- 5.3 Retire the old market trips: detail rows first, then the trips,
---     with the same order and markings the pipeline uses (D5).
+-- 5.4 Retire the old market trips: detail rows first, then the trips,
+--     with the same markings the pipeline uses (D5).
 UPDATE TRIP_DETAIL
    SET delete_ind   = 'Y',
        last_dml_cd  = 'U',
@@ -335,7 +334,8 @@ UPDATE TRIP_DETAIL
    AND business_start_dt BETWEEN $d_from AND $d_to
    AND trip_master_id IN (SELECT trip_master_id
                           FROM IDENTIFIER($work_tbl)
-                          WHERE action = 'RETIRE' AND chunk_year = $chunk);
+                          WHERE action = 'RETIRE' AND in_scope = 1
+                            AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
 
 UPDATE TRIP_MASTER
    SET delete_ind   = 'Y',
@@ -347,29 +347,35 @@ UPDATE TRIP_MASTER
    AND trip_start_dt BETWEEN $d_from AND $d_to
    AND trip_master_id IN (SELECT trip_master_id
                           FROM IDENTIFIER($work_tbl)
-                          WHERE action = 'RETIRE' AND chunk_year = $chunk);
+                          WHERE action = 'RETIRE' AND in_scope = 1
+                            AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
 
 COMMIT;
 
 
 -- =============================================================================
 -- PART 6. VALIDATION: after every chunk, in UAT and in prod.
--- 6.0 comes out zero by construction, so it only proves the plan ran.
--- 6.1-6.5 are the real tests. 6.6 is prod-only, after the next chain run.
+-- VAM/CDA rides along as a control group. VAM was already re-cut in prod on
+-- Aug 12, so whatever these queries report for VAM is what "done" looks like,
+-- including its known residue. Run 6.0, 6.2, 6.3 and 6.5 once BEFORE the first
+-- chunk too (6.1 and 6.4 need a run): that calibrates the pack on a market
+-- that's already fixed, and gives Pete the before-picture for BEM and WLM.
 -- =============================================================================
 
--- 6.0 Twin check by year (pre-check B1's logic). Finished years read 0 / 0.
+-- 6.0 Twin check by start year, trips built before the cutoff.
+--     BEM/WLM in finished windows: market side 0. Property side 0, or the
+--     out_of_scope count from the Part 4 plan. VAM: the control baseline.
 WITH prop AS (
     SELECT DISTINCT guest_unique_id,
-           DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd,
+           DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM', 'CDA', 'VAM') AS market_cd,
            trip_start_dt, trip_end_dt
     FROM TRIP_MASTER
-    WHERE trip_type = 'PROPERTY' AND delete_ind = 'N' AND property_cd IN ('IBE', 'IWA')
+    WHERE trip_type = 'PROPERTY' AND delete_ind = 'N' AND property_cd IN ('IBE', 'IWA', 'CDA')
 ),
 mkt AS (
     SELECT DISTINCT guest_unique_id, market_cd, trip_start_dt, trip_end_dt
     FROM TRIP_MASTER
-    WHERE trip_type = 'MARKET' AND delete_ind = 'N' AND market_cd IN ('BEM', 'WLM')
+    WHERE trip_type = 'MARKET' AND delete_ind = 'N' AND market_cd IN ('BEM', 'WLM', 'VAM')
 )
 SELECT market_cd,
        start_year,
@@ -378,18 +384,18 @@ SELECT market_cd,
 FROM (
     SELECT m.market_cd, YEAR(m.trip_start_dt) AS start_year, 1 AS market_no_twin, 0 AS property_no_twin
     FROM TRIP_MASTER m
-    WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND m.market_cd IN ('BEM', 'WLM')
+    WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND m.market_cd IN ('BEM', 'WLM', 'VAM')
       AND m.created_dttm < $cutoff
       AND NOT EXISTS (SELECT 1 FROM prop p
                       WHERE p.market_cd = m.market_cd AND p.guest_unique_id = m.guest_unique_id
                         AND p.trip_start_dt = m.trip_start_dt AND p.trip_end_dt = m.trip_end_dt)
     UNION ALL
-    SELECT DECODE(p.property_cd, 'IBE', 'BEM', 'IWA', 'WLM'), YEAR(p.trip_start_dt), 0, 1
+    SELECT DECODE(p.property_cd, 'IBE', 'BEM', 'IWA', 'WLM', 'CDA', 'VAM'), YEAR(p.trip_start_dt), 0, 1
     FROM TRIP_MASTER p
-    WHERE p.trip_type = 'PROPERTY' AND p.delete_ind = 'N' AND p.property_cd IN ('IBE', 'IWA')
+    WHERE p.trip_type = 'PROPERTY' AND p.delete_ind = 'N' AND p.property_cd IN ('IBE', 'IWA', 'CDA')
       AND p.created_dttm < $cutoff
       AND NOT EXISTS (SELECT 1 FROM mkt m
-                      WHERE m.market_cd = DECODE(p.property_cd, 'IBE', 'BEM', 'IWA', 'WLM')
+                      WHERE m.market_cd = DECODE(p.property_cd, 'IBE', 'BEM', 'IWA', 'WLM', 'CDA', 'VAM')
                         AND m.guest_unique_id = p.guest_unique_id
                         AND m.trip_start_dt = p.trip_start_dt AND m.trip_end_dt = p.trip_end_dt)
 )
@@ -397,49 +403,42 @@ GROUP BY 1, 2
 ORDER BY 1, 2;
 
 
--- 6.1 Did the chunk do exactly what the plan said? planned = done on every row.
-SELECT 'retired' AS step,
-       w.market_cd,
-       COUNT(*)                                              AS planned,
-       COUNT_IF(t.delete_ind = 'Y' AND t.updated_by = $tag)  AS done
-FROM IDENTIFIER($work_tbl) w
-JOIN TRIP_MASTER t ON t.trip_master_id = w.trip_master_id
-WHERE w.action = 'RETIRE' AND w.chunk_year = $chunk
-GROUP BY 1, 2
-UNION ALL
-SELECT 'copied',
-       c.market_cd,
-       COUNT(*),
-       COUNT(t.trip_master_id)
-FROM IDENTIFIER($copy_tbl) c
-LEFT JOIN TRIP_MASTER t ON t.trip_master_id = c.new_trip_master_id
-WHERE c.chunk_year = $chunk
+-- 6.1 Did this run do exactly what it logged? planned = done on every row.
+SELECT l.action,
+       l.market_cd,
+       COUNT(*) AS planned,
+       COUNT_IF(   (l.action = 'RETIRE' AND t.delete_ind = 'Y' AND t.updated_by = $tag)
+                OR (l.action = 'COPY'   AND t.delete_ind = 'N' AND t.created_by = $tag)) AS done
+FROM IDENTIFIER($log_tbl) l
+LEFT JOIN TRIP_MASTER t
+       ON t.trip_master_id = IFF(l.action = 'RETIRE', l.trip_master_id, l.new_trip_master_id)
+WHERE l.run_id = $run_id
 GROUP BY 1, 2
 ORDER BY 1, 2;
 
 
--- 6.2 Nothing lost, nothing doubled: every IBE/IWA rating should sit on as many
---     live market trips as live property trips.
---     Must stay 0: on_no_market_trip and on_market_trip_only.
---     trip_count_differs should shrink with each chunk, down to the small
---     post-Aug-12 residue (its own ticket). Baseline doubles: IBE 1,935, IWA 1,346.
+-- 6.2 Nothing lost, nothing doubled: each rating should sit on as many live
+--     market trips as live property trips.
+--     Must stay 0: on_no_market_trip, on_market_trip_only.
+--     trip_count_differs shrinks with each chunk toward the newer residue.
+--     Baseline doubles (B3): IBE 1,935, IWA 1,346. CDA = control.
 WITH prop_r AS (
     SELECT tm.property_cd,
            td.transaction_table_sk,
            COUNT(DISTINCT tm.trip_master_id) AS property_trips
     FROM TRIP_MASTER tm
     JOIN TRIP_DETAIL td ON td.trip_master_id = tm.trip_master_id
-    WHERE tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('IBE', 'IWA')
+    WHERE tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('IBE', 'IWA', 'CDA')
       AND tm.delete_ind = 'N' AND td.delete_ind = 'N' AND td.transaction_type = 'RATINGS'
     GROUP BY 1, 2
 ),
 mkt_r AS (
     SELECT td.transaction_table_sk,
-           MIN(DECODE(tm.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')) AS property_cd,
-           COUNT(DISTINCT tm.trip_master_id)                     AS market_trips
+           MIN(DECODE(tm.market_cd, 'BEM', 'IBE', 'WLM', 'IWA', 'VAM', 'CDA')) AS property_cd,
+           COUNT(DISTINCT tm.trip_master_id)                                   AS market_trips
     FROM TRIP_MASTER tm
     JOIN TRIP_DETAIL td ON td.trip_master_id = tm.trip_master_id
-    WHERE tm.trip_type = 'MARKET' AND tm.market_cd IN ('BEM', 'WLM')
+    WHERE tm.trip_type = 'MARKET' AND tm.market_cd IN ('BEM', 'WLM', 'VAM')
       AND tm.delete_ind = 'N' AND td.delete_ind = 'N' AND td.transaction_type = 'RATINGS'
     GROUP BY 1
 )
@@ -457,53 +456,56 @@ GROUP BY 1
 ORDER BY 1;
 
 
--- 6.3 Live detail rows by transaction type: BEM should equal IBE, WLM should equal IWA.
---     Before the fix they already differed by a handful (BEM: COMP -3, OFFER -145,
---     POS -44; WLM: HOTEL -1, OFFER -1); those may remain on trips the fix didn't touch.
+-- 6.3 Live detail rows by type: BEM = IBE, WLM = IWA (VAM = CDA as control).
+--     Before the fix they already differed by a handful (BEM: COMP -3,
+--     OFFER -145, POS -44; WLM: HOTEL -1, OFFER -1) on trips the fix may not touch.
 SELECT td.transaction_type,
        COUNT_IF(tm.trip_type = 'MARKET'   AND tm.market_cd   = 'BEM') AS bem,
        COUNT_IF(tm.trip_type = 'PROPERTY' AND tm.property_cd = 'IBE') AS ibe,
        COUNT_IF(tm.trip_type = 'MARKET'   AND tm.market_cd   = 'WLM') AS wlm,
-       COUNT_IF(tm.trip_type = 'PROPERTY' AND tm.property_cd = 'IWA') AS iwa
+       COUNT_IF(tm.trip_type = 'PROPERTY' AND tm.property_cd = 'IWA') AS iwa,
+       COUNT_IF(tm.trip_type = 'MARKET'   AND tm.market_cd   = 'VAM') AS vam,
+       COUNT_IF(tm.trip_type = 'PROPERTY' AND tm.property_cd = 'CDA') AS cda
 FROM TRIP_MASTER tm
 JOIN TRIP_DETAIL td ON td.trip_master_id = tm.trip_master_id
 WHERE tm.delete_ind = 'N'
   AND td.delete_ind = 'N'
-  AND ((tm.trip_type = 'MARKET'   AND tm.market_cd   IN ('BEM', 'WLM'))
-    OR (tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('IBE', 'IWA')))
+  AND ((tm.trip_type = 'MARKET'   AND tm.market_cd   IN ('BEM', 'WLM', 'VAM'))
+    OR (tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('IBE', 'IWA', 'CDA')))
 GROUP BY 1
 ORDER BY 1;
 
 
--- 6.4 Completeness of this chunk. The first number must be 0; the other two must match.
+-- 6.4 Completeness of this run. The first number must be 0; the other two must match.
 SELECT 'live details left on retired trips' AS check_name,
        COUNT(*)                             AS n
 FROM TRIP_DETAIL d
-JOIN IDENTIFIER($work_tbl) w ON w.trip_master_id = d.trip_master_id
-WHERE w.action = 'RETIRE' AND w.chunk_year = $chunk AND d.delete_ind = 'N'
+JOIN IDENTIFIER($log_tbl) l ON l.trip_master_id = d.trip_master_id
+WHERE l.run_id = $run_id AND l.action = 'RETIRE' AND d.delete_ind = 'N'
 UNION ALL
 SELECT 'live details on the source property trips', COUNT(*)
 FROM TRIP_DETAIL d
-JOIN IDENTIFIER($copy_tbl) c ON c.source_trip_master_id = d.trip_master_id
-WHERE c.chunk_year = $chunk AND d.delete_ind = 'N'
+JOIN IDENTIFIER($log_tbl) l ON l.trip_master_id = d.trip_master_id
+WHERE l.run_id = $run_id AND l.action = 'COPY' AND d.delete_ind = 'N'
 UNION ALL
 SELECT 'live details on the new market trips', COUNT(*)
 FROM TRIP_DETAIL d
-JOIN IDENTIFIER($copy_tbl) c ON c.new_trip_master_id = d.trip_master_id
-WHERE c.chunk_year = $chunk AND d.delete_ind = 'N';
+JOIN IDENTIFIER($log_tbl) l ON l.new_trip_master_id = d.trip_master_id
+WHERE l.run_id = $run_id AND l.action = 'COPY' AND d.delete_ind = 'N';
 
 
--- 6.5 Trips longer than the cap with no hotel stay: market should equal property.
---     The market mirrors the property, so any property exceptions from 1e carry over.
+-- 6.5 Tracy's check in the core tables: trips longer than the cap with no hotel
+--     stay. Every row should read 0. Pre-check 1e found no such IBE/IWA trips,
+--     so any BEM/WLM count here is a trip the fix hasn't reached yet.
 SELECT IFF(tm.trip_type = 'MARKET', tm.market_cd, tm.property_cd) AS trip_owner,
        COUNT(*)                                                    AS over_cap_without_hotel
 FROM TRIP_MASTER tm
 WHERE tm.delete_ind = 'N'
-  AND ((tm.trip_type = 'MARKET'   AND tm.market_cd   IN ('BEM', 'WLM'))
-    OR (tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('IBE', 'IWA')))
+  AND ((tm.trip_type = 'MARKET'   AND tm.market_cd   IN ('BEM', 'WLM', 'VAM'))
+    OR (tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('IBE', 'IWA', 'CDA')))
   AND DATEDIFF(day, tm.trip_start_dt, tm.trip_end_dt) + 1
       > DECODE(IFF(tm.trip_type = 'MARKET', tm.market_cd, tm.property_cd),
-               'BEM', 1, 'IBE', 1, 'WLM', 3, 'IWA', 3)
+               'BEM', 1, 'IBE', 1, 'WLM', 3, 'IWA', 3, 'VAM', 2, 'CDA', 2)
   AND NOT EXISTS (SELECT 1 FROM TRIP_DETAIL d
                   WHERE d.trip_master_id = tm.trip_master_id
                     AND d.transaction_type = 'HOTEL'
@@ -512,39 +514,76 @@ GROUP BY 1
 ORDER BY 1;
 
 
--- 6.6 PROD ONLY, after the next hourly chain run has finished. All three should be 0.
-SELECT 'retired trips still in TRIP_SUMMARY_DT' AS check_name,
-       COUNT(DISTINCT dt.trip_master_id)        AS n
-FROM IDENTIFIER($work_tbl) w
-JOIN DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT dt ON dt.trip_master_id = w.trip_master_id
-WHERE w.action = 'RETIRE' AND w.chunk_year = $chunk
+-- 6.6 PROD ONLY, after the next hourly chain run has finished. Every row 0.
+--     Run the TIBCO SMART row again after the next 7:00 AM PT refresh.
+--     DAS and the trip-number metric: 0 if 1h-1 showed those layers drop
+--     soft-deleted trips; otherwise they clear at the archival sweep.
+WITH run AS (
+    SELECT action, trip_master_id, new_trip_master_id
+    FROM IDENTIFIER($log_tbl)
+    WHERE run_id = $run_id
+)
+SELECT 'retired, still in TRIP_SUMMARY_DT' AS check_name, COUNT(DISTINCT x.trip_master_id) AS n
+FROM run r JOIN DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT x ON x.trip_master_id = r.trip_master_id
+WHERE r.action = 'RETIRE'
 UNION ALL
-SELECT 'retired trips still in TRIP_SUMMARY_VW', COUNT(DISTINCT v.trip_master_id)
-FROM IDENTIFIER($work_tbl) w
-JOIN DAAS_PROD.DAAS_CORE_MARKETING_VW.TRIP_SUMMARY_VW v ON v.trip_master_id = w.trip_master_id
-WHERE w.action = 'RETIRE' AND w.chunk_year = $chunk
+SELECT 'retired, still in TRIP_SUMMARY_VW', COUNT(DISTINCT x.trip_master_id)
+FROM run r JOIN DAAS_PROD.DAAS_CORE_MARKETING_VW.TRIP_SUMMARY_VW x ON x.trip_master_id = r.trip_master_id
+WHERE r.action = 'RETIRE'
 UNION ALL
-SELECT 'new trips missing from TRIP_SUMMARY', COUNT(*)
-FROM IDENTIFIER($copy_tbl) c
-LEFT JOIN DAAS_PROD.DAAS_CORE.TRIP_SUMMARY s ON s.trip_master_id = c.new_trip_master_id
-WHERE c.chunk_year = $chunk AND s.trip_master_id IS NULL;
---     Then rerun pre-check B4: each finished year's theo gap should now be 0.
---     Then Tracy reruns her max(trip_days) query for that year's dates.
+SELECT 'retired, still in TIBCO DWS TRIP_SUMMARY', COUNT(DISTINCT x.trip_master_id)
+FROM run r JOIN DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY x ON x.trip_master_id = r.trip_master_id
+WHERE r.action = 'RETIRE'
+UNION ALL
+SELECT 'retired, still in TIBCO TRIP_SUMMARY_18MO', COUNT(DISTINCT x.trip_master_id)
+FROM run r JOIN DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY_18MO x ON x.trip_master_id = r.trip_master_id
+WHERE r.action = 'RETIRE'
+UNION ALL
+SELECT 'retired, still in TIBCO SMART (after 7 AM)', COUNT(DISTINCT x.trip_master_id)
+FROM run r JOIN DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY x ON x.trip_master_id = r.trip_master_id
+WHERE r.action = 'RETIRE'
+UNION ALL
+SELECT 'retired, still in DAILY_ACTIVITY_SUMMARY', COUNT(DISTINCT x.trip_master_id)
+FROM run r JOIN DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY x ON x.trip_master_id = r.trip_master_id
+WHERE r.action = 'RETIRE'
+UNION ALL
+SELECT 'retired, still in TRIP_NUM_GAP metric', COUNT(DISTINCT x.trip_master_id)
+FROM run r JOIN DAAS_PROD.DAAS_CORE.DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT x ON x.trip_master_id = r.trip_master_id
+WHERE r.action = 'RETIRE'
+UNION ALL
+SELECT 'new, missing from TRIP_SUMMARY_DT', COUNT(*)
+FROM run r
+WHERE r.action = 'COPY'
+  AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT x
+                  WHERE x.trip_master_id = r.new_trip_master_id)
+UNION ALL
+-- Not 0 = the chain changed some new trips (its merge step, or late play on recent
+-- dates). Look at those trips before running the next chunk.
+SELECT 'new, changed by the chain since insert', COUNT(*)
+FROM run r
+JOIN TRIP_MASTER t ON t.trip_master_id = r.new_trip_master_id
+WHERE r.action = 'COPY'
+  AND (t.delete_ind <> 'N' OR COALESCE(t.updated_by, '') <> $tag);
+--     Then rerun pre-check B4: the theo gap for the chunk's years should be 0.
+--     Then Tracy reruns her max(trip_days) query for those trip dates.
 
 
 -- =============================================================================
 -- PART 7. PROD WRAPPER (after UAT sign-off and Pete's approval)
 --
 -- Before the first chunk:
+--   * Part 1h done.
 --   * Give TIBCO's owners a heads-up. DAAS_TIBCO_PAT_USER_PROD reads
 --     TRIP_SUMMARY_18MO about 690K times a week, and BEM/WLM trip IDs from the
 --     last 18 months will change.
---   * Run 7a (backups).
+--   * Run 7a (backups). Keep them, and the log table, until Tracy signs off:
+--     once the archival task sweeps retired rows, they are the only way back.
 --
--- For each chunk, starting with 2026:
---   7b pause -> Part 3 (prod lines) -> Part 4 (fresh list, chain paused)
---   -> Part 5 -> 6.0-6.5 -> 7c resume -> after the next run finishes: 6.6
---   -> Tracy checks that year in her view -> next year.
+-- For each chunk (pilot July 2026, then 2026, 2025, ... back to 2017):
+--   7b pause -> Part 3 (prod lines) -> Part 4 (fresh list) -> Part 5
+--   -> 6.0-6.5 -> 7c resume -> after the next run finishes: 6.6
+--   -> Tracy checks those dates in her view -> next chunk.
+-- Start right after a :15 run finishes, so the pause costs at most one run.
 -- =============================================================================
 
 -- 7a. Backups: the nine tables the team backed up for DAASI-3376, plus the
@@ -561,7 +600,8 @@ CREATE TABLE DAAS_PROD.DAAS_BACKUP.TRIP_RECALC_QUEUE_DAASI_3641_YYYYMMDD      CL
 CREATE TABLE DAAS_PROD.DAAS_BACKUP.TRIP_RECALC_PROCESSED_DAASI_3641_YYYYMMDD  CLONE DAAS_PROD.DAAS_CORE.TRIP_RECALC_PROCESSED;
 CREATE TABLE DAAS_PROD.DAAS_BACKUP.TRIP_NUM_GAP_MKTENT_DAASI_3641_YYYYMMDD    CLONE DAAS_PROD.DAAS_CORE.DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT;
 
--- 7b. Pause the hourly chain. TRIP_ROOT_TASK is its root, so every child waits too.
+-- 7b. Pause the hourly chain. TRIP_ROOT_TASK roots every trip task, including
+--     the merge, recalculation and archival steps, so they all wait.
 ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK SUSPEND;
 
 --     Wait until this returns no rows (nothing in the chain still running).
@@ -577,33 +617,59 @@ ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
 
 
 -- =============================================================================
--- PART 8. ROLLBACK BY TAG
--- Touches only rows the fix wrote, so it is safe even after the chain has run.
--- Before any chain run, restoring the 7a clones is the blunter alternative.
+-- PART 8. ROLLBACK FROM THE LOG
+-- Works whether or not the archival task has swept the retired rows yet:
+-- rows still in place are flipped back; swept rows come back from the 7a clones.
 -- Run with the chain paused (7b), then resume (7c).
+-- Undoes everything in the log by default. To undo a single chunk, add
+-- "AND run_id = '<run>'" to each of the six log subqueries below.
 -- =============================================================================
+SET tm_backup = 'DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3641_YYYYMMDD';
+SET td_backup = 'DAAS_PROD.DAAS_BACKUP.TRIP_DETAIL_DAASI_3641_YYYYMMDD';
+
 BEGIN;
 
--- Remove what the fix added.
+-- 8.1 Take back the new market trips and their detail rows.
 UPDATE TRIP_DETAIL
    SET delete_ind = 'Y', last_dml_cd = 'U',
        updated_dttm = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, updated_by = $tag || '-ROLLBACK'
- WHERE created_by = $tag AND delete_ind = 'N';
+ WHERE delete_ind = 'N'
+   AND trip_master_id IN (SELECT new_trip_master_id FROM IDENTIFIER($log_tbl) WHERE action = 'COPY');
 
 UPDATE TRIP_MASTER
    SET delete_ind = 'Y', last_dml_cd = 'U',
        updated_dttm = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, updated_by = $tag || '-ROLLBACK'
- WHERE created_by = $tag AND delete_ind = 'N';
+ WHERE delete_ind = 'N'
+   AND trip_master_id IN (SELECT new_trip_master_id FROM IDENTIFIER($log_tbl) WHERE action = 'COPY');
 
--- Bring back what the fix retired.
+-- 8.2 Bring back retired trips that are still in place.
 UPDATE TRIP_DETAIL
    SET delete_ind = 'N', last_dml_cd = 'U',
        updated_dttm = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, updated_by = $tag || '-ROLLBACK'
- WHERE updated_by = $tag AND COALESCE(created_by, '') <> $tag AND delete_ind = 'Y';
+ WHERE delete_ind = 'Y'
+   AND updated_by = $tag
+   AND trip_master_id IN (SELECT trip_master_id FROM IDENTIFIER($log_tbl) WHERE action = 'RETIRE');
 
 UPDATE TRIP_MASTER
    SET delete_ind = 'N', last_dml_cd = 'U',
        updated_dttm = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, updated_by = $tag || '-ROLLBACK'
- WHERE updated_by = $tag AND COALESCE(created_by, '') <> $tag AND delete_ind = 'Y';
+ WHERE delete_ind = 'Y'
+   AND updated_by = $tag
+   AND trip_master_id IN (SELECT trip_master_id FROM IDENTIFIER($log_tbl) WHERE action = 'RETIRE');
+
+-- 8.3 Re-insert retired trips the archival task already swept, from the clones.
+INSERT INTO TRIP_MASTER
+SELECT c.*
+FROM IDENTIFIER($tm_backup) c
+WHERE c.trip_master_id IN (SELECT trip_master_id FROM IDENTIFIER($log_tbl) WHERE action = 'RETIRE')
+  AND NOT EXISTS (SELECT 1 FROM TRIP_MASTER t WHERE t.trip_master_id = c.trip_master_id);
+
+INSERT INTO TRIP_DETAIL
+SELECT c.*
+FROM IDENTIFIER($td_backup) c
+WHERE c.delete_ind = 'N'
+  AND c.trip_master_id IN (SELECT trip_master_id FROM IDENTIFIER($log_tbl) WHERE action = 'RETIRE')
+  AND NOT EXISTS (SELECT 1 FROM TRIP_DETAIL t WHERE t.trip_detail_id = c.trip_detail_id);
 
 COMMIT;
+-- Afterwards: rerun 6.0 and B4. Both should match their pre-fix baselines again.
