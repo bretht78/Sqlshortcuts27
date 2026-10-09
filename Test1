@@ -1,5 +1,5 @@
 -- =============================================================================
--- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v5
+-- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v6
 -- =============================================================================
 -- Goal: every BEM and WLM market trip built before the Aug 12 config change
 -- becomes an exact copy of its IBE or IWA property trip. That is what the
@@ -13,6 +13,12 @@
 --   PART 6  Validation, with VAM/CDA as a control group.
 --   PART 7  Prod wrapper: backups, pause/resume, chunk order, TIBCO heads-up.
 --   PART 8  Rollback from the log (works even after the archival sweep).
+--
+-- Changed in v6, after the first UAT attempt at Part 5:
+--   * d_from/d_to renamed scan_from/scan_to: the old names read like typos of
+--     from_dt/to_dt, which are a different, narrower window.
+--   * A check before BEGIN shows the run ID, scan window and copy count, so a
+--     skipped SET stops the run before the transaction starts.
 --
 -- Changed in v5, after the first UAT plan (Part 4):
 --   * Part 4 is rebuilt before every chunk in UAT too (v4 said "build once",
@@ -373,14 +379,22 @@ CREATE TRANSIENT TABLE IF NOT EXISTS IDENTIFIER($log_tbl) (
     trip_end_dt        DATE
 );
 
--- A date window around the chunk, only so Snowflake can skip unrelated storage
--- (both tables are clustered by date). Check 6.4 proves nothing was missed.
-SET d_from = (SELECT TO_VARCHAR(DATEADD(day, -31, MIN(trip_start_dt)), 'YYYY-MM-DD')
-              FROM IDENTIFIER($work_tbl)
-              WHERE in_scope = 1 AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
-SET d_to   = (SELECT TO_VARCHAR(DATEADD(day,  31, MAX(trip_end_dt)), 'YYYY-MM-DD')
-              FROM IDENTIFIER($work_tbl)
-              WHERE in_scope = 1 AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
+-- The SCAN window: NOT the chunk window (from_dt/to_dt). It runs from 31 days
+-- before the chunk's earliest trip to 31 days after its latest, because a
+-- July island's trips and detail rows can fall outside July. It exists only
+-- so Snowflake can skip storage outside it (both tables are clustered by
+-- date). Check 6.4 proves nothing was missed.
+SET scan_from = (SELECT TO_VARCHAR(DATEADD(day, -31, MIN(trip_start_dt)), 'YYYY-MM-DD')
+                 FROM IDENTIFIER($work_tbl)
+                 WHERE in_scope = 1 AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
+SET scan_to   = (SELECT TO_VARCHAR(DATEADD(day,  31, MAX(trip_end_dt)), 'YYYY-MM-DD')
+                 FROM IDENTIFIER($work_tbl)
+                 WHERE in_scope = 1 AND island_start_dt >= $from_dt AND island_start_dt < $to_dt);
+
+-- Last check before the transaction: both must show a date. If this errors,
+-- run the two SETs above first; nothing has been changed yet.
+SELECT $run_id AS run_id, $scan_from AS scan_from, $scan_to AS scan_to,
+       (SELECT COUNT(*) FROM IDENTIFIER($copy_tbl)) AS trips_to_copy;
 
 BEGIN;
 
@@ -435,7 +449,7 @@ FROM IDENTIFIER($copy_tbl) c
 JOIN TRIP_DETAIL d
   ON d.trip_master_id = c.source_trip_master_id
 WHERE d.delete_ind = 'N'
-  AND d.business_start_dt BETWEEN $d_from AND $d_to;
+  AND d.business_start_dt BETWEEN $scan_from AND $scan_to;
 
 -- 5.4 Retire the old market trips: detail rows first, then the trips,
 --     with the same markings the pipeline uses (D5).
@@ -446,7 +460,7 @@ UPDATE TRIP_DETAIL
        updated_by   = $tag,
        batch_id     = $fix_batch
  WHERE delete_ind = 'N'
-   AND business_start_dt BETWEEN $d_from AND $d_to
+   AND business_start_dt BETWEEN $scan_from AND $scan_to
    AND trip_master_id IN (SELECT trip_master_id
                           FROM IDENTIFIER($log_tbl)
                           WHERE run_id = $run_id AND action = 'RETIRE');
@@ -458,7 +472,7 @@ UPDATE TRIP_MASTER
        updated_by   = $tag,
        batch_id     = $fix_batch
  WHERE delete_ind = 'N'
-   AND trip_start_dt BETWEEN $d_from AND $d_to
+   AND trip_start_dt BETWEEN $scan_from AND $scan_to
    AND trip_master_id IN (SELECT trip_master_id
                           FROM IDENTIFIER($log_tbl)
                           WHERE run_id = $run_id AND action = 'RETIRE');
