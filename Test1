@@ -1,5 +1,5 @@
 -- =============================================================================
--- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v6
+-- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v7
 -- =============================================================================
 -- Goal: every BEM and WLM market trip built before the Aug 12 config change
 -- becomes an exact copy of its IBE or IWA property trip. That is what the
@@ -13,6 +13,14 @@
 --   PART 6  Validation, with VAM/CDA as a control group.
 --   PART 7  Prod wrapper: backups, pause/resume, chunk order, TIBCO heads-up.
 --   PART 8  Rollback from the log (works even after the archival sweep).
+--
+-- Changed in v7, after a session lost its schema in UAT:
+--   * Part 3 sets $target, the schema TRIP_MASTER and TRIP_DETAIL must come
+--     from. A context check opens Parts 4, 5, 6 and 8 (and sits in the check
+--     before BEGIN): it stops the run if the session is in any other schema,
+--     so a UAT run can never write to prod tables, or the reverse.
+--   * 6.2's comment corrected: its three counts catch loss or doubling and
+--     should stay 0 throughout; market_doubles should equal property_doubles.
 --
 -- Changed in v6, after the first UAT attempt at Part 5:
 --   * d_from/d_to renamed scan_from/scan_to: the old names read like typos of
@@ -193,13 +201,15 @@ USE SCHEMA DAAS_UAT.DAAS_TEMP_WORK;
 SET work     = 'DAAS_UAT.DAAS_TEMP_WORK';
 SET clone_tm = 'DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER';  -- read only by the UAT ID lines in Part 5
 SET clone_td = 'DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL';
+SET target   = 'DAAS_UAT.DAAS_TEMP_WORK';  -- the schema TRIP_MASTER and TRIP_DETAIL must come from
 
--- PROD (use these four lines instead, only after UAT sign-off; see Part 7).
+-- PROD (use these five lines instead, only after UAT sign-off; see Part 7).
 -- The two clone_ settings are the guard: they make a UAT ID line fail in prod.
 -- USE SCHEMA DAAS_PROD.DAAS_CORE;
 -- SET work     = 'DAAS_PROD.DAAS_TEMP_WORK';
 -- SET clone_tm = 'NO_CLONE_IN_PROD_USE_THE_PROD_ID_LINES';
 -- SET clone_td = 'NO_CLONE_IN_PROD_USE_THE_PROD_ID_LINES';
+-- SET target   = 'DAAS_PROD.DAAS_CORE';
 
 -- Both: if any statement between BEGIN and COMMIT fails, roll back the whole
 -- chunk. Snowflake's default would keep the statements that worked.
@@ -211,6 +221,14 @@ SET fix_batch = -3641;                       -- BATCH_ID on every row the fix wr
 SET work_tbl  = $work || '.DAASI_3641_WORK'; -- both sides of the regrouping, rebuilt per chunk
 SET copy_tbl  = $work || '.DAASI_3641_COPY'; -- this chunk's property trips to copy, with new IDs
 SET log_tbl   = $work || '.DAASI_3641_LOG';  -- every chunk's retire/copy rows; keep until sign-off
+
+-- Context check. Parts 4-6 and 8 name TRIP_MASTER and TRIP_DETAIL without a
+-- schema, so they follow whatever schema the session is in. This returns 1,
+-- or stops with an error naming the schema the session is really in. It also
+-- opens Parts 4, 5, 6 and 8; if it ever fails there, rerun Part 3.
+SELECT TO_NUMBER(IFF(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA() = $target, '1',
+         'WRONG SCHEMA ' || COALESCE(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA(), 'NONE')
+         || ', RERUN PART 3')) AS context_ok;
 
 
 -- =============================================================================
@@ -227,6 +245,11 @@ SET log_tbl   = $work || '.DAASI_3641_LOG';  -- every chunk's retire/copy rows; 
 -- (July 2026 sits inside 2026); Part 5 also skips those, so a stale list
 -- can't copy a trip twice.
 -- =============================================================================
+-- Context check (see Part 3): must return 1.
+SELECT TO_NUMBER(IFF(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA() = $target, '1',
+         'WRONG SCHEMA ' || COALESCE(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA(), 'NONE')
+         || ', RERUN PART 3')) AS context_ok;
+
 CREATE OR REPLACE TRANSIENT TABLE IDENTIFIER($work_tbl) AS
 WITH prop AS (
     SELECT trip_master_id,
@@ -331,6 +354,11 @@ ORDER BY 1, 2;
 -- the whole chunk (Part 3 setting); run ROLLBACK to close it, then fix and
 -- start again from Part 4.
 -- =============================================================================
+-- Context check (see Part 3): must return 1.
+SELECT TO_NUMBER(IFF(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA() = $target, '1',
+         'WRONG SCHEMA ' || COALESCE(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA(), 'NONE')
+         || ', RERUN PART 3')) AS context_ok;
+
 SET from_dt = '2026-07-01';
 SET to_dt   = '2026-08-01';
 -- Next: '2026-01-01' / '2027-01-01', then '2025-01-01' / '2026-01-01', and so on.
@@ -394,7 +422,10 @@ SET scan_to   = (SELECT TO_VARCHAR(DATEADD(day,  31, MAX(trip_end_dt)), 'YYYY-MM
 -- Last check before the transaction: both must show a date. If this errors,
 -- run the two SETs above first; nothing has been changed yet.
 SELECT $run_id AS run_id, $scan_from AS scan_from, $scan_to AS scan_to,
-       (SELECT COUNT(*) FROM IDENTIFIER($copy_tbl)) AS trips_to_copy;
+       (SELECT COUNT(*) FROM IDENTIFIER($copy_tbl)) AS trips_to_copy,
+       TO_NUMBER(IFF(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA() = $target, '1',
+         'WRONG SCHEMA ' || COALESCE(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA(), 'NONE')
+         || ', RERUN PART 3')) AS context_ok;
 
 BEGIN;
 
@@ -491,6 +522,10 @@ COMMIT;
 -- then SET run_id = '<value>' using:
 --   SELECT DISTINCT run_id, from_dt, to_dt FROM IDENTIFIER($log_tbl) ORDER BY 1;
 -- =============================================================================
+-- Context check (see Part 3): must return 1, or 6.0-6.5 would check the wrong tables.
+SELECT TO_NUMBER(IFF(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA() = $target, '1',
+         'WRONG SCHEMA ' || COALESCE(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA(), 'NONE')
+         || ', RERUN PART 3')) AS context_ok;
 
 -- 6.0 Twin check by start year, trips built before the cutoff.
 --     BEM/WLM in finished windows: market side 0. Property side 0, or the
@@ -551,9 +586,11 @@ ORDER BY 1, 2;
 
 -- 6.2 Nothing lost, nothing doubled: each rating should sit on as many live
 --     market trips as live property trips.
---     Must stay 0: on_no_market_trip, on_market_trip_only.
---     trip_count_differs shrinks with each chunk toward the newer residue.
---     Baseline doubles (B3): IBE 1,935, IWA 1,346. CDA = control.
+--     Must stay 0: on_no_market_trip, on_market_trip_only, trip_count_differs.
+--     These catch loss or doubling, not wrong trip lengths (6.0 and 6.5 do).
+--     market_doubles should equal property_doubles: the market mirrors the
+--     property side's own duplicates (UAT July 2026: CDA 3,842, IBE 1,935,
+--     IWA 1,346 on both sides). CDA = control.
 WITH prop_r AS (
     SELECT tm.property_cd,
            td.transaction_table_sk,
@@ -766,6 +803,11 @@ ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
 -- Undoes everything in the log by default. To undo a single chunk, add
 -- "AND run_id = '<run>'" to each of the six log subqueries below.
 -- =============================================================================
+-- Context check (see Part 3): must return 1.
+SELECT TO_NUMBER(IFF(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA() = $target, '1',
+         'WRONG SCHEMA ' || COALESCE(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA(), 'NONE')
+         || ', RERUN PART 3')) AS context_ok;
+
 SET tm_backup = 'DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3641_YYYYMMDD';
 SET td_backup = 'DAAS_PROD.DAAS_BACKUP.TRIP_DETAIL_DAASI_3641_YYYYMMDD';
 
