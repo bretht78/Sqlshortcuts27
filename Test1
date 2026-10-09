@@ -1,5 +1,5 @@
 -- =============================================================================
--- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v7
+-- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v8
 -- =============================================================================
 -- Goal: every BEM and WLM market trip built before the Aug 12 config change
 -- becomes an exact copy of its IBE or IWA property trip. That is what the
@@ -13,6 +13,20 @@
 --   PART 6  Validation, with VAM/CDA as a control group.
 --   PART 7  Prod wrapper: backups, pause/resume, chunk order, TIBCO heads-up.
 --   PART 8  Rollback from the log (works even after the archival sweep).
+--
+-- Changed in v8, after the two 2026 chunks in UAT:
+--   * Prod chunks run oldest year first. A chunk fixes the islands that start
+--     in its window, and 1,034 BEM trips at the start of 2026 belonged to
+--     islands that began in Dec 2025. Oldest first, a year is finished when
+--     its own chunk ends. The first chunk starts at 2000-01-01, so nothing
+--     older than 2017 can slip through.
+--   * Part 5 (and Part 8) end with SHOW TRANSACTIONS. A run cut off between
+--     BEGIN and COMMIT can leave TRIP_MASTER and TRIP_DETAIL locked for hours,
+--     and in prod the hourly chain would wait on those locks.
+--   * Part 4: after the last chunk, a fresh plan is the final proof (nothing
+--     left to retire or copy, only the out-of-scope rows).
+--   * New 6.7: the three WLM test trips from the RCA, before and after.
+--   * Part 7: Tracy judges the pilot on trips that START in July.
 --
 -- Changed in v7, after a session lost its schema in UAT:
 --   * Part 3 sets $target, the schema TRIP_MASTER and TRIP_DETAIL must come
@@ -335,6 +349,9 @@ FROM islands;
 -- old ones; B1 counted only trips built before the cutoff. On the Oct 9 clone:
 -- BEM 329,245 / 841,952; WLM 70,252 / 142,190 (+339 / +3,606).
 -- out_of_scope = newer residue, left for the follow-up ticket.
+-- After the last chunk, a fresh plan is the final proof: no BEM rows at all,
+-- and WLM rows with 0 to retire and 0 to copy, only out_of_scope left (on the
+-- Oct 9 clone: 2020 3, 2021 7, 2026 13).
 SELECT market_cd,
        YEAR(island_start_dt)                       AS island_year,
        COUNT_IF(in_scope = 1 AND action = 'RETIRE') AS trips_to_retire,
@@ -348,8 +365,12 @@ ORDER BY 1, 2;
 -- =============================================================================
 -- PART 5. RUN ONE CHUNK: every in-scope island that starts in [from_dt, to_dt).
 -- Prod pilot: July 2026 (the last full month of pre-cutoff trips). Then whole
--- years, newest first. Rebuild Part 4 before each chunk; finished islands drop
--- out of a fresh list, so overlapping windows are harmless.
+-- years, OLDEST first. A chunk fixes islands that START in its window, so a
+-- trip in early January can belong to the previous December's island (UAT:
+-- 1,034 BEM property trips in Jan 2026 waited for the 2025 chunk). Oldest
+-- first, each year is complete when its own chunk finishes.
+-- Rebuild Part 4 before each chunk; finished islands drop out of a fresh list,
+-- so overlapping windows are harmless.
 -- If any statement fails, stop. Between BEGIN and COMMIT, a failure rolls back
 -- the whole chunk (Part 3 setting); run ROLLBACK to close it, then fix and
 -- start again from Part 4.
@@ -361,7 +382,9 @@ SELECT TO_NUMBER(IFF(CURRENT_DATABASE() || '.' || CURRENT_SCHEMA() = $target, '1
 
 SET from_dt = '2026-07-01';
 SET to_dt   = '2026-08-01';
--- Next: '2026-01-01' / '2027-01-01', then '2025-01-01' / '2026-01-01', and so on.
+-- Next (prod): '2000-01-01' / '2018-01-01' (the early start sweeps in anything
+-- older than 2017), then one year at a time up to '2026-01-01' / '2027-01-01'.
+-- UAT can take everything before 2026 in one run: '2000-01-01' / '2026-01-01'.
 SET run_id  = (SELECT TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS'));  -- names this run in the log
 
 -- 5.0 This chunk's copy list, with new trip IDs. This ID line and its twin in
@@ -509,6 +532,14 @@ UPDATE TRIP_MASTER
                           WHERE run_id = $run_id AND action = 'RETIRE');
 
 COMMIT;
+
+-- Must return no rows. A run cut off between BEGIN and COMMIT (closed tab,
+-- dropped connection, laptop asleep) can leave the transaction open, still
+-- locking TRIP_MASTER and TRIP_DETAIL. Snowflake only rolls it back after
+-- about 4 idle hours, and in prod the chain would wait on those locks.
+-- If a row shows up: SELECT SYSTEM$ABORT_TRANSACTION(<id from that row>);
+-- Nothing from that chunk is kept (the log included), so start again at Part 4.
+SHOW TRANSACTIONS;
 
 
 -- =============================================================================
@@ -741,6 +772,30 @@ WHERE r.action = 'COPY'
 --     Then Tracy reruns her max(trip_days) query for those trip dates.
 
 
+-- 6.7 Exhibit for Jira and Pete, once the 2026 chunk is in: the three WLM test
+--     trips from the RCA (Aug 7-10, 4 days, over the 3-day cap). Before: three
+--     live 4-day market trips. After: those three show delete_ind = 'Y', and
+--     each guest's new market trips (created_by DAASI-3641) carry the same
+--     dates as their IWA trips, row for row. In prod, run it within 3 days of
+--     the chunk, before the archival step clears the retired trips.
+SELECT tm.guest_unique_id,
+       IFF(tm.trip_type = 'MARKET', tm.market_cd, tm.property_cd) AS trip_owner,
+       tm.trip_master_id,
+       tm.trip_start_dt,
+       tm.trip_end_dt,
+       DATEDIFF(day, tm.trip_start_dt, tm.trip_end_dt) + 1        AS trip_days,
+       tm.delete_ind,
+       tm.created_by,
+       tm.updated_by
+FROM TRIP_MASTER tm
+WHERE ((tm.trip_type = 'MARKET'   AND tm.market_cd   = 'WLM')
+    OR (tm.trip_type = 'PROPERTY' AND tm.property_cd = 'IWA'))
+  AND tm.trip_start_dt BETWEEN '2026-08-01' AND '2026-08-15'
+  AND tm.guest_unique_id IN (SELECT guest_unique_id FROM TRIP_MASTER
+                             WHERE trip_master_id IN (2895722234, 2895809361, 2895852622))
+ORDER BY tm.guest_unique_id, tm.trip_start_dt, trip_owner, tm.delete_ind;
+
+
 -- =============================================================================
 -- PART 7. PROD WRAPPER (after UAT sign-off and Pete's approval)
 --
@@ -753,14 +808,18 @@ WHERE r.action = 'COPY'
 --     the archival step clears retired rows within about 3 days (1h-2), and
 --     after that the backups are the only way back.
 --
--- For each chunk (pilot July 2026, then 2026, 2025, ... back to 2017):
+-- For each chunk (pilot July 2026, then 2017 starting from 2000-01-01, then
+-- 2018, 2019, ... through 2026):
 --   7b pause -> Part 3 (prod lines) -> Part 4 (fresh list)
---   -> Part 5 (with the PROD ID lines in 5.0 and 5.3) -> 6.0-6.5 -> 7c resume
+--   -> Part 5 (with the PROD ID lines in 5.0 and 5.3; its closing
+--      SHOW TRANSACTIONS must come back empty) -> 6.0-6.5 -> 7c resume
 --   -> after the next run finishes: 6.6
 --   -> Tracy checks those dates in her view -> next chunk.
 -- Start right after a :15 run finishes, so the pause costs at most one run.
 -- Pilot only: have Tracy check within 2 days, while an undo is still a flag
 -- flip (8.2), and wait for the 3-day pass of 6.6 before the next chunk.
+-- She should judge trips that START in July: trips that began in late June
+-- and run into July belong to June's islands, fixed by the 2026 chunk.
 -- After the pilot, chunks can run back to back.
 -- =============================================================================
 
@@ -856,4 +915,5 @@ WHERE c.delete_ind = 'N'
   AND NOT EXISTS (SELECT 1 FROM TRIP_DETAIL t WHERE t.trip_detail_id = c.trip_detail_id);
 
 COMMIT;
+SHOW TRANSACTIONS;  -- must return no rows (see the end of Part 5)
 -- Afterwards: rerun 6.0 and B4. Both should match their pre-fix baselines again.
