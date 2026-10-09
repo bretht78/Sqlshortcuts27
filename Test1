@@ -1,18 +1,27 @@
 -- =============================================================================
--- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v3
+-- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v4
 -- =============================================================================
 -- Goal: every BEM and WLM market trip built before the Aug 12 config change
 -- becomes an exact copy of its IBE or IWA property trip. That is what the
 -- pipeline already produces for every trip built since (twin check: BEM 0/0).
 --
 --   PART 1  Decision checks. All done; 1h-1 is rewritten, and its rerun is optional.
---   PART 2  UAT setup: zero-copy clones into DAAS_UAT.DAASI_3641.
+--   PART 2  UAT setup: zero-copy clones into DAAS_UAT.DAAS_TEMP_WORK.
 --   PART 3  Settings: the only lines that change between UAT and prod.
 --   PART 4  Work list: which trips to retire and which to copy.
 --   PART 5  One chunk, in one transaction, logged. Prod pilot: July 2026.
 --   PART 6  Validation, with VAM/CDA as a control group.
 --   PART 7  Prod wrapper: backups, pause/resume, chunk order, TIBCO heads-up.
 --   PART 8  Rollback from the log (works even after the archival sweep).
+--
+-- Changed in v4, because DAAS_TEAM can't create schemas or sequences in UAT:
+--   * UAT runs in the shared schema DAAS_UAT.DAAS_TEMP_WORK, with no sequences.
+--   * New IDs in UAT continue from the clones' highest IDs; prod still uses the
+--     pipeline's sequences. Those two ID lines (5.0, 5.3) are the only code
+--     that differs, and Part 3 makes a UAT ID line fail in prod, not run.
+--   * TRANSACTION_ABORT_ON_ERROR (Part 3): a failed statement now rolls back
+--     the whole chunk. By default, Snowflake keeps the statements that worked.
+--   * 5.0 drops the last chunk's copy list first, so a failed 5.0 can't reuse it.
 --
 -- Changed in v3, because of 1h:
 --   * 1h-1 rewritten: v2's version tested an empty group.
@@ -145,32 +154,45 @@ WHERE b.trip_type = 'MARKET'
 -- PART 2. UAT SETUP
 -- DAAS_UAT is in the same Snowflake account as DAAS_PROD (C3 shows both), so
 -- zero-copy clones work: nothing is physically copied, and storage is charged
--- only for what the test changes. This isolated schema never touches UAT's own
--- pipeline tables.
+-- only for what the test changes. DAAS_TEMP_WORK is a shared scratch schema:
+-- everything else this test creates there is named DAASI_3641_*.
+-- No sequences: DAAS_TEAM can't create them here, and UAT doesn't need them,
+-- because nothing else writes to these clones (see the ID lines in Part 5).
 -- =============================================================================
-CREATE SCHEMA IF NOT EXISTS DAAS_UAT.DAASI_3641;
-CREATE OR REPLACE TABLE    DAAS_UAT.DAASI_3641.TRIP_MASTER     CLONE DAAS_PROD.DAAS_CORE.TRIP_MASTER;
-CREATE OR REPLACE TABLE    DAAS_UAT.DAASI_3641.TRIP_DETAIL     CLONE DAAS_PROD.DAAS_CORE.TRIP_DETAIL;
-CREATE OR REPLACE SEQUENCE DAAS_UAT.DAASI_3641.TRIP_MASTER_SEQ CLONE DAAS_PROD.DAAS_CORE.TRIP_MASTER_SEQ;
-CREATE OR REPLACE SEQUENCE DAAS_UAT.DAASI_3641.TRIP_DETAIL_SEQ CLONE DAAS_PROD.DAAS_CORE.TRIP_DETAIL_SEQ;
--- If a sequence clone is refused, create the sequence instead, with START set
--- above the clone's MAX(trip_master_id) or MAX(trip_detail_id).
---
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER CLONE DAAS_PROD.DAAS_CORE.TRIP_MASTER;
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL CLONE DAAS_PROD.DAAS_CORE.TRIP_DETAIL;
+
+-- Because the schema is shared: CREATE OR REPLACE would have silently replaced
+-- anyone's existing TRIP_MASTER or TRIP_DETAIL here. A dropped row created
+-- before today means it did; that table can come back within the schema's
+-- Time Travel window (rename ours, then UNDROP theirs).
+SHOW TABLES HISTORY LIKE 'TRIP_%' IN SCHEMA DAAS_UAT.DAAS_TEMP_WORK;
+
 -- What UAT proves: Parts 4-6 are correct on real prod data, every year of it.
 -- What it can't prove: the summary layer, which only rebuilds through the
 -- hourly chain. That proof comes from the one-month prod pilot (Part 7).
+-- After UAT sign-off, drop the two clones and the DAASI_3641_* tables.
 
 
 -- =============================================================================
 -- PART 3. SETTINGS: run at the start of every session.
 -- =============================================================================
 -- UAT:
-USE SCHEMA DAAS_UAT.DAASI_3641;
-SET work = 'DAAS_UAT.DAASI_3641';
+USE SCHEMA DAAS_UAT.DAAS_TEMP_WORK;
+SET work     = 'DAAS_UAT.DAAS_TEMP_WORK';
+SET clone_tm = 'DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER';  -- read only by the UAT ID lines in Part 5
+SET clone_td = 'DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL';
 
--- PROD (use these two lines instead, only after UAT sign-off; see Part 7):
+-- PROD (use these four lines instead, only after UAT sign-off; see Part 7).
+-- The two clone_ settings are the guard: they make a UAT ID line fail in prod.
 -- USE SCHEMA DAAS_PROD.DAAS_CORE;
--- SET work = 'DAAS_PROD.DAAS_TEMP_WORK';
+-- SET work     = 'DAAS_PROD.DAAS_TEMP_WORK';
+-- SET clone_tm = 'NO_CLONE_IN_PROD_USE_THE_PROD_ID_LINES';
+-- SET clone_td = 'NO_CLONE_IN_PROD_USE_THE_PROD_ID_LINES';
+
+-- Both: if any statement between BEGIN and COMMIT fails, roll back the whole
+-- chunk. Snowflake's default would keep the statements that worked.
+ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = TRUE;
 
 SET cutoff    = '2026-08-12 11:16:26';       -- the config update; trips built before it are in scope
 SET tag       = 'DAASI-3641';                -- CREATED_BY / UPDATED_BY on every row the fix writes
@@ -288,16 +310,25 @@ ORDER BY 1, 2;
 -- Prod pilot: July 2026 (the last full month of pre-cutoff trips). Then whole
 -- years, newest first. Rebuild Part 4 before each chunk; finished islands drop
 -- out of a fresh list, so overlapping windows are harmless.
+-- If any statement fails, stop. Between BEGIN and COMMIT, a failure rolls back
+-- the whole chunk (Part 3 setting); run ROLLBACK to close it, then fix and
+-- start again from Part 4.
 -- =============================================================================
 SET from_dt = '2026-07-01';
 SET to_dt   = '2026-08-01';
 -- Next: '2026-01-01' / '2027-01-01', then '2025-01-01' / '2026-01-01', and so on.
 SET run_id  = (SELECT TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS'));  -- names this run in the log
 
--- 5.0 This chunk's copy list. New IDs come from the pipeline's own sequence,
---     drawn only for this chunk.
+-- 5.0 This chunk's copy list, with new trip IDs. This ID line and its twin in
+--     5.3 are the only code that differs between UAT and prod:
+--       UAT:  continue from the clone's highest ID (nothing else writes there).
+--       PROD: the pipeline's own sequence. Swap the comments before the prod
+--             run. A UAT line left in place fails in prod instead of running.
+DROP TABLE IF EXISTS IDENTIFIER($copy_tbl);  -- so a failed 5.0 can't leave the last chunk's list behind
 CREATE OR REPLACE TRANSIENT TABLE IDENTIFIER($copy_tbl) AS
-SELECT TRIP_MASTER_SEQ.NEXTVAL AS new_trip_master_id,
+SELECT
+       (SELECT MAX(trip_master_id) FROM IDENTIFIER($clone_tm)) + ROW_NUMBER() OVER (ORDER BY trip_master_id) AS new_trip_master_id,  -- UAT
+--     TRIP_MASTER_SEQ.NEXTVAL AS new_trip_master_id,                                                                              -- PROD
        trip_master_id          AS source_trip_master_id,
        guest_unique_id,
        market_cd,
@@ -369,7 +400,10 @@ INSERT INTO TRIP_DETAIL
         business_start_dt, business_end_dt, transaction_modified_dttm, delete_ind,
         created_dttm, created_by, updated_dttm, updated_by,
         batch_id, replay_counter, last_dml_cd, property_cd)
-SELECT TRIP_DETAIL_SEQ.NEXTVAL, c.new_trip_master_id, d.transaction_table_sk, d.transaction_table,
+SELECT
+       (SELECT MAX(trip_detail_id) FROM IDENTIFIER($clone_td)) + ROW_NUMBER() OVER (ORDER BY c.new_trip_master_id, d.trip_detail_id),  -- UAT
+--     TRIP_DETAIL_SEQ.NEXTVAL,                                                                                                      -- PROD
+       c.new_trip_master_id, d.transaction_table_sk, d.transaction_table,
        d.transaction_type, d.transaction_sub_type, d.transaction_start_dttm, d.transaction_end_dttm,
        d.business_start_dt, d.business_end_dt, d.transaction_modified_dttm, 'N',
        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, $tag, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, $tag,
@@ -648,8 +682,9 @@ WHERE r.action = 'COPY'
 --     after that the backups are the only way back.
 --
 -- For each chunk (pilot July 2026, then 2026, 2025, ... back to 2017):
---   7b pause -> Part 3 (prod lines) -> Part 4 (fresh list) -> Part 5
---   -> 6.0-6.5 -> 7c resume -> after the next run finishes: 6.6
+--   7b pause -> Part 3 (prod lines) -> Part 4 (fresh list)
+--   -> Part 5 (with the PROD ID lines in 5.0 and 5.3) -> 6.0-6.5 -> 7c resume
+--   -> after the next run finishes: 6.6
 --   -> Tracy checks those dates in her view -> next chunk.
 -- Start right after a :15 run finishes, so the pause costs at most one run.
 -- Pilot only: have Tracy check within 2 days, while an undo is still a flag
