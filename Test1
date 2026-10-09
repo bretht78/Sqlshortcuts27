@@ -1,24 +1,84 @@
+-- =============================================================================
+-- DAASI-3641 · BEM/WLM market trip history rebuild · runbook v3
+-- =============================================================================
+-- Goal: every BEM and WLM market trip built before the Aug 12 config change
+-- becomes an exact copy of its IBE or IWA property trip. That is what the
+-- pipeline already produces for every trip built since (twin check: BEM 0/0).
+--
+--   PART 1  Decision checks. All done; 1h-1 is rewritten, and its rerun is optional.
+--   PART 2  UAT setup: zero-copy clones into DAAS_UAT.DAASI_3641.
+--   PART 3  Settings: the only lines that change between UAT and prod.
+--   PART 4  Work list: which trips to retire and which to copy.
+--   PART 5  One chunk, in one transaction, logged. Prod pilot: July 2026.
+--   PART 6  Validation, with VAM/CDA as a control group.
+--   PART 7  Prod wrapper: backups, pause/resume, chunk order, TIBCO heads-up.
+--   PART 8  Rollback from the log (works even after the archival sweep).
+--
+-- Changed in v3, because of 1h:
+--   * 1h-1 rewritten: v2's version tested an empty group.
+--   * 6.1 still counts a retired trip as done after the archival step removes it.
+--   * 6.6 runs twice (after the next chain run, and 3 days later), and its last
+--     row also catches a new trip the chain merged and the archival step removed.
+--   * The facts below are updated with 1h-2 to 1h-4.
+--
+-- Changed in v2, because of Part 1:
+--   * Chunks are island-start date windows, so the prod pilot can be one month.
+--   * New trip IDs are drawn per chunk (v1 drew IDs for every year on every run).
+--   * Every chunk is logged; rollback restores from the log plus the 7a clones,
+--     because the archival step clears soft-deleted trips within about 3 days.
+--   * Validation queries carry VAM/CDA as a control (already fixed in prod).
+--   * BATCH_ID is -3641: unmistakably synthetic, can't collide with a real batch.
+--
+-- Pre-check findings this design rests on:
+--   One property per market, in the mapping and in the data ........... A1, A2
+--   No duplicate property trips ........................................ A4
+--   Market trips carry the same detail types as property trips ......... B2
+--   Every rating already sits on a market trip; theo gaps sum to 0 ..... B3, B4
+--   Every over-cap IBE/IWA trip includes a hotel stay (none without) ... 1e
+--   Soft-deleted trips drop out of TRIP_SUMMARY_DT, TRIP_SUMMARY_VW,
+--     TIBCO DWS and 18MO; TIBCO SMART catches up on its own ....... C2, 1f, 1h-3
+--   The archival step clears soft-deleted trips within about 3 days .... 1h-2
+--   New IDs come from DAAS_CORE.TRIP_MASTER_SEQ / TRIP_DETAIL_SEQ ...... D1, D2
+--   Deletes: DELETE_IND 'Y' + LAST_DML_CD 'U', detail rows first ....... D5
+--   TRIP_ROOT_TASK (hourly at :15 PT) roots the whole chain, including
+--     the merge, recalculation and archival steps ...................... D4
+--   The native recalculation path can't apply caps: TRIP_RECALCULATION_PROC
+--     never reads TRIP_CONFIG, and its only feeder task is a Dec 2023
+--     one-off hotel cleanup (batch 20231213) ............................ 1c, 1d
+--   VAM's Aug 12 rebuild replaced only its twinless trips (739,194 gone,
+--     1,588,759 kept) and left nothing downstream ...................... 1a, 1b
+--   The merge step did it: 736,287 of those 739,194 went through it. It joins
+--     trips when a cap goes up and never splits them, so it couldn't fix BEM
+--     or WLM, whose caps went down ..................................... 1h-4
+--
+-- Out of scope (its own ticket): the small mismatches in trips built since Aug 12
+-- (VAM 9,458 / WLM 347 market trips without a twin).
+-- =============================================================================
 
 
 -- =============================================================================
--- PART 1h. FOUR MORE READ-ONLY CHECKS (prod). They don't block UAT; run them
--- before the prod pilot. 1g can be skipped: 1b and 1h-1 cover the layers that
--- matter.
+-- PART 1h. RESULTS FROM OCT 8. Only 1h-1 is left, and it's optional: the
+-- pilot's 6.6 measures the same thing directly for the trips we retire.
+-- 1g was skipped: 1b and 6.6 cover the layers that matter.
 -- =============================================================================
 
--- 1h-1. Do the other downstream layers drop soft-deleted trips, or keep them?
---       Uses trips the pipeline soft-deleted 2+ days ago, so daily jobs have run.
---       0 = that layer drops retired trips by itself. Anything else = Part 6.6
---       must watch that layer, and the archival sweep is what finally clears it.
+-- 1h-1. OPTIONAL RERUN. Do the other downstream layers drop soft-deleted trips
+--       right away, or keep them until the archival step clears them?
+--       v2's version tested an empty group: it asked for trips deleted before
+--       midnight two days ago, and the oldest deleted trip (Oct 6, 00:31) was
+--       31 minutes younger than that. This version uses 24 hours.
+--       Row 1 must be above 0, or the test is empty again.
+--       0 = that layer drops retired trips by itself. Above 0 = it keeps them
+--       until the archival step clears them (about 3 days); 6.6 allows for that.
 WITH deleted AS (
     SELECT trip_master_id
     FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
     WHERE delete_ind = 'Y'
-      AND updated_dttm < DATEADD(day, -2, CURRENT_DATE())
+      AND updated_dttm < DATEADD(hour, -24, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
       AND ((trip_type = 'MARKET'   AND market_cd   IN ('VAM', 'BEM', 'WLM'))
         OR (trip_type = 'PROPERTY' AND property_cd IN ('CDA', 'IBE', 'IWA')))
 )
-SELECT 'soft-deleted 2+ days ago' AS layer, COUNT(*) AS trips FROM deleted
+SELECT 'soft-deleted 24+ hours ago (must be above 0)' AS layer, COUNT(*) AS trips FROM deleted
 UNION ALL
 SELECT 'still in DAILY_ACTIVITY_SUMMARY', COUNT(DISTINCT x.trip_master_id)
 FROM DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY x
@@ -37,9 +97,10 @@ FROM DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY x
 JOIN deleted d ON d.trip_master_id = x.trip_master_id;
 
 
--- 1h-2. How long soft-deleted trips survive before the archival task sweeps them.
---       oldest_delete is roughly the sweep horizon, and so the window in which
---       a rollback can simply flip DELETE_IND back (Part 8 handles both cases).
+-- 1h-2. DONE. 2,270 market and 1,887 property trips soft-deleted, the oldest
+--       from Oct 6, 00:31. The archival step clears deleted trips within about
+--       3 days, so an undo is a flag flip (8.2) for about 2 days after a chunk,
+--       and a restore from the 7a clones (8.3) after that.
 SELECT trip_type,
        COUNT(*)          AS soft_deleted_now,
        MIN(updated_dttm) AS oldest_delete,
@@ -51,8 +112,7 @@ WHERE delete_ind = 'Y'
 GROUP BY 1;
 
 
--- 1h-3. The 6 deleted trips TIBCO SMART still had in 1f. If every deleted_at is
---       after the most recent 7:00 AM PT, it's just SMART's once-a-day refresh.
+-- 1h-3. DONE. No rows: the 6 deleted trips TIBCO SMART still had in 1f are gone.
 SELECT tm.trip_master_id,
        tm.trip_type,
        IFF(tm.trip_type = 'MARKET', tm.market_cd, tm.property_cd) AS trip_owner,
@@ -66,10 +126,8 @@ WHERE tm.delete_ind = 'Y'
 ORDER BY deleted_at DESC;
 
 
--- 1h-4. Optional, for the RCA: did the merge step rebuild VAM on Aug 12?
---       Counts VAM trips from the 9:38 AM Aug 12 backup that entered
---       TRIP_MERGE_PROCESSED after that backup. Near 739,194 = the merge step
---       did it. Near 0 = ask FJOHNSON1 (who built the Aug 12 replay list).
+-- 1h-4. DONE: 736,287. Of the 739,194 VAM trips replaced since the 9:38 AM
+--       Aug 12 backup, that many went through the merge step. It rebuilt VAM.
 WITH merged_since_backup AS (
     SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE.TRIP_MERGE_PROCESSED
     MINUS
@@ -360,6 +418,9 @@ COMMIT;
 -- including its known residue. Run 6.0, 6.2, 6.3 and 6.5 once BEFORE the first
 -- chunk too (6.1 and 6.4 need a run): that calibrates the pack on a market
 -- that's already fixed, and gives Pete the before-picture for BEM and WLM.
+-- 6.1, 6.4 and 6.6 read one run from the log. In a new session, run Part 3,
+-- then SET run_id = '<value>' using:
+--   SELECT DISTINCT run_id, from_dt, to_dt FROM IDENTIFIER($log_tbl) ORDER BY 1;
 -- =============================================================================
 
 -- 6.0 Twin check by start year, trips built before the cutoff.
@@ -404,10 +465,12 @@ ORDER BY 1, 2;
 
 
 -- 6.1 Did this run do exactly what it logged? planned = done on every row.
+--     A retired trip still counts as done after the archival step removes it.
 SELECT l.action,
        l.market_cd,
        COUNT(*) AS planned,
-       COUNT_IF(   (l.action = 'RETIRE' AND t.delete_ind = 'Y' AND t.updated_by = $tag)
+       COUNT_IF(   (l.action = 'RETIRE' AND (t.trip_master_id IS NULL
+                                             OR (t.delete_ind = 'Y' AND t.updated_by = $tag)))
                 OR (l.action = 'COPY'   AND t.delete_ind = 'N' AND t.created_by = $tag)) AS done
 FROM IDENTIFIER($log_tbl) l
 LEFT JOIN TRIP_MASTER t
@@ -514,10 +577,11 @@ GROUP BY 1
 ORDER BY 1;
 
 
--- 6.6 PROD ONLY, after the next hourly chain run has finished. Every row 0.
---     Run the TIBCO SMART row again after the next 7:00 AM PT refresh.
---     DAS and the trip-number metric: 0 if 1h-1 showed those layers drop
---     soft-deleted trips; otherwise they clear at the archival sweep.
+-- 6.6 PROD ONLY. Run it after the next hourly chain run, and again 3 days later.
+--     The 3-day pass must be all 0. A "still in" row above 0 on the first pass
+--     and 0 on the second is a layer that keeps retired trips until the
+--     archival step clears them, which is fine. The last two rows must be 0
+--     on both passes.
 WITH run AS (
     SELECT action, trip_master_id, new_trip_master_id
     FROM IDENTIFIER($log_tbl)
@@ -539,7 +603,7 @@ SELECT 'retired, still in TIBCO TRIP_SUMMARY_18MO', COUNT(DISTINCT x.trip_master
 FROM run r JOIN DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY_18MO x ON x.trip_master_id = r.trip_master_id
 WHERE r.action = 'RETIRE'
 UNION ALL
-SELECT 'retired, still in TIBCO SMART (after 7 AM)', COUNT(DISTINCT x.trip_master_id)
+SELECT 'retired, still in TIBCO SMART TRIP_SUMMARY', COUNT(DISTINCT x.trip_master_id)
 FROM run r JOIN DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY x ON x.trip_master_id = r.trip_master_id
 WHERE r.action = 'RETIRE'
 UNION ALL
@@ -557,13 +621,16 @@ WHERE r.action = 'COPY'
   AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT x
                   WHERE x.trip_master_id = r.new_trip_master_id)
 UNION ALL
--- Not 0 = the chain changed some new trips (its merge step, or late play on recent
--- dates). Look at those trips before running the next chunk.
-SELECT 'new, changed by the chain since insert', COUNT(*)
+-- Not 0 = the chain changed or removed some new trips (its merge step, or late
+-- play on recent dates). Look at those trips before running the next chunk.
+-- 0 = nothing in the chain, merge step included, found a reason to touch them.
+SELECT 'new, changed or removed by the chain', COUNT(*)
 FROM run r
-JOIN TRIP_MASTER t ON t.trip_master_id = r.new_trip_master_id
 WHERE r.action = 'COPY'
-  AND (t.delete_ind <> 'N' OR COALESCE(t.updated_by, '') <> $tag);
+  AND NOT EXISTS (SELECT 1 FROM TRIP_MASTER t
+                  WHERE t.trip_master_id = r.new_trip_master_id
+                    AND t.delete_ind = 'N'
+                    AND COALESCE(t.updated_by, '') = $tag);
 --     Then rerun pre-check B4: the theo gap for the chunk's years should be 0.
 --     Then Tracy reruns her max(trip_days) query for those trip dates.
 
@@ -572,18 +639,22 @@ WHERE r.action = 'COPY'
 -- PART 7. PROD WRAPPER (after UAT sign-off and Pete's approval)
 --
 -- Before the first chunk:
---   * Part 1h done.
+--   * Optional: rerun 1h-1.
 --   * Give TIBCO's owners a heads-up. DAAS_TIBCO_PAT_USER_PROD reads
 --     TRIP_SUMMARY_18MO about 690K times a week, and BEM/WLM trip IDs from the
 --     last 18 months will change.
 --   * Run 7a (backups). Keep them, and the log table, until Tracy signs off:
---     once the archival task sweeps retired rows, they are the only way back.
+--     the archival step clears retired rows within about 3 days (1h-2), and
+--     after that the backups are the only way back.
 --
 -- For each chunk (pilot July 2026, then 2026, 2025, ... back to 2017):
 --   7b pause -> Part 3 (prod lines) -> Part 4 (fresh list) -> Part 5
 --   -> 6.0-6.5 -> 7c resume -> after the next run finishes: 6.6
 --   -> Tracy checks those dates in her view -> next chunk.
 -- Start right after a :15 run finishes, so the pause costs at most one run.
+-- Pilot only: have Tracy check within 2 days, while an undo is still a flag
+-- flip (8.2), and wait for the 3-day pass of 6.6 before the next chunk.
+-- After the pilot, chunks can run back to back.
 -- =============================================================================
 
 -- 7a. Backups: the nine tables the team backed up for DAASI-3376, plus the
@@ -618,8 +689,9 @@ ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
 
 -- =============================================================================
 -- PART 8. ROLLBACK FROM THE LOG
--- Works whether or not the archival task has swept the retired rows yet:
--- rows still in place are flipped back; swept rows come back from the 7a clones.
+-- Works whether or not the archival step has cleared the retired rows yet
+-- (it does within about 3 days): rows still in place are flipped back (8.2),
+-- cleared rows come back from the 7a clones (8.3).
 -- Run with the chain paused (7b), then resume (7c).
 -- Undoes everything in the log by default. To undo a single chunk, add
 -- "AND run_id = '<run>'" to each of the six log subqueries below.
