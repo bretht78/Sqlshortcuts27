@@ -151,9 +151,11 @@ BEGIN
 
     -- 5. the trip tables
     BEGIN
-        SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER LIMIT 1))
-             + (SELECT COUNT(*) FROM (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL LIMIT 1))
-        INTO :v_n;
+        -- (Snowflake wants every SELECT ... INTO to have a FROM after the INTO)
+        SELECT COUNT(*) INTO :v_n
+        FROM (SELECT 1 AS one FROM (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER LIMIT 1)
+              UNION ALL
+              SELECT 1 FROM (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL LIMIT 1));
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
         VALUES (:v_id, 'PREFLIGHT', 5, 'Trip tables readable, with rows', '2 of 2', TO_VARCHAR(:v_n) || ' of 2',
                 :v_n = 2, CURRENT_TIMESTAMP());
@@ -284,17 +286,19 @@ BEGIN
     END;
 
     BEGIN
-        SELECT (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT WHERE FALSE))
-             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE_MARKETING_VW.TRIP_SUMMARY_VW WHERE FALSE))
-             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY WHERE FALSE))
-             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY_18MO WHERE FALSE))
-             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY WHERE FALSE))
-             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY WHERE FALSE))
-             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE.DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT WHERE FALSE))
-        INTO :v_n;
+        -- one row per table (COUNT over no rows still gives a row), so 7 = all readable,
+        -- each with a trip_master_id column
+        SELECT COUNT(*) INTO :v_n
+        FROM (SELECT COUNT(trip_master_id) AS n FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT WHERE FALSE
+              UNION ALL SELECT COUNT(trip_master_id) FROM DAAS_PROD.DAAS_CORE_MARKETING_VW.TRIP_SUMMARY_VW WHERE FALSE
+              UNION ALL SELECT COUNT(trip_master_id) FROM DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY WHERE FALSE
+              UNION ALL SELECT COUNT(trip_master_id) FROM DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY_18MO WHERE FALSE
+              UNION ALL SELECT COUNT(trip_master_id) FROM DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY WHERE FALSE
+              UNION ALL SELECT COUNT(trip_master_id) FROM DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY WHERE FALSE
+              UNION ALL SELECT COUNT(trip_master_id) FROM DAAS_PROD.DAAS_CORE.DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT WHERE FALSE);
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 11, 'Downstream tables the post-test reads', '7 readable', '7 readable',
-                IFF(:v_has_chain, TRUE, NULL), CURRENT_TIMESTAMP());
+        VALUES (:v_id, 'PREFLIGHT', 11, 'Downstream tables the post-test reads', '7 readable', TO_VARCHAR(:v_n) || ' readable',
+                IFF(:v_has_chain, :v_n = 7, NULL), CURRENT_TIMESTAMP());
     EXCEPTION
         WHEN OTHER THEN
             v_val := LEFT(SQLERRM, 100);
