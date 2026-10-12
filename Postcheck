@@ -139,8 +139,7 @@ BEGIN
         v_run := COALESCE(v_run, 'NONE');
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
             (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES
-            (:v_run, 'POST1', 99, 'RESULT', 'a committed run', :v_status, FALSE, CURRENT_TIMESTAMP());
+        SELECT  :v_run, 'POST1', 99, 'RESULT', 'a committed run', :v_status, FALSE, CURRENT_TIMESTAMP();
         LET rs0 RESULTSET := (SELECT 'RESULT' AS check_name, 'a committed run' AS expected,
                                      :v_status AS actual, FALSE AS passed);
         RETURN TABLE(rs0);
@@ -373,48 +372,62 @@ BEGIN
 
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
         (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES
-        (:v_run, :v_phase, 1, 'In-scope trips still to fix after the run (BEM / WLM)',
-         '0 / 0', TO_VARCHAR(:v_left_bem) || ' / ' || TO_VARCHAR(:v_left_wlm), :v_left_bem + :v_left_wlm = 0, CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 2, 'BEM/WLM market trips over the max trip days without a hotel stay (whole table)',
-         '0', TO_VARCHAR(:v_over_cap), :v_over_cap = 0, CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 3, 'Live detail rows, BEM minus IBE (information; 0 right after the run)',
-         '0', TO_VARCHAR(:v_bem_diff), NULL, CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 4, 'Live detail rows, WLM minus IWA (information; 0 right after the run)',
-         '0', TO_VARCHAR(:v_wlm_diff), NULL, CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 5, 'New trips the UAT run did not also create (information)',
-         '0', IFF(:v_not_in_uat < 0, 'n/a', TO_VARCHAR(:v_not_in_uat)), NULL, CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 6, 'New trips missing from TRIP_SUMMARY_DT',
-         '0', IFF(:v_has_chain, IFF(:v_chain_result IS NULL OR :v_chain_result = 'PASS', TO_VARCHAR(:v_new_missing), 'not checked yet'), 'n/a (no chain)'),
-         IFF(:v_has_chain AND :v_chain_result IS NULL, :v_new_missing = 0, NULL), CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 7, 'New trips the chain removed (look before going on)',
-         '0', IFF(:v_has_chain, IFF(:v_chain_result IS NULL, TO_VARCHAR(:v_new_removed), 'not checked yet'), 'n/a (no chain)'),
-         IFF(:v_has_chain AND :v_chain_result IS NULL, :v_new_removed = 0, NULL), CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 8, 'New trips the chain updated (information)',
-         'any', IFF(:v_has_chain, IFF(:v_chain_result IS NULL, TO_VARCHAR(:v_new_updated), 'not checked yet'), 'n/a (no chain)'), NULL, CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 9, 'Retired trips still in TRIP_SUMMARY_DT',
-         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_tsdt), 'n/a (no chain)'),
-         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_tsdt = 0, NULL), CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 10, 'Retired trips still in TRIP_SUMMARY_VW',
-         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_vw), 'n/a (no chain)'),
-         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_vw = 0, NULL), CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 11, 'Retired trips still in TIBCO DWS TRIP_SUMMARY',
-         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_dws), 'n/a (no chain)'),
-         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_dws = 0, NULL), CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 12, 'Retired trips still in TIBCO TRIP_SUMMARY_18MO',
-         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_18mo), 'n/a (no chain)'),
-         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_18mo = 0, NULL), CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 13, 'Retired trips still in TIBCO SMART TRIP_SUMMARY',
-         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_smart), 'n/a (no chain)'),
-         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_smart = 0, NULL), CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 14, 'Retired trips still in DAILY_ACTIVITY_SUMMARY',
-         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_das), 'n/a (no chain)'),
-         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_das = 0, NULL), CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 15, 'Retired trips still in the trip-number gap metric',
-         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_gap), 'n/a (no chain)'),
-         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_gap = 0, NULL), CURRENT_TIMESTAMP()),
-        (:v_run, :v_phase, 99, 'RESULT',
-         :v_reason, :v_result, IFF(:v_result = 'WAITING', NULL, :v_result = 'PASS'), CURRENT_TIMESTAMP());
+    SELECT  :v_run, :v_phase, 1, 'In-scope trips still to fix after the run (BEM / WLM)',
+            '0 / 0', TO_VARCHAR(:v_left_bem) || ' / ' || TO_VARCHAR(:v_left_wlm), :v_left_bem + :v_left_wlm = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 2, 'BEM/WLM market trips over the max trip days without a hotel stay (whole table)',
+            '0', TO_VARCHAR(:v_over_cap), :v_over_cap = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 3, 'Live detail rows, BEM minus IBE (information; 0 right after the run)',
+            '0', TO_VARCHAR(:v_bem_diff), NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 4, 'Live detail rows, WLM minus IWA (information; 0 right after the run)',
+            '0', TO_VARCHAR(:v_wlm_diff), NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 5, 'New trips the UAT run did not also create (information)',
+            '0', IFF(:v_not_in_uat < 0, 'n/a', TO_VARCHAR(:v_not_in_uat)), NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 6, 'New trips missing from TRIP_SUMMARY_DT',
+            '0', IFF(:v_has_chain, IFF(:v_chain_result IS NULL OR :v_chain_result = 'PASS', TO_VARCHAR(:v_new_missing), 'not checked yet'), 'n/a (no chain)'),
+            IFF(:v_has_chain AND :v_chain_result IS NULL, :v_new_missing = 0, NULL), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 7, 'New trips the chain removed (look before going on)',
+            '0', IFF(:v_has_chain, IFF(:v_chain_result IS NULL, TO_VARCHAR(:v_new_removed), 'not checked yet'), 'n/a (no chain)'),
+            IFF(:v_has_chain AND :v_chain_result IS NULL, :v_new_removed = 0, NULL), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 8, 'New trips the chain updated (information)',
+            'any', IFF(:v_has_chain, IFF(:v_chain_result IS NULL, TO_VARCHAR(:v_new_updated), 'not checked yet'), 'n/a (no chain)'), NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 9, 'Retired trips still in TRIP_SUMMARY_DT',
+            IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_tsdt), 'n/a (no chain)'),
+            IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_tsdt = 0, NULL), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 10, 'Retired trips still in TRIP_SUMMARY_VW',
+            IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_vw), 'n/a (no chain)'),
+            IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_vw = 0, NULL), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 11, 'Retired trips still in TIBCO DWS TRIP_SUMMARY',
+            IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_dws), 'n/a (no chain)'),
+            IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_dws = 0, NULL), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 12, 'Retired trips still in TIBCO TRIP_SUMMARY_18MO',
+            IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_18mo), 'n/a (no chain)'),
+            IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_18mo = 0, NULL), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 13, 'Retired trips still in TIBCO SMART TRIP_SUMMARY',
+            IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_smart), 'n/a (no chain)'),
+            IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_smart = 0, NULL), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 14, 'Retired trips still in DAILY_ACTIVITY_SUMMARY',
+            IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_das), 'n/a (no chain)'),
+            IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_das = 0, NULL), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 15, 'Retired trips still in the trip-number gap metric',
+            IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_gap), 'n/a (no chain)'),
+            IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_gap = 0, NULL), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run, :v_phase, 99, 'RESULT',
+            :v_reason, :v_result, IFF(:v_result = 'WAITING', NULL, :v_result = 'PASS'), CURRENT_TIMESTAMP();
 
     LET rs RESULTSET := (SELECT check_name, expected, actual, passed
                          FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
