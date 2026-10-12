@@ -182,13 +182,17 @@ BEGIN
 
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
         (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES
-        (:P_RUN_ID, 'RECOVER', 1, 'Queries of the run''s session still going', '0 seen', LEFT(:v_look, 100), NULL, CURRENT_TIMESTAMP()),
-        (:P_RUN_ID, 'RECOVER', 2, 'Open transactions of the run''s session', 'ended, or none visible', LEFT(:v_aborted, 100), NULL, CURRENT_TIMESTAMP()),
-        (:P_RUN_ID, 'RECOVER', 3, 'Trip chain', 'running', :v_chain_msg, NULL, CURRENT_TIMESTAMP()),
-        (:P_RUN_ID, 'RECOVER', 4, 'Run lock', 'released', :v_lock_msg, :v_lock_msg IN ('released', 'was already free'), CURRENT_TIMESTAMP()),
-        (:P_RUN_ID, 'RECOVER', 5, 'Run status', 'ABORTED (or COMMITTED if it had committed)', :v_new_status, NULL, CURRENT_TIMESTAMP()),
-        (:P_RUN_ID, 'RECOVER', 99, 'RESULT', 'RECOVERED', 'RECOVERED', TRUE, CURRENT_TIMESTAMP());
+    SELECT  :P_RUN_ID, 'RECOVER', 1, 'Queries of the run''s session still going', '0 seen', LEFT(:v_look, 100), NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :P_RUN_ID, 'RECOVER', 2, 'Open transactions of the run''s session', 'ended, or none visible', LEFT(:v_aborted, 100), NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :P_RUN_ID, 'RECOVER', 3, 'Trip chain', 'running', :v_chain_msg, NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :P_RUN_ID, 'RECOVER', 4, 'Run lock', 'released', :v_lock_msg, :v_lock_msg IN ('released', 'was already free'), CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :P_RUN_ID, 'RECOVER', 5, 'Run status', 'ABORTED (or COMMITTED if it had committed)', :v_new_status, NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :P_RUN_ID, 'RECOVER', 99, 'RESULT', 'RECOVERED', 'RECOVERED', TRUE, CURRENT_TIMESTAMP();
 
     LET rs RESULTSET := (SELECT check_name, expected, actual, passed
                          FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
