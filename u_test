@@ -65,7 +65,9 @@ $$;
 --           BEM 329,245 to retire / 841,952 to copy; WLM 70,252 / 142,191.
 --         (The runbook's Part 4 note says 142,190 for WLM copies, one fewer.
 --         The log counts what Friday actually did, and step 6 compares with
---         the log, so 142,191 is the number that matters.)
+--         the log, so 142,191 is the number that matters.) Row 16 tries each
+--         kind of write the procedures use (insert, update, delete, with bound
+--         values) on a scratch table; it must say "all ran".
 CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PREFLIGHT();
 
 -- STEP 3. The fix, in one call. Expect RESULT = COMMITTED and 12 checks with
@@ -268,47 +270,8 @@ SELECT 'live detail rows, whole table: before minus now',
 -- Snowsight's "SQL definition" view of the procedure, the same statement is at
 -- line N + 5 (the view adds five header lines).
 --
--- "SQL execution internal error: Processing aborted due to error 300002:...;
--- incident ...": Snowflake itself crashed on that statement; it is not a SQL
--- mistake, and nothing was changed. Run the same CALL once more. If it stops
--- the same way again, run the block below (a one-minute test of PREFLIGHT's
--- first write, three ways; it removes its own test rows) and send Claude its
--- one-line result. Snowflake support can see exactly what crashed from the
--- incident number and the query ID of the failed statement (Query History).
-EXECUTE IMMEDIATE $$
-DECLARE
-    v_val VARCHAR;
-    r1    VARCHAR DEFAULT 'ok';
-    r2    VARCHAR DEFAULT 'ok';
-    r3    VARCHAR DEFAULT 'ok';
-BEGIN
-    SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION;
-    SELECT LOWER(MAX("value")) INTO :v_val FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
-    BEGIN
-        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES ('TEST', 'TEST', 1, 'values, plain', 'true', 'true', TRUE, CURRENT_TIMESTAMP());
-    EXCEPTION
-        WHEN OTHER THEN
-            r1 := LEFT(SQLERRM, 120);
-    END;
-    BEGIN
-        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES ('TEST', 'TEST', 2, 'values, bound', 'true', COALESCE(:v_val, 'unknown'),
-                COALESCE(:v_val, 'true') = 'true', CURRENT_TIMESTAMP());
-    EXCEPTION
-        WHEN OTHER THEN
-            r2 := LEFT(SQLERRM, 120);
-    END;
-    BEGIN
-        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        SELECT 'TEST', 'TEST', 3, 'select, bound', 'true', COALESCE(:v_val, 'unknown'),
-               COALESCE(:v_val, 'true') = 'true', CURRENT_TIMESTAMP();
-    EXCEPTION
-        WHEN OTHER THEN
-            r3 := LEFT(SQLERRM, 120);
-    END;
-    DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS WHERE phase = 'TEST';
-    RETURN 'warehouse ' || COALESCE(CURRENT_WAREHOUSE(), 'none') || ' | 1 values/plain: ' || r1
-        || ' | 2 values/bound: ' || r2 || ' | 3 select/bound: ' || r3;
-END;
-$$;
+-- "SQL execution internal error ... incident ...": Snowflake itself crashed on
+-- that statement; it is not a SQL mistake. (Monday's crash, 300002:3259654597,
+-- was INSERT ... VALUES with bound values; none of the procedures uses that form
+-- now, and PREFLIGHT row 16 proves the forms they do use.) Send Claude the
+-- incident number and the statement's line.
