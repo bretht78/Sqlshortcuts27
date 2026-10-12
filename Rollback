@@ -129,9 +129,8 @@ BEGIN
     v_rb_id := TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISSFF3');
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS
         (run_id, kind, status, chain_paused, started_at, run_by, session_id, message)
-    VALUES
-        (:v_rb_id, 'ROLLBACK', 'STARTED', FALSE, CURRENT_TIMESTAMP(), CURRENT_USER(), CURRENT_SESSION(),
-         'Started: rollback of ' || :P_RUN_ID || '.');
+    SELECT  :v_rb_id, 'ROLLBACK', 'STARTED', FALSE, CURRENT_TIMESTAMP(), CURRENT_USER(), CURRENT_SESSION(),
+            'Started: rollback of ' || :P_RUN_ID || '.';
     v_logged := TRUE;
     UPDATE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK SET holder = :v_rb_id, since = CURRENT_TIMESTAMP() WHERE holder IS NULL;
     IF (SQLROWCOUNT = 0) THEN
@@ -332,15 +331,17 @@ BEGIN
 
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
         (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES
-        (:v_rb_id, 'ROLLBACK', 1, 'New trips still live after the rollback',
-         '0', TO_VARCHAR(:v_new_live), :v_new_live = 0, CURRENT_TIMESTAMP()),
-        (:v_rb_id, 'ROLLBACK', 2, 'Retired trips not brought back',
-         '0', TO_VARCHAR(:v_old_not_live), :v_old_not_live = 0, CURRENT_TIMESTAMP()),
-        (:v_rb_id, 'ROLLBACK', 3, 'IBE/IWA ratings on no BEM/WLM market trip (information: replay new ones)',
-         'compare with before the fix', TO_VARCHAR(:v_no_market), NULL, CURRENT_TIMESTAMP()),
-        (:v_rb_id, 'ROLLBACK', 99, 'RESULT',
-         'ROLLED BACK', IFF(:v_failed = 0, 'ROLLED BACK', 'NOTHING CHANGED'), :v_failed = 0, CURRENT_TIMESTAMP());
+    SELECT  :v_rb_id, 'ROLLBACK', 1, 'New trips still live after the rollback',
+            '0', TO_VARCHAR(:v_new_live), :v_new_live = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_rb_id, 'ROLLBACK', 2, 'Retired trips not brought back',
+            '0', TO_VARCHAR(:v_old_not_live), :v_old_not_live = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_rb_id, 'ROLLBACK', 3, 'IBE/IWA ratings on no BEM/WLM market trip (information: replay new ones)',
+            'compare with before the fix', TO_VARCHAR(:v_no_market), NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_rb_id, 'ROLLBACK', 99, 'RESULT',
+            'ROLLED BACK', IFF(:v_failed = 0, 'ROLLED BACK', 'NOTHING CHANGED'), :v_failed = 0, CURRENT_TIMESTAMP();
 
     IF (v_failed > 0) THEN
         RAISE e_rb_failed;
