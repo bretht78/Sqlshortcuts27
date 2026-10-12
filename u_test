@@ -1,5 +1,5 @@
 -- =============================================================================
--- · one-call version · UAT TEST (Monday)
+-- DAASI-3641 · one-call version · UAT TEST (Monday)
 -- =============================================================================
 -- One worksheet, run top to bottom. Use a NEW worksheet, set to warehouse
 -- DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE (so Friday's session settings don't
@@ -20,11 +20,13 @@ CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL CLONE DAAS_UAT.DAAS_
 -- Must be 0: nothing the fix wrote is in the before-picture.
 SELECT COUNT(*) AS fix_rows_in_before_picture
 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER WHERE created_by = 'DAASI-3641' OR updated_by = 'DAASI-3641';
--- FIRST TIME ONLY: set Friday's hand-run log aside; the one-call version keeps
--- its own under the same name, and step 6 reads Friday's rows from the new name.
+-- FIRST TIME ONLY, before the first CALL: set Friday's hand-run log aside; the
+-- one-call version keeps its own under the same name (its procedures create the
+-- six DAASI_3641_* tables on first call), and step 6 reads Friday's rows from
+-- the new name.
 ALTER TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG RENAME TO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG_MANUAL;
 -- STARTING OVER (any later time): the reset above, then drop the one-call
--- version's own tables so the redeploy in step 1 recreates them empty:
+-- version's own tables; the next CALL recreates them empty:
 --   DROP TABLE IF EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS;
 --   DROP TABLE IF EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS;
 --   DROP TABLE IF EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG;
@@ -32,9 +34,10 @@ ALTER TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG RENAME TO DAAS_UAT.DAAS_TEMP_
 --   DROP TABLE IF EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TD;
 --   DROP TABLE IF EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK;
 
--- STEP 1. Deploy daasi_3641_onecall_uat.sql (GitHub Actions, or open it in a
---         worksheet and Run All). It creates six DAASI_3641_* tables and five
---         procedures in DAAS_UAT.DAAS_TEMP_WORK. It changes no trip data.
+-- STEP 1. Deploy the five files DAASI_3641_ONECALL_UAT_<PREFLIGHT, RUN_ALL,
+--         POST_CHECK, ROLLBACK, RECOVER>.sql (GitHub Actions; one procedure per
+--         file, one statement each). They change no data; the six DAASI_3641_*
+--         tables appear on the first call, in DAAS_UAT.DAAS_TEMP_WORK.
 
 -- STEP 2. Pre-test. RESULT must say READY. Rows 8-11 are information in UAT (a
 --         read-only look at the PROD chain: whether this role can see what
@@ -207,13 +210,18 @@ SELECT 'live detail rows, whole table: before minus now',
 --       and after a minute or two cancel it from Query History (or with the
 --       worksheet's stop button). DAASI_3641_RUNS shows it STARTED, the lock
 --       row shows it as holder, and SHOW TRANSACTIONS; shows its transaction.
---   8b. In a NEW worksheet, as the same user:
+--   8b. Still in THIS worksheet: CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PREFLIGHT();
+--       It must refuse with "this session has a transaction open" (-20657).
+--       That guard is what keeps a later call from committing the cancelled
+--       one's half-done work; if it does NOT refuse, stop here and tell me.
+--   8c. In a NEW worksheet, as the same user:
 --       CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RECOVER('<that run_id>');
 --       Expect RESULT = RECOVERED, "ended <id>" in row 2, the lock released,
 --       the run ABORTED, and no fix rows in TRIP_MASTER (the reset query from
 --       step 0 returns 0 again).
---   8c. CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUN_ALL();     then step 6 again: "same" and six zeros.
---       This also leaves UAT in its fixed state for Tracy to look at.
+--   8d. In the new worksheet: CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUN_ALL();
+--       then step 6 again: "same" and six zeros. This also leaves UAT in its
+--       fixed state for Tracy to look at.
 -- To start over at any point: step 0 again (the reset takes seconds).
 
 
@@ -230,7 +238,8 @@ SELECT 'live detail rows, whole table: before minus now',
 --
 -- A call was cut off (cancelled, or stopped by a statement timeout; closing a
 -- tab or losing the connection does NOT stop a call): it still holds the run
--- lock and its transaction. Once Query History shows the CALL is no longer
--- running, in a NEW worksheet, as the same user:
+-- lock and its transaction, and every procedure refuses to run in that
+-- worksheet until it is cleaned up. Once Query History shows the CALL is no
+-- longer running, in a NEW worksheet, as the same user:
 --   CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RECOVER('<run_id from DAASI_3641_RUNS>');
--- then call RUN_ALL again.
+-- then call RUN_ALL again (in the new worksheet).
