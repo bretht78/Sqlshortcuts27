@@ -1,0 +1,217 @@
+-- DAASI-3641 · one-call version · UAT · RECOVER. One file per procedure; the notes that
+-- cover all of them are at the top of DAASI_3641_ONECALL_UAT_RUN_ALL.sql.
+
+-- -----------------------------------------------------------------------------
+-- 6. RECOVER: clean up after a RUN_ALL or ROLLBACK call that was cancelled
+--    or stopped by a statement timeout. Such a call cannot run its own cleanup:
+--    its transaction stays open in its session, the run lock stays held.
+--    Run it in a NEW worksheet, as the user who made the call (Snowflake lets a
+--    user end only their own transactions; an ACCOUNTADMIN can end anyone's), and
+--    only once Query History shows that CALL is no longer running. It ends the
+--    run's open transaction (nothing of it is kept), releases the
+--    lock, and marks the run ABORTED. A run that had already committed stays
+--    COMMITTED. Then call RUN_ALL again.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RECOVER(P_RUN_ID VARCHAR)
+COPY GRANTS
+RETURNS TABLE (CHECK_NAME VARCHAR, EXPECTED VARCHAR, ACTUAL VARCHAR, PASSED BOOLEAN)
+LANGUAGE SQL
+COMMENT = 'DAASI-3641: cleans up after a cancelled or timed-out call: ends its open transaction, resumes the trip chain if it had paused it, releases the run lock, marks the run ABORTED.'
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    v_has_chain     BOOLEAN DEFAULT FALSE;
+    v_status        VARCHAR;
+    v_session       VARCHAR;
+    v_paused        BOOLEAN;
+    v_finished      TIMESTAMP_LTZ;
+    v_running       NUMBER DEFAULT 0;
+    v_look          VARCHAR;
+    v_txn           NUMBER;
+    v_aborted       VARCHAR DEFAULT 'none';
+    v_holder        VARCHAR;
+    v_task_state    VARCHAR;
+    v_chain_msg     VARCHAR DEFAULT 'n/a (no chain)';
+    v_lock_msg      VARCHAR;
+    v_new_status    VARCHAR;
+    e_bad_arg       EXCEPTION (-20646, 'DAASI-3641: pass a run_id exactly as DAASI_3641_RUNS shows it.');
+    e_not_found     EXCEPTION (-20659, 'DAASI-3641: no such run in DAASI_3641_RUNS. Nothing was changed.');
+    e_finished      EXCEPTION (-20660, 'DAASI-3641: that run finished on its own (it recorded finished_at and holds no lock), so there is nothing to recover. Nothing was changed.');
+    e_still_running EXCEPTION (-20661, 'DAASI-3641: that run''s session still has a query running, so the call may still be going. Nothing was changed. Check Query History and try again later.');
+    e_open_txn      EXCEPTION (-20657, 'DAASI-3641: this session has a transaction open (left by a cancelled call?), so nothing was done. Use a new worksheet. If that call was RUN_ALL or ROLLBACK: CALL DAASI_3641_RECOVER(''<its run_id>'') there.');
+BEGIN
+    -- Never inside a transaction left open by a cancelled call: the table
+    -- statements below are DDL, and DDL would commit it (with whatever that call
+    -- had half done). Use a new worksheet; RECOVER cleans the old one up.
+    IF (CURRENT_TRANSACTION() IS NOT NULL) THEN
+        RAISE e_open_txn;
+    END IF;
+    IF (P_RUN_ID IS NULL OR NOT REGEXP_LIKE(P_RUN_ID, '[0-9]{8}_[0-9]{6,9}')) THEN
+        RAISE e_bad_arg;
+    END IF;
+    -- the six working tables, created only if missing (DDL, so before any transaction)
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS (
+        run_id          VARCHAR(20),
+        kind            VARCHAR(10),      -- RUN or ROLLBACK
+        from_dt         DATE,
+        to_dt           DATE,
+        status          VARCHAR(20),      -- STARTED, COMMITTED, NOTHING_TO_DO, CHECKS_FAILED, CHAIN_BUSY,
+                                          -- CHAIN_PAUSED, LOCK_BUSY, ERROR, ABORTED, ROLLED_BACK
+        chain_paused    BOOLEAN,          -- TRUE while this run holds the trip chain paused
+        started_at      TIMESTAMP_LTZ,
+        committed_at    TIMESTAMP_LTZ,
+        finished_at     TIMESTAMP_LTZ,
+        trips_retired   NUMBER(38,0),
+        trips_copied    NUMBER(38,0),
+        details_moved   NUMBER(38,0),
+        scan_from       DATE,
+        scan_to         DATE,
+        run_by          VARCHAR(200),
+        session_id      VARCHAR(100),     -- the Snowflake session that ran it (RECOVER uses it)
+        message         VARCHAR(4000)
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (
+        run_id          VARCHAR(20),
+        phase           VARCHAR(10),      -- GATE, POST1, POST3, ROLLBACK, PREFLIGHT, RECOVER
+        check_no        NUMBER(4,0),
+        check_name      VARCHAR(200),
+        expected        VARCHAR(100),
+        actual          VARCHAR(100),
+        passed          BOOLEAN,          -- NULL = information only
+        checked_at      TIMESTAMP_LTZ
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG (
+        run_id             VARCHAR(20),
+        logged_at          TIMESTAMP_NTZ,
+        from_dt            DATE,
+        to_dt              DATE,
+        action             VARCHAR(10),
+        trip_master_id     NUMBER(38,0),  -- RETIRE: the old market trip.  COPY: the source property trip.
+        new_trip_master_id NUMBER(38,0),  -- COPY only: the new market trip
+        market_cd          VARCHAR(100),
+        trip_start_dt      DATE,
+        trip_end_dt        DATE
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TM AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS run_id, t.*
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER t
+    WHERE FALSE;
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TD AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS run_id, d.*
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d
+    WHERE FALSE;
+    -- (created with its one row)
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS holder, CAST(NULL AS TIMESTAMP_LTZ) AS since;
+    SELECT MAX(status), MAX(session_id), BOOLOR_AGG(chain_paused), MAX(finished_at)
+    INTO :v_status, :v_session, :v_paused, :v_finished
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS WHERE run_id = :P_RUN_ID;
+    IF (v_status IS NULL) THEN
+        RAISE e_not_found;
+    END IF;
+    SELECT MAX(holder) INTO :v_holder FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK;
+    IF (v_finished IS NOT NULL AND COALESCE(v_holder, '') <> P_RUN_ID) THEN
+        RAISE e_finished;
+    END IF;
+
+    -- 1. Is the call really over? Only this user's queries are visible, and a look
+    --    that fails cannot tell: both are reported, so the person checks Query
+    --    History themselves before calling (the run sheet says so).
+    BEGIN
+        SELECT COUNT(*) INTO :v_running
+        FROM TABLE(DAAS_UAT.INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(SESSION_ID => TO_NUMBER(:v_session), RESULT_LIMIT => 1000))
+        WHERE execution_status IN ('RUNNING', 'BLOCKED', 'QUEUED', 'RESUMING_WAREHOUSE', 'QUEUED_REPAIRING_WAREHOUSE')
+          AND query_text ILIKE '%DAASI_3641_%';
+        v_look := TO_VARCHAR(v_running) || ' seen (this user''s queries only)';
+    EXCEPTION
+        WHEN OTHER THEN
+            v_running := 0;
+            v_look := LEFT('could not look: ' || SQLERRM, 100);
+    END;
+    IF (v_running > 0) THEN
+        RAISE e_still_running;
+    END IF;
+
+    -- 2. End the run's open transactions (its session's, as far as this user can see
+    --    them), one at a time.
+    SHOW TRANSACTIONS;
+    LET rs_txn RESULTSET := (SELECT "id" AS txn_id
+                             FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+                             WHERE TO_VARCHAR("session") = :v_session);
+    LET c_txn CURSOR FOR rs_txn;
+    FOR rec IN c_txn DO
+        v_txn := rec.txn_id;
+        BEGIN
+            SELECT SYSTEM$ABORT_TRANSACTION(:v_txn);
+            v_aborted := IFF(v_aborted = 'none', '', v_aborted || '; ') || 'ended ' || TO_VARCHAR(v_txn);
+        EXCEPTION
+            WHEN OTHER THEN
+                v_aborted := IFF(v_aborted = 'none', '', v_aborted || '; ') || 'could not end ' || TO_VARCHAR(v_txn) || ': ' || SQLERRM;
+        END;
+    END FOR;
+
+    -- 3. Resume the trip chain if this run had paused it.
+    IF (v_has_chain) THEN
+        IF (COALESCE(v_paused, FALSE)) THEN
+            SHOW TASKS LIKE 'TRIP_ROOT_TASK' IN SCHEMA DAAS_PROD.DAAS_COMMON;
+            SELECT MAX("state") INTO :v_task_state FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+            IF (v_task_state = 'suspended') THEN
+                ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
+                v_chain_msg := 'resumed';
+            ELSE
+                v_chain_msg := 'already ' || COALESCE(v_task_state, 'not visible');
+            END IF;
+        ELSE
+            v_chain_msg := 'the run had not paused it';
+        END IF;
+    END IF;
+
+    -- 4. Release the lock if this run holds it, and close the run.
+    IF (v_holder = P_RUN_ID) THEN
+        UPDATE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK SET holder = NULL, since = NULL WHERE holder = :P_RUN_ID;
+        v_lock_msg := 'released';
+    ELSE
+        v_lock_msg := COALESCE('held by ' || v_holder, 'was already free');
+    END IF;
+    v_new_status := IFF(v_status = 'STARTED', 'ABORTED', v_status);
+    UPDATE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS
+       SET status = :v_new_status, chain_paused = FALSE, finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP()),
+           message = LEFT(COALESCE(message, '') || ' Closed by RECOVER as ' || CURRENT_USER() || '.', 4000)
+     WHERE run_id = :P_RUN_ID;
+
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+        (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+    VALUES
+        (:P_RUN_ID, 'RECOVER', 1, 'Queries of the run''s session still going', '0 seen', LEFT(:v_look, 100), NULL, CURRENT_TIMESTAMP()),
+        (:P_RUN_ID, 'RECOVER', 2, 'Open transactions of the run''s session', 'ended, or none visible', LEFT(:v_aborted, 100), NULL, CURRENT_TIMESTAMP()),
+        (:P_RUN_ID, 'RECOVER', 3, 'Trip chain', 'running', :v_chain_msg, NULL, CURRENT_TIMESTAMP()),
+        (:P_RUN_ID, 'RECOVER', 4, 'Run lock', 'released', :v_lock_msg, :v_lock_msg IN ('released', 'was already free'), CURRENT_TIMESTAMP()),
+        (:P_RUN_ID, 'RECOVER', 5, 'Run status', 'ABORTED (or COMMITTED if it had committed)', :v_new_status, NULL, CURRENT_TIMESTAMP()),
+        (:P_RUN_ID, 'RECOVER', 99, 'RESULT', 'RECOVERED', 'RECOVERED', TRUE, CURRENT_TIMESTAMP());
+
+    LET rs RESULTSET := (SELECT check_name, expected, actual, passed
+                         FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+                         WHERE run_id = :P_RUN_ID AND phase = 'RECOVER'
+                           AND checked_at = (SELECT MAX(checked_at) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+                                             WHERE run_id = :P_RUN_ID AND phase = 'RECOVER')
+                         ORDER BY check_no);
+    RETURN TABLE(rs);
+END;
+$$;
+
+
+-- -----------------------------------------------------------------------------
+-- GRANT USAGE ON PROCEDURE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PREFLIGHT() TO ROLE <operator_role>;
+-- GRANT USAGE ON PROCEDURE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUN_ALL(DATE, DATE) TO ROLE <operator_role>;
+-- GRANT USAGE ON PROCEDURE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_POST_CHECK(VARCHAR) TO ROLE <operator_role>;
+-- GRANT USAGE ON PROCEDURE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_ROLLBACK(VARCHAR) TO ROLE <operator_role>;
+-- GRANT USAGE ON PROCEDURE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RECOVER(VARCHAR) TO ROLE <operator_role>;
+-- GRANT SELECT, INSERT, UPDATE ON TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS        TO ROLE <operator_role>;
+-- GRANT SELECT, INSERT         ON TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS      TO ROLE <operator_role>;
+-- GRANT SELECT, INSERT         ON TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG         TO ROLE <operator_role>;
+-- GRANT SELECT, INSERT         ON TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TM  TO ROLE <operator_role>;
+-- GRANT SELECT, INSERT         ON TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TD  TO ROLE <operator_role>;
+-- GRANT SELECT, UPDATE         ON TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK        TO ROLE <operator_role>;
+
+-- END OF FILE (UAT RECOVER).
