@@ -361,9 +361,17 @@ BEGIN
     FROM islands;
 
     -- The copy list, with new trip IDs (5.0).
+    --     Made empty, then filled by an INSERT: the run window's dates go in as bound
+    --     values, and an INSERT is the surest place for those.
     CREATE OR REPLACE TEMPORARY TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_COPY AS
     SELECT (SELECT MAX(trip_master_id) FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER) + ROW_NUMBER() OVER (ORDER BY w.trip_master_id) AS new_trip_master_id,
            w.trip_master_id AS source_trip_master_id, w.guest_unique_id, w.market_cd, w.trip_start_dt, w.trip_end_dt
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_WORK w
+    WHERE FALSE;
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_COPY
+           (new_trip_master_id, source_trip_master_id, guest_unique_id, market_cd, trip_start_dt, trip_end_dt)
+    SELECT (SELECT MAX(trip_master_id) FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER) + ROW_NUMBER() OVER (ORDER BY w.trip_master_id),
+           w.trip_master_id, w.guest_unique_id, w.market_cd, w.trip_start_dt, w.trip_end_dt
     FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_WORK w
     WHERE w.action = 'COPY' AND w.in_scope = 1
       AND w.island_start_dt >= :P_FROM_DT AND w.island_start_dt < :P_TO_DT
