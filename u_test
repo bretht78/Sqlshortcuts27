@@ -1,11 +1,18 @@
 -- =============================================================================
 -- DAASI-3641 · one-call version · UAT TEST (Monday)
 -- =============================================================================
--- One worksheet, run top to bottom. Use a NEW worksheet, set to warehouse
--- DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE (so Friday's session settings don't
--- carry over). No session variables; every object is fully named.
--- Steps 3 and 7b are the long ones (about what Friday's runs took).
+-- Run it ONE STATEMENT AT A TIME, top to bottom: cursor in the statement,
+-- Ctrl+Enter (runs just that one), then check the result against the step's
+-- note before going on. (Running the whole file at once goes straight through
+-- the fix, the post-test and the rollback rehearsal, and shows only the last
+-- result.) Any statement can be run again (step 0 always puts UAT back to the
+-- before-picture). Use a NEW worksheet (so Friday's session settings don't
+-- carry over). No session variables; every object is fully named. Steps 3 and
+-- 7b are the long ones (about what Friday's runs took).
 -- =============================================================================
+
+-- The warehouse the procedures use; start the session on it too.
+USE WAREHOUSE DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE;
 
 -- STEP 0. Put the UAT trip tables back to Friday's before-picture: the frozen
 --         clones from the runbook's 9.1 (taken at 2026-10-09 13:59:13, before
@@ -20,11 +27,23 @@ CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL CLONE DAAS_UAT.DAAS_
 -- Must be 0: nothing the fix wrote is in the before-picture.
 SELECT COUNT(*) AS fix_rows_in_before_picture
 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER WHERE created_by = 'DAASI-3641' OR updated_by = 'DAASI-3641';
--- FIRST TIME ONLY, before the first CALL: set Friday's hand-run log aside; the
--- one-call version keeps its own under the same name (its procedures create the
--- six DAASI_3641_* tables on first call), and step 6 reads Friday's rows from
--- the new name.
-ALTER TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG RENAME TO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG_MANUAL;
+-- Set Friday's hand-run log aside, once: the one-call version keeps its own
+-- under the same name (its procedures create the six DAASI_3641_* tables on
+-- first call), and step 6 reads Friday's rows from the new name. Safe to run
+-- again: once DAASI_3641_LOG_MANUAL exists it does nothing.
+EXECUTE IMMEDIATE $$
+DECLARE
+    n NUMBER DEFAULT 0;
+BEGIN
+    SELECT COUNT(*) INTO :n FROM DAAS_UAT.INFORMATION_SCHEMA.TABLES
+    WHERE table_schema = 'DAAS_TEMP_WORK' AND table_name = 'DAASI_3641_LOG_MANUAL';
+    IF (n > 0) THEN
+        RETURN 'Friday''s log is already set aside as DAASI_3641_LOG_MANUAL: nothing to do.';
+    END IF;
+    ALTER TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG RENAME TO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG_MANUAL;
+    RETURN 'Friday''s log set aside as DAASI_3641_LOG_MANUAL.';
+END;
+$$;
 -- STARTING OVER (any later time): the reset above, then drop the one-call
 -- version's own tables; the next CALL recreates them empty:
 --   DROP TABLE IF EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS;
@@ -243,3 +262,53 @@ SELECT 'live detail rows, whole table: before minus now',
 -- longer running, in a NEW worksheet, as the same user:
 --   CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RECOVER('<run_id from DAASI_3641_RUNS>');
 -- then call RUN_ALL again (in the new worksheet).
+--
+-- Finding the statement behind "... on line N at position P": N counts from the
+-- line holding the opening $$ of that procedure's file (that line is 1). In
+-- Snowsight's "SQL definition" view of the procedure, the same statement is at
+-- line N + 5 (the view adds five header lines).
+--
+-- "SQL execution internal error: Processing aborted due to error 300002:...;
+-- incident ...": Snowflake itself crashed on that statement; it is not a SQL
+-- mistake, and nothing was changed. Run the same CALL once more. If it stops
+-- the same way again, run the block below (a one-minute test of PREFLIGHT's
+-- first write, three ways; it removes its own test rows) and send Claude its
+-- one-line result. Snowflake support can see exactly what crashed from the
+-- incident number and the query ID of the failed statement (Query History).
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_val VARCHAR;
+    r1    VARCHAR DEFAULT 'ok';
+    r2    VARCHAR DEFAULT 'ok';
+    r3    VARCHAR DEFAULT 'ok';
+BEGIN
+    SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION;
+    SELECT LOWER(MAX("value")) INTO :v_val FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    BEGIN
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES ('TEST', 'TEST', 1, 'values, plain', 'true', 'true', TRUE, CURRENT_TIMESTAMP());
+    EXCEPTION
+        WHEN OTHER THEN
+            r1 := LEFT(SQLERRM, 120);
+    END;
+    BEGIN
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES ('TEST', 'TEST', 2, 'values, bound', 'true', COALESCE(:v_val, 'unknown'),
+                COALESCE(:v_val, 'true') = 'true', CURRENT_TIMESTAMP());
+    EXCEPTION
+        WHEN OTHER THEN
+            r2 := LEFT(SQLERRM, 120);
+    END;
+    BEGIN
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        SELECT 'TEST', 'TEST', 3, 'select, bound', 'true', COALESCE(:v_val, 'unknown'),
+               COALESCE(:v_val, 'true') = 'true', CURRENT_TIMESTAMP();
+    EXCEPTION
+        WHEN OTHER THEN
+            r3 := LEFT(SQLERRM, 120);
+    END;
+    DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS WHERE phase = 'TEST';
+    RETURN 'warehouse ' || COALESCE(CURRENT_WAREHOUSE(), 'none') || ' | 1 values/plain: ' || r1
+        || ' | 2 values/bound: ' || r2 || ' | 3 select/bound: ' || r3;
+END;
+$$;
