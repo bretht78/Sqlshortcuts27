@@ -406,9 +406,10 @@ BEGIN
     END IF;
 
     -- 16. The kinds of write the procedures are made of, each tried once with bound
-    --     values on a private scratch table. (Snowflake crashed here on one kind,
-    --     INSERT ... VALUES with bound values, so none of the procedures uses it any
-    --     more; this proves the kinds they do use run, before anything changes.)
+    --     values on a private scratch table (a temporary table: it goes away with
+    --     the session). Snowflake crashed here on one kind, INSERT ... VALUES with
+    --     bound values, so none of the procedures uses it any more; this proves the
+    --     kinds they do use run, before anything changes.
     BEGIN
         CREATE OR REPLACE TEMPORARY TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST
             (k VARCHAR(20), n NUMBER(38,0), b BOOLEAN, ts TIMESTAMP_LTZ);
@@ -423,18 +424,17 @@ BEGIN
         UPDATE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST
            SET n = n + 10, b = (:v_id IS NOT NULL), ts = CURRENT_TIMESTAMP()
          WHERE k = :v_id AND n = 1;
-        DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST WHERE k = :v_id AND n = 2;
+        -- now 11, 2 and 101: total 114, two of them marked
         SELECT COALESCE(SUM(n), 0), COUNT_IF(b) INTO :v_m, :v_k FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST;
-        DROP TABLE IF EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST;
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        SELECT  :v_id, 'PREFLIGHT', 16, 'Writes with bound values run here (insert, update, delete)', 'all ran',
-                IFF(:v_m = 112 AND :v_k = 2, 'all ran', 'ran, wrong result (' || TO_VARCHAR(:v_m) || ', ' || TO_VARCHAR(:v_k) || ')'),
-                :v_m = 112 AND :v_k = 2, CURRENT_TIMESTAMP();
+        SELECT  :v_id, 'PREFLIGHT', 16, 'Writes with bound values run here (insert, update)', 'all ran',
+                IFF(:v_m = 114 AND :v_k = 2, 'all ran', 'ran, wrong result (' || TO_VARCHAR(:v_m) || ', ' || TO_VARCHAR(:v_k) || ')'),
+                :v_m = 114 AND :v_k = 2, CURRENT_TIMESTAMP();
     EXCEPTION
         WHEN OTHER THEN
             v_val := LEFT(SQLERRM, 100);
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            SELECT  :v_id, 'PREFLIGHT', 16, 'Writes with bound values run here (insert, update, delete)', 'all ran',
+            SELECT  :v_id, 'PREFLIGHT', 16, 'Writes with bound values run here (insert, update)', 'all ran',
                     :v_val, FALSE, CURRENT_TIMESTAMP();
     END;
 
