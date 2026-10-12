@@ -236,9 +236,8 @@ BEGIN
     v_run_id := TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISSFF3');
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS
         (run_id, kind, from_dt, to_dt, status, chain_paused, started_at, run_by, session_id, message)
-    VALUES
-        (:v_run_id, 'RUN', :P_FROM_DT, :P_TO_DT, 'STARTED', FALSE, CURRENT_TIMESTAMP(), CURRENT_USER(),
-         CURRENT_SESSION(), 'Started.');
+    SELECT  :v_run_id, 'RUN', :P_FROM_DT, :P_TO_DT, 'STARTED', FALSE, CURRENT_TIMESTAMP(), CURRENT_USER(),
+            CURRENT_SESSION(), 'Started.';
     v_logged := TRUE;
     UPDATE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK SET holder = :v_run_id, since = CURRENT_TIMESTAMP() WHERE holder IS NULL;
     IF (SQLROWCOUNT = 0) THEN
@@ -402,8 +401,7 @@ BEGIN
          WHERE run_id = :v_run_id;
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
             (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES
-            (:v_run_id, 'GATE', 99, 'RESULT', 'COMMITTED', 'NOTHING_TO_DO', TRUE, CURRENT_TIMESTAMP());
+        SELECT  :v_run_id, 'GATE', 99, 'RESULT', 'COMMITTED', 'NOTHING_TO_DO', TRUE, CURRENT_TIMESTAMP();
         LET rs0 RESULTSET := (SELECT check_name, expected, actual, passed
                               FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
                               WHERE run_id = :v_run_id ORDER BY check_no);
@@ -677,35 +675,46 @@ BEGIN
 
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
         (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES
-        (:v_run_id, 'GATE', 1, 'Old market trips retired, as logged',
-         TO_VARCHAR(:v_retire_planned), TO_VARCHAR(:v_retire_done), :v_retire_done = :v_retire_planned, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 2, 'New market trips created, as logged',
-         TO_VARCHAR(:v_copy_planned), TO_VARCHAR(:v_copy_done), :v_copy_done = :v_copy_planned, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 3, 'New trip IDs that collide with another row',
-         '0', TO_VARCHAR(:v_dup_trip_ids), :v_dup_trip_ids = 0, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 4, 'New detail IDs that collide with another row',
-         '0', TO_VARCHAR(:v_dup_detail_ids), :v_dup_detail_ids = 0, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 5, 'Live detail rows left on retired trips',
-         '0', TO_VARCHAR(:v_left_on_old), :v_left_on_old = 0, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 6, 'Detail rows on the new trips = on their property trips',
-         TO_VARCHAR(:v_src_details), TO_VARCHAR(:v_new_details), :v_new_details = :v_src_details, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 7, 'Transactions dropped from every market trip',
-         '0', TO_VARCHAR(:v_dropped), :v_dropped = 0, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 8, 'Ratings added minus ratings retired',
-         '0', TO_VARCHAR(:v_ratings_net), :v_ratings_net = 0, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 9, 'New trips over the max trip days without a hotel stay',
-         '0', TO_VARCHAR(:v_over_cap), :v_over_cap = 0, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 10, 'Ratings lost or doubled, all BEM/WLM (no worse than before)',
-         '<= ' || TO_VARCHAR(:v_g62_before), TO_VARCHAR(:v_g62_after), :v_g62_after <= :v_g62_before, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 11, 'Kept copies = retired rows (trips / detail rows)',
-         TO_VARCHAR(:v_retired_tm) || ' / ' || TO_VARCHAR(:v_retired_td),
-         TO_VARCHAR(:v_arch_tm) || ' / ' || TO_VARCHAR(:v_arch_td),
-         :v_arch_tm = :v_retired_tm AND :v_arch_td = :v_retired_td, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 12, 'New trips with a live identical market trip (a double copy)',
-         '0', TO_VARCHAR(:v_dup_twins), :v_dup_twins = 0, CURRENT_TIMESTAMP()),
-        (:v_run_id, 'GATE', 99, 'RESULT',
-         'COMMITTED', IFF(:v_failed = 0, 'COMMITTED', 'ROLLED BACK'), :v_failed = 0, CURRENT_TIMESTAMP());
+    SELECT  :v_run_id, 'GATE', 1, 'Old market trips retired, as logged',
+            TO_VARCHAR(:v_retire_planned), TO_VARCHAR(:v_retire_done), :v_retire_done = :v_retire_planned, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 2, 'New market trips created, as logged',
+            TO_VARCHAR(:v_copy_planned), TO_VARCHAR(:v_copy_done), :v_copy_done = :v_copy_planned, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 3, 'New trip IDs that collide with another row',
+            '0', TO_VARCHAR(:v_dup_trip_ids), :v_dup_trip_ids = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 4, 'New detail IDs that collide with another row',
+            '0', TO_VARCHAR(:v_dup_detail_ids), :v_dup_detail_ids = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 5, 'Live detail rows left on retired trips',
+            '0', TO_VARCHAR(:v_left_on_old), :v_left_on_old = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 6, 'Detail rows on the new trips = on their property trips',
+            TO_VARCHAR(:v_src_details), TO_VARCHAR(:v_new_details), :v_new_details = :v_src_details, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 7, 'Transactions dropped from every market trip',
+            '0', TO_VARCHAR(:v_dropped), :v_dropped = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 8, 'Ratings added minus ratings retired',
+            '0', TO_VARCHAR(:v_ratings_net), :v_ratings_net = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 9, 'New trips over the max trip days without a hotel stay',
+            '0', TO_VARCHAR(:v_over_cap), :v_over_cap = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 10, 'Ratings lost or doubled, all BEM/WLM (no worse than before)',
+            '<= ' || TO_VARCHAR(:v_g62_before), TO_VARCHAR(:v_g62_after), :v_g62_after <= :v_g62_before, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 11, 'Kept copies = retired rows (trips / detail rows)',
+            TO_VARCHAR(:v_retired_tm) || ' / ' || TO_VARCHAR(:v_retired_td),
+            TO_VARCHAR(:v_arch_tm) || ' / ' || TO_VARCHAR(:v_arch_td),
+            :v_arch_tm = :v_retired_tm AND :v_arch_td = :v_retired_td, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 12, 'New trips with a live identical market trip (a double copy)',
+            '0', TO_VARCHAR(:v_dup_twins), :v_dup_twins = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_run_id, 'GATE', 99, 'RESULT',
+            'COMMITTED', IFF(:v_failed = 0, 'COMMITTED', 'ROLLED BACK'), :v_failed = 0, CURRENT_TIMESTAMP();
 
     IF (v_failed > 0) THEN
         RAISE e_checks_failed;
