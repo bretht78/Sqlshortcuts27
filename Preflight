@@ -105,22 +105,22 @@ BEGIN
     SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION;
     SELECT LOWER(MAX("value")) INTO :v_val FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES (:v_id, 'PREFLIGHT', 1, 'Session AUTOCOMMIT', 'true', COALESCE(:v_val, 'unknown'),
-            COALESCE(:v_val, 'true') = 'true', CURRENT_TIMESTAMP());
+    SELECT  :v_id, 'PREFLIGHT', 1, 'Session AUTOCOMMIT', 'true', COALESCE(:v_val, 'unknown'),
+            COALESCE(:v_val, 'true') = 'true', CURRENT_TIMESTAMP();
 
     -- 2. the warehouse the run uses (start the call on it too)
     BEGIN
         EXECUTE IMMEDIATE 'USE WAREHOUSE DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE';
         v_val := CURRENT_WAREHOUSE();
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 2, 'Warehouse the run uses (start the call on it too)', 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE',
+        SELECT  :v_id, 'PREFLIGHT', 2, 'Warehouse the run uses (start the call on it too)', 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE',
                 LEFT(COALESCE(:v_val, 'none') || ' (this call started on ' || COALESCE(:v_call_wh, 'none') || ')', 100),
-                COALESCE(:v_val, '') = 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE', CURRENT_TIMESTAMP());
+                COALESCE(:v_val, '') = 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE', CURRENT_TIMESTAMP();
     EXCEPTION
         WHEN OTHER THEN
             v_val := LEFT(SQLERRM, 100);
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            VALUES (:v_id, 'PREFLIGHT', 2, 'Warehouse the run uses (start the call on it too)', 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE', :v_val, FALSE, CURRENT_TIMESTAMP());
+            SELECT  :v_id, 'PREFLIGHT', 2, 'Warehouse the run uses (start the call on it too)', 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE', :v_val, FALSE, CURRENT_TIMESTAMP();
     END;
 
     -- 3. the statement timeout in force (the run must not be cut off partway)
@@ -137,17 +137,17 @@ BEGIN
         v_timeout_s := v_wh_timeout_s;
     END IF;
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES (:v_id, 'PREFLIGHT', 3, 'Statement timeout in force (session and warehouse)', 'at least 4 hours',
+    SELECT  :v_id, 'PREFLIGHT', 3, 'Statement timeout in force (session and warehouse)', 'at least 4 hours',
             LEFT(IFF(:v_timeout_s = 0, 'none (the 7-day maximum applies)', TO_VARCHAR(FLOOR(:v_timeout_s / 3600)::INTEGER) || ' hour(s)')
               || IFF(:v_wh_timeout_s < 0, '; could not read the warehouse''s', ''), 100),
-            :v_timeout_s = 0 OR :v_timeout_s >= 14400, CURRENT_TIMESTAMP());
+            :v_timeout_s = 0 OR :v_timeout_s >= 14400, CURRENT_TIMESTAMP();
 
     -- 4. the run lock: one row, free
     SELECT COUNT(*), MAX(holder) INTO :v_n, :v_val FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK;
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES (:v_id, 'PREFLIGHT', 4, 'Run lock', '1 row, free',
+    SELECT  :v_id, 'PREFLIGHT', 4, 'Run lock', '1 row, free',
             TO_VARCHAR(:v_n) || ' row(s), ' || COALESCE('held by run ' || :v_val, 'free'),
-            :v_n = 1 AND :v_val IS NULL, CURRENT_TIMESTAMP());
+            :v_n = 1 AND :v_val IS NULL, CURRENT_TIMESTAMP();
 
     -- 5. the trip tables
     BEGIN
@@ -157,13 +157,13 @@ BEGIN
               UNION ALL
               SELECT 1 FROM (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL LIMIT 1));
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 5, 'Trip tables readable, with rows', '2 of 2', TO_VARCHAR(:v_n) || ' of 2',
-                :v_n = 2, CURRENT_TIMESTAMP());
+        SELECT  :v_id, 'PREFLIGHT', 5, 'Trip tables readable, with rows', '2 of 2', TO_VARCHAR(:v_n) || ' of 2',
+                :v_n = 2, CURRENT_TIMESTAMP();
     EXCEPTION
         WHEN OTHER THEN
             v_val := LEFT(SQLERRM, 100);
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            VALUES (:v_id, 'PREFLIGHT', 5, 'Trip tables readable, with rows', '2 of 2', :v_val, FALSE, CURRENT_TIMESTAMP());
+            SELECT  :v_id, 'PREFLIGHT', 5, 'Trip tables readable, with rows', '2 of 2', :v_val, FALSE, CURRENT_TIMESTAMP();
     END;
 
     -- 6. the kept-copy tables still have the trip tables' columns, same names in the
@@ -193,15 +193,15 @@ BEGIN
         SELECT COUNT(*) INTO :v_k FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
         WHERE table_schema = 'DAAS_TEMP_WORK' AND table_name IN ('TRIP_MASTER', 'TRIP_DETAIL');
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 6, 'Kept-copy tables match the trip tables (column names and order)', '0 differences',
+        SELECT  :v_id, 'PREFLIGHT', 6, 'Kept-copy tables match the trip tables (column names and order)', '0 differences',
                 TO_VARCHAR(:v_n + :v_m) || ' difference(s); ' || TO_VARCHAR(:v_k) || ' trip-table columns seen',
-                :v_n + :v_m = 0 AND :v_k > 0, CURRENT_TIMESTAMP());
+                :v_n + :v_m = 0 AND :v_k > 0, CURRENT_TIMESTAMP();
     EXCEPTION
         WHEN OTHER THEN
             v_val := LEFT(SQLERRM, 100);
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            VALUES (:v_id, 'PREFLIGHT', 6, 'Kept-copy tables match the trip tables (column names and order)', '0 differences', :v_val,
-                    FALSE, CURRENT_TIMESTAMP());
+            SELECT  :v_id, 'PREFLIGHT', 6, 'Kept-copy tables match the trip tables (column names and order)', '0 differences', :v_val,
+                    FALSE, CURRENT_TIMESTAMP();
     END;
 
     -- 7. backups (PROD: the clones BACKUP takes, within the last 2 days; UAT: none needed)
@@ -212,22 +212,22 @@ BEGIN
             SELECT MAX(created) INTO :v_ts2 FROM DAAS_UAT.INFORMATION_SCHEMA.TABLES
             WHERE table_schema = 'DAAS_TEMP_WORK' AND LEFT(table_name, 23) = 'TRIP_DETAIL_DAASI_3641_';
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            VALUES (:v_id, 'PREFLIGHT', 7, 'Backups of the trip tables taken in the last 2 days', 'yes',
+            SELECT  :v_id, 'PREFLIGHT', 7, 'Backups of the trip tables taken in the last 2 days', 'yes',
                     'TRIP_MASTER: ' || COALESCE(TO_VARCHAR(:v_ts, 'YYYY-MM-DD HH24:MI'), 'none')
                       || ', TRIP_DETAIL: ' || COALESCE(TO_VARCHAR(:v_ts2, 'YYYY-MM-DD HH24:MI'), 'none'),
                     COALESCE(:v_ts >= DATEADD(hour, -48, CURRENT_TIMESTAMP()), FALSE)
-                    AND COALESCE(:v_ts2 >= DATEADD(hour, -48, CURRENT_TIMESTAMP()), FALSE), CURRENT_TIMESTAMP());
+                    AND COALESCE(:v_ts2 >= DATEADD(hour, -48, CURRENT_TIMESTAMP()), FALSE), CURRENT_TIMESTAMP();
         EXCEPTION
             WHEN OTHER THEN
                 v_val := LEFT(SQLERRM, 100);
                 INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-                VALUES (:v_id, 'PREFLIGHT', 7, 'Backups of the trip tables taken in the last 2 days', 'yes', :v_val,
-                        FALSE, CURRENT_TIMESTAMP());
+                SELECT  :v_id, 'PREFLIGHT', 7, 'Backups of the trip tables taken in the last 2 days', 'yes', :v_val,
+                        FALSE, CURRENT_TIMESTAMP();
         END;
     ELSE
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 7, 'Backups of the trip tables taken in the last 2 days', 'n/a',
-                'n/a (UAT works on clones)', NULL, CURRENT_TIMESTAMP());
+        SELECT  :v_id, 'PREFLIGHT', 7, 'Backups of the trip tables taken in the last 2 days', 'n/a',
+                'n/a (UAT works on clones)', NULL, CURRENT_TIMESTAMP();
     END IF;
 
     -- 8-11. The trip chain and the tables it feeds. In PROD these must pass. In
@@ -237,15 +237,15 @@ BEGIN
         SHOW TASKS LIKE 'TRIP_ROOT_TASK' IN SCHEMA DAAS_PROD.DAAS_COMMON;
         SELECT MAX("state") INTO :v_val FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 8, 'Trip chain root task visible and running', 'started',
+        SELECT  :v_id, 'PREFLIGHT', 8, 'Trip chain root task visible and running', 'started',
                 COALESCE(:v_val, 'not visible to this role'),
-                IFF(:v_has_chain, COALESCE(:v_val = 'started', FALSE), NULL), CURRENT_TIMESTAMP());
+                IFF(:v_has_chain, COALESCE(:v_val = 'started', FALSE), NULL), CURRENT_TIMESTAMP();
     EXCEPTION
         WHEN OTHER THEN
             v_val := LEFT(SQLERRM, 100);
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            VALUES (:v_id, 'PREFLIGHT', 8, 'Trip chain root task visible and running', 'started', :v_val,
-                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP());
+            SELECT  :v_id, 'PREFLIGHT', 8, 'Trip chain root task visible and running', 'started', :v_val,
+                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP();
     END;
 
     BEGIN
@@ -253,14 +253,14 @@ BEGIN
         FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.CURRENT_TASK_GRAPHS(ROOT_TASK_NAME => 'TRIP_ROOT_TASK'))
         WHERE database_name = 'DAAS_PROD' AND schema_name = 'DAAS_COMMON' AND state = 'EXECUTING';
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 9, 'Trip chain runs in progress readable', 'readable',
-                TO_VARCHAR(:v_n) || ' running now', IFF(:v_has_chain, TRUE, NULL), CURRENT_TIMESTAMP());
+        SELECT  :v_id, 'PREFLIGHT', 9, 'Trip chain runs in progress readable', 'readable',
+                TO_VARCHAR(:v_n) || ' running now', IFF(:v_has_chain, TRUE, NULL), CURRENT_TIMESTAMP();
     EXCEPTION
         WHEN OTHER THEN
             v_val := LEFT(SQLERRM, 100);
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            VALUES (:v_id, 'PREFLIGHT', 9, 'Trip chain runs in progress readable', 'readable', :v_val,
-                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP());
+            SELECT  :v_id, 'PREFLIGHT', 9, 'Trip chain runs in progress readable', 'readable', :v_val,
+                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP();
     END;
 
     -- (the post-test waits for a finished chain run after the commit, so this
@@ -273,16 +273,16 @@ BEGIN
                  TASK_NAME => 'TRIP_ROOT_TASK'))
         WHERE database_name = 'DAAS_PROD' AND schema_name = 'DAAS_COMMON' AND state = 'SUCCEEDED';
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 10, 'Trip chain finished a run in the last 2 hours', 'yes',
+        SELECT  :v_id, 'PREFLIGHT', 10, 'Trip chain finished a run in the last 2 hours', 'yes',
                 COALESCE('last at ' || TO_VARCHAR(:v_ts, 'YYYY-MM-DD HH24:MI'), 'none seen in 6 hours'),
                 IFF(:v_has_chain, COALESCE(:v_ts >= DATEADD(hour, -2, CURRENT_TIMESTAMP()), FALSE), NULL),
-                CURRENT_TIMESTAMP());
+                CURRENT_TIMESTAMP();
     EXCEPTION
         WHEN OTHER THEN
             v_val := LEFT(SQLERRM, 100);
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            VALUES (:v_id, 'PREFLIGHT', 10, 'Trip chain finished a run in the last 2 hours', 'yes', :v_val,
-                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP());
+            SELECT  :v_id, 'PREFLIGHT', 10, 'Trip chain finished a run in the last 2 hours', 'yes', :v_val,
+                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP();
     END;
 
     BEGIN
@@ -297,21 +297,21 @@ BEGIN
               UNION ALL SELECT COUNT(trip_master_id) FROM DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY WHERE FALSE
               UNION ALL SELECT COUNT(trip_master_id) FROM DAAS_PROD.DAAS_CORE.DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT WHERE FALSE);
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 11, 'Downstream tables the post-test reads', '7 readable', TO_VARCHAR(:v_n) || ' readable',
-                IFF(:v_has_chain, :v_n = 7, NULL), CURRENT_TIMESTAMP());
+        SELECT  :v_id, 'PREFLIGHT', 11, 'Downstream tables the post-test reads', '7 readable', TO_VARCHAR(:v_n) || ' readable',
+                IFF(:v_has_chain, :v_n = 7, NULL), CURRENT_TIMESTAMP();
     EXCEPTION
         WHEN OTHER THEN
             v_val := LEFT(SQLERRM, 100);
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            VALUES (:v_id, 'PREFLIGHT', 11, 'Downstream tables the post-test reads', '7 readable', :v_val,
-                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP());
+            SELECT  :v_id, 'PREFLIGHT', 11, 'Downstream tables the post-test reads', '7 readable', :v_val,
+                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP();
     END;
 
     -- 12. a call made inside an open transaction would not behave (information)
     v_val := CURRENT_TRANSACTION();
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES (:v_id, 'PREFLIGHT', 12, 'Open transaction in this session (call with none open)', 'none',
-            COALESCE(:v_val, 'none'), NULL, CURRENT_TIMESTAMP());
+    SELECT  :v_id, 'PREFLIGHT', 12, 'Open transaction in this session (call with none open)', 'none',
+            COALESCE(:v_val, 'none'), NULL, CURRENT_TIMESTAMP();
 
     -- 13-14. What RUN_ALL will do, by market (information): the same work list
     --        RUN_ALL builds, read once. Compare with the UAT run's numbers.
@@ -379,10 +379,11 @@ BEGIN
     FROM islands
     ) wl;
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES (:v_id, 'PREFLIGHT', 13, 'BEM: market trips to retire / property trips to copy / out of scope (information)',
-            'compare with UAT', TO_VARCHAR(:v_bem_r) || ' / ' || TO_VARCHAR(:v_bem_c) || ' / ' || TO_VARCHAR(:v_bem_o), NULL, CURRENT_TIMESTAMP()),
-           (:v_id, 'PREFLIGHT', 14, 'WLM: market trips to retire / property trips to copy / out of scope (information)',
-            'compare with UAT', TO_VARCHAR(:v_wlm_r) || ' / ' || TO_VARCHAR(:v_wlm_c) || ' / ' || TO_VARCHAR(:v_wlm_o), NULL, CURRENT_TIMESTAMP());
+    SELECT  :v_id, 'PREFLIGHT', 13, 'BEM: market trips to retire / property trips to copy / out of scope (information)',
+            'compare with UAT', TO_VARCHAR(:v_bem_r) || ' / ' || TO_VARCHAR(:v_bem_c) || ' / ' || TO_VARCHAR(:v_bem_o), NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_id, 'PREFLIGHT', 14, 'WLM: market trips to retire / property trips to copy / out of scope (information)',
+            'compare with UAT', TO_VARCHAR(:v_wlm_r) || ' / ' || TO_VARCHAR(:v_wlm_c) || ' / ' || TO_VARCHAR(:v_wlm_o), NULL, CURRENT_TIMESTAMP();
 
     -- 15. PROD: the two sequences the run draws new IDs from are visible to this role
     IF (v_has_backup) THEN
@@ -390,27 +391,60 @@ BEGIN
             SELECT COUNT(*) INTO :v_n FROM DAAS_UAT.INFORMATION_SCHEMA.SEQUENCES
             WHERE sequence_schema = 'DAAS_TEMP_WORK' AND sequence_name IN ('TRIP_MASTER_SEQ', 'TRIP_DETAIL_SEQ');
             INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-            VALUES (:v_id, 'PREFLIGHT', 15, 'Trip ID sequences visible to this role', '2 of 2', TO_VARCHAR(:v_n) || ' of 2',
-                    :v_n = 2, CURRENT_TIMESTAMP());
+            SELECT  :v_id, 'PREFLIGHT', 15, 'Trip ID sequences visible to this role', '2 of 2', TO_VARCHAR(:v_n) || ' of 2',
+                    :v_n = 2, CURRENT_TIMESTAMP();
         EXCEPTION
             WHEN OTHER THEN
                 v_val := LEFT(SQLERRM, 100);
                 INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-                VALUES (:v_id, 'PREFLIGHT', 15, 'Trip ID sequences visible to this role', '2 of 2', :v_val, FALSE, CURRENT_TIMESTAMP());
+                SELECT  :v_id, 'PREFLIGHT', 15, 'Trip ID sequences visible to this role', '2 of 2', :v_val, FALSE, CURRENT_TIMESTAMP();
         END;
     ELSE
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-        VALUES (:v_id, 'PREFLIGHT', 15, 'Trip ID sequences visible to this role', 'n/a', 'n/a (UAT continues from the clones'' highest IDs)',
-                NULL, CURRENT_TIMESTAMP());
+        SELECT  :v_id, 'PREFLIGHT', 15, 'Trip ID sequences visible to this role', 'n/a', 'n/a (UAT continues from the clones'' highest IDs)',
+                NULL, CURRENT_TIMESTAMP();
     END IF;
+
+    -- 16. The kinds of write the procedures are made of, each tried once with bound
+    --     values on a private scratch table. (Snowflake crashed here on one kind,
+    --     INSERT ... VALUES with bound values, so none of the procedures uses it any
+    --     more; this proves the kinds they do use run, before anything changes.)
+    BEGIN
+        CREATE OR REPLACE TEMPORARY TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST
+            (k VARCHAR(20), n NUMBER(38,0), b BOOLEAN, ts TIMESTAMP_LTZ);
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST (k, n, b, ts)
+        SELECT  :v_id, 1, COALESCE(:v_id, 'x') = :v_id, CURRENT_TIMESTAMP()
+        UNION ALL
+        SELECT  :v_id, 2, NULL, CURRENT_TIMESTAMP();
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST (k, n, b, ts)
+        SELECT k, n + 100, b, CURRENT_TIMESTAMP()
+        FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST
+        WHERE k = :v_id AND n = 1;
+        UPDATE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST
+           SET n = n + 10, b = (:v_id IS NOT NULL), ts = CURRENT_TIMESTAMP()
+         WHERE k = :v_id AND n = 1;
+        DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST WHERE k = :v_id AND n = 2;
+        SELECT COALESCE(SUM(n), 0), COUNT_IF(b) INTO :v_m, :v_k FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST;
+        DROP TABLE IF EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST;
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        SELECT  :v_id, 'PREFLIGHT', 16, 'Writes with bound values run here (insert, update, delete)', 'all ran',
+                IFF(:v_m = 112 AND :v_k = 2, 'all ran', 'ran, wrong result (' || TO_VARCHAR(:v_m) || ', ' || TO_VARCHAR(:v_k) || ')'),
+                :v_m = 112 AND :v_k = 2, CURRENT_TIMESTAMP();
+    EXCEPTION
+        WHEN OTHER THEN
+            v_val := LEFT(SQLERRM, 100);
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            SELECT  :v_id, 'PREFLIGHT', 16, 'Writes with bound values run here (insert, update, delete)', 'all ran',
+                    :v_val, FALSE, CURRENT_TIMESTAMP();
+    END;
 
     SELECT COUNT_IF(passed = FALSE) INTO :v_failed
     FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
     WHERE run_id = :v_id AND phase = 'PREFLIGHT';
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
-    VALUES (:v_id, 'PREFLIGHT', 99, 'RESULT', 'READY',
+    SELECT  :v_id, 'PREFLIGHT', 99, 'RESULT', 'READY',
             IFF(:v_failed = 0, 'READY', 'NOT READY: ' || TO_VARCHAR(:v_failed) || ' check(s) failed'),
-            :v_failed = 0, CURRENT_TIMESTAMP());
+            :v_failed = 0, CURRENT_TIMESTAMP();
 
     LET rs RESULTSET := (SELECT check_name, expected, actual, passed
                          FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
