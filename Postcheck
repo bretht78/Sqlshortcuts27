@@ -1,0 +1,429 @@
+-- DAASI-3641 · one-call version · UAT · POST_CHECK. One file per procedure; the notes that
+-- cover all of them are at the top of DAASI_3641_ONECALL_UAT_RUN_ALL.sql.
+
+-- -----------------------------------------------------------------------------
+-- 4. POST_CHECK: the post-test for a committed run (the latest, or the
+--    run_id given). In UAT there is no chain, so run it right after RUN_ALL.
+--    RESULT is PASS, FAIL or WAITING; for WAITING, "expected" says what for.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_POST_CHECK(P_RUN_ID VARCHAR DEFAULT NULL)
+COPY GRANTS
+RETURNS TABLE (CHECK_NAME VARCHAR, EXPECTED VARCHAR, ACTUAL VARCHAR, PASSED BOOLEAN)
+LANGUAGE SQL
+COMMENT = 'DAASI-3641: the post-test for a committed run (the latest, or the run_id given). RESULT: PASS, FAIL or WAITING.'
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    v_has_chain     BOOLEAN DEFAULT FALSE;
+    v_autocommit    VARCHAR;
+    v_run           VARCHAR;
+    v_status        VARCHAR;
+    v_committed_at  TIMESTAMP_LTZ;
+    v_since         TIMESTAMP_LTZ;
+    v_phase         VARCHAR;
+    v_root_id       VARCHAR;
+    v_failed_task   VARCHAR;
+    v_runs_since    NUMBER DEFAULT 0;
+    v_failed_since  NUMBER DEFAULT 0;
+    v_busy          NUMBER DEFAULT 0;
+    v_tsdt          NUMBER DEFAULT 0;
+    v_vw            NUMBER DEFAULT 0;
+    v_dws           NUMBER DEFAULT 0;
+    v_18mo          NUMBER DEFAULT 0;
+    v_smart         NUMBER DEFAULT 0;
+    v_das           NUMBER DEFAULT 0;
+    v_gap           NUMBER DEFAULT 0;
+    v_lingering     NUMBER DEFAULT 0;
+    v_new_missing   NUMBER DEFAULT 0;
+    v_new_removed   NUMBER DEFAULT 0;
+    v_new_updated   NUMBER DEFAULT 0;
+    v_not_in_uat    NUMBER DEFAULT -1;
+    v_left_bem      NUMBER DEFAULT 0;
+    v_left_wlm      NUMBER DEFAULT 0;
+    v_over_cap      NUMBER DEFAULT 0;
+    v_bem_diff      NUMBER DEFAULT 0;
+    v_wlm_diff      NUMBER DEFAULT 0;
+    v_fail          NUMBER DEFAULT 0;
+    v_chain_result  VARCHAR;
+    v_chain_reason  VARCHAR;
+    v_result        VARCHAR;
+    v_reason        VARCHAR;
+    v_ts            TIMESTAMP_LTZ;
+    e_autocommit    EXCEPTION (-20650, 'DAASI-3641: this session has AUTOCOMMIT off. Run ALTER SESSION SET AUTOCOMMIT = TRUE; and call again. Nothing was changed.');
+    e_open_txn      EXCEPTION (-20657, 'DAASI-3641: this session has a transaction open (left by a cancelled call?), so nothing was done. Use a new worksheet. If that call was RUN_ALL or ROLLBACK: CALL DAASI_3641_RECOVER(''<its run_id>'') there.');
+BEGIN
+    -- Never inside a transaction left open by a cancelled call: the table
+    -- statements below are DDL, and DDL would commit it (with whatever that call
+    -- had half done). Use a new worksheet; RECOVER cleans the old one up.
+    IF (CURRENT_TRANSACTION() IS NOT NULL) THEN
+        RAISE e_open_txn;
+    END IF;
+    SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION;
+    SELECT MAX("value") INTO :v_autocommit FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    IF (LOWER(COALESCE(v_autocommit, 'true')) <> 'true') THEN
+        RAISE e_autocommit;
+    END IF;
+    IF (COALESCE(CURRENT_WAREHOUSE(), '') <> 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE') THEN
+        EXECUTE IMMEDIATE 'USE WAREHOUSE DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE';
+    END IF;
+    EXECUTE IMMEDIATE 'ALTER SESSION SET TIMEZONE = ''America/Los_Angeles''';
+    -- the six working tables, created only if missing (DDL, so before any transaction)
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS (
+        run_id          VARCHAR(20),
+        kind            VARCHAR(10),      -- RUN or ROLLBACK
+        from_dt         DATE,
+        to_dt           DATE,
+        status          VARCHAR(20),      -- STARTED, COMMITTED, NOTHING_TO_DO, CHECKS_FAILED, CHAIN_BUSY,
+                                          -- CHAIN_PAUSED, LOCK_BUSY, ERROR, ABORTED, ROLLED_BACK
+        chain_paused    BOOLEAN,          -- TRUE while this run holds the trip chain paused
+        started_at      TIMESTAMP_LTZ,
+        committed_at    TIMESTAMP_LTZ,
+        finished_at     TIMESTAMP_LTZ,
+        trips_retired   NUMBER(38,0),
+        trips_copied    NUMBER(38,0),
+        details_moved   NUMBER(38,0),
+        scan_from       DATE,
+        scan_to         DATE,
+        run_by          VARCHAR(200),
+        session_id      VARCHAR(100),     -- the Snowflake session that ran it (RECOVER uses it)
+        message         VARCHAR(4000)
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (
+        run_id          VARCHAR(20),
+        phase           VARCHAR(10),      -- GATE, POST1, POST3, ROLLBACK, PREFLIGHT, RECOVER
+        check_no        NUMBER(4,0),
+        check_name      VARCHAR(200),
+        expected        VARCHAR(100),
+        actual          VARCHAR(100),
+        passed          BOOLEAN,          -- NULL = information only
+        checked_at      TIMESTAMP_LTZ
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG (
+        run_id             VARCHAR(20),
+        logged_at          TIMESTAMP_NTZ,
+        from_dt            DATE,
+        to_dt              DATE,
+        action             VARCHAR(10),
+        trip_master_id     NUMBER(38,0),  -- RETIRE: the old market trip.  COPY: the source property trip.
+        new_trip_master_id NUMBER(38,0),  -- COPY only: the new market trip
+        market_cd          VARCHAR(100),
+        trip_start_dt      DATE,
+        trip_end_dt        DATE
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TM AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS run_id, t.*
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER t
+    WHERE FALSE;
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TD AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS run_id, d.*
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d
+    WHERE FALSE;
+    -- (created with its one row)
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS holder, CAST(NULL AS TIMESTAMP_LTZ) AS since;
+
+    -- the run under test: the one given, or the latest committed one
+    IF (P_RUN_ID IS NULL) THEN
+        SELECT MAX_BY(run_id, started_at) INTO :v_run
+        FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS WHERE kind = 'RUN' AND status = 'COMMITTED';
+    ELSE
+        v_run := P_RUN_ID;
+    END IF;
+    SELECT MAX(status), MAX(committed_at) INTO :v_status, :v_committed_at
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS
+    WHERE run_id = :v_run AND kind = 'RUN';
+
+    IF (v_run IS NULL OR v_status IS NULL OR v_status <> 'COMMITTED') THEN
+        v_status := COALESCE(v_status, IFF(v_run IS NULL, 'no committed run', 'no such run'));
+        v_run := COALESCE(v_run, 'NONE');
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+            (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES
+            (:v_run, 'POST1', 99, 'RESULT', 'a committed run', :v_status, FALSE, CURRENT_TIMESTAMP());
+        LET rs0 RESULTSET := (SELECT 'RESULT' AS check_name, 'a committed run' AS expected,
+                                     :v_status AS actual, FALSE AS passed);
+        RETURN TABLE(rs0);
+    END IF;
+
+    v_phase := IFF(v_committed_at <= DATEADD(hour, -72, CURRENT_TIMESTAMP()), 'POST3', 'POST1');
+
+    -- ---------- PROD: the trip chain and the tables it feeds ----------
+    IF (v_has_chain) THEN
+        -- A finished chain run that started after the commit. (If a later run is
+        -- going now, a failing look is treated as WAITING, below.)
+        v_since := GREATEST(v_committed_at, DATEADD(day, -6, CURRENT_TIMESTAMP()));
+        SELECT COUNT(*) INTO :v_runs_since
+        FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.TASK_HISTORY(
+                 SCHEDULED_TIME_RANGE_START => :v_since,
+                 RESULT_LIMIT => 10000,
+                 TASK_NAME => 'TRIP_ROOT_TASK'))
+        WHERE database_name = 'DAAS_PROD'
+          AND schema_name = 'DAAS_COMMON'
+          AND state = 'SUCCEEDED'
+          AND query_start_time > :v_committed_at;
+
+        SELECT COUNT(*) INTO :v_busy
+        FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.CURRENT_TASK_GRAPHS(ROOT_TASK_NAME => 'TRIP_ROOT_TASK'))
+        WHERE database_name = 'DAAS_PROD' AND schema_name = 'DAAS_COMMON' AND state = 'EXECUTING';
+
+        -- POST1: any task of the chain that failed or was cancelled after the commit is
+        -- for a person to look at (the root task can succeed while a child fails).
+        -- A look that itself fails just means no failure was seen.
+        IF (v_phase = 'POST1') THEN
+            BEGIN
+                SHOW TASKS LIKE 'TRIP_ROOT_TASK' IN SCHEMA DAAS_PROD.DAAS_COMMON;
+                SELECT MAX("id") INTO :v_root_id FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+                SELECT COUNT(*), MAX(name) INTO :v_failed_since, :v_failed_task
+                FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.TASK_HISTORY(
+                         SCHEDULED_TIME_RANGE_START => :v_since,
+                         RESULT_LIMIT => 10000,
+                         ROOT_TASK_ID => :v_root_id,
+                         ERROR_ONLY => TRUE))
+                WHERE COALESCE(query_start_time, scheduled_time) > :v_committed_at;
+            EXCEPTION
+                WHEN OTHER THEN
+                    v_failed_since := 0;
+            END;
+        END IF;
+
+        IF (v_failed_since > 0) THEN
+            v_chain_result := 'FAIL';
+            v_chain_reason := LEFT('chain task ' || COALESCE(v_failed_task, '?') || ' failed or was cancelled after the commit', 100);
+        ELSEIF (v_runs_since = 0) THEN
+            IF (v_committed_at <= DATEADD(hour, -4, CURRENT_TIMESTAMP())) THEN
+                v_chain_result := 'FAIL';
+                v_chain_reason := 'no finished trip chain run in the 4 hours since the commit';
+            ELSE
+                v_chain_result := 'WAITING';
+                v_chain_reason := 'the next trip chain run to finish';
+            END IF;
+        END IF;
+
+        IF (v_chain_result IS NULL) THEN
+            -- Retired trips still in a downstream table (fine until the archival step clears them)
+            SELECT COUNT(DISTINCT x.trip_master_id) INTO :v_tsdt
+            FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r JOIN DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT x ON x.trip_master_id = r.trip_master_id
+            WHERE r.run_id = :v_run AND r.action = 'RETIRE';
+            SELECT COUNT(DISTINCT x.trip_master_id) INTO :v_vw
+            FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r JOIN DAAS_PROD.DAAS_CORE_MARKETING_VW.TRIP_SUMMARY_VW x ON x.trip_master_id = r.trip_master_id
+            WHERE r.run_id = :v_run AND r.action = 'RETIRE';
+            SELECT COUNT(DISTINCT x.trip_master_id) INTO :v_dws
+            FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r JOIN DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY x ON x.trip_master_id = r.trip_master_id
+            WHERE r.run_id = :v_run AND r.action = 'RETIRE';
+            SELECT COUNT(DISTINCT x.trip_master_id) INTO :v_18mo
+            FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r JOIN DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY_18MO x ON x.trip_master_id = r.trip_master_id
+            WHERE r.run_id = :v_run AND r.action = 'RETIRE';
+            SELECT COUNT(DISTINCT x.trip_master_id) INTO :v_smart
+            FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r JOIN DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY x ON x.trip_master_id = r.trip_master_id
+            WHERE r.run_id = :v_run AND r.action = 'RETIRE';
+            SELECT COUNT(DISTINCT x.trip_master_id) INTO :v_das
+            FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r JOIN DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY x ON x.trip_master_id = r.trip_master_id
+            WHERE r.run_id = :v_run AND r.action = 'RETIRE';
+            SELECT COUNT(DISTINCT x.trip_master_id) INTO :v_gap
+            FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r JOIN DAAS_PROD.DAAS_CORE.DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT x ON x.trip_master_id = r.trip_master_id
+            WHERE r.run_id = :v_run AND r.action = 'RETIRE';
+            v_lingering := v_tsdt + v_vw + v_dws + v_18mo + v_smart + v_das + v_gap;
+
+            -- New trips the summaries should now hold, and what the chain did to them
+            SELECT COUNT(*) INTO :v_new_missing
+            FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r
+            WHERE r.run_id = :v_run AND r.action = 'COPY'
+              AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT x
+                              WHERE x.trip_master_id = r.new_trip_master_id);
+
+            SELECT COUNT_IF(t.trip_master_id IS NULL OR t.delete_ind <> 'N'),
+                   COUNT_IF(t.delete_ind = 'N' AND COALESCE(t.updated_by, '') <> 'DAASI-3641')
+            INTO :v_new_removed, :v_new_updated
+            FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r
+            LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER t ON t.trip_master_id = r.new_trip_master_id
+            WHERE r.run_id = :v_run AND r.action = 'COPY';
+
+            v_fail := IFF(v_new_missing = 0, 0, 1) + IFF(v_new_removed = 0, 0, 1);
+            IF (v_fail > 0 AND v_busy > 0) THEN
+                -- the chain is mid-run, so this may be a half-finished picture: look again later
+                v_chain_result := 'WAITING';
+                v_chain_reason := 'the trip chain run now in progress to finish';
+                v_fail := 0;
+            END IF;
+            IF (v_chain_result IS NULL AND v_phase = 'POST3' AND v_fail = 0 AND v_lingering > 0) THEN
+                -- Some layers keep retired trips until the archival step clears them ("within
+                -- about 3 days"): wait for it, up to 7 days after the commit.
+                IF (v_committed_at > DATEADD(day, -7, CURRENT_TIMESTAMP())) THEN
+                    v_chain_result := 'WAITING';
+                    v_chain_reason := 'retired trips to clear downstream (archival step; up to 7 days)';
+                ELSE
+                    v_chain_result := 'FAIL';
+                    v_chain_reason := 'retired trips cleared downstream within 7 days';
+                END IF;
+            END IF;
+        END IF;
+    END IF;
+
+    -- ---------- both environments: the core tables themselves ----------
+    -- Final proof (6.0): no in-scope island is left to fix (the work list, read once).
+    SELECT COUNT_IF(market_cd = 'BEM'), COUNT_IF(market_cd = 'WLM') INTO :v_left_bem, :v_left_wlm
+    FROM (
+    WITH prop AS (
+        SELECT trip_master_id, guest_unique_id,
+               DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd,
+               trip_start_dt, trip_end_dt
+        FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER
+        WHERE trip_type = 'PROPERTY' AND delete_ind = 'N' AND property_cd IN ('IBE', 'IWA')
+    ),
+    mkt AS (
+        SELECT trip_master_id, guest_unique_id, market_cd, trip_start_dt, trip_end_dt, created_dttm
+        FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER
+        WHERE trip_type = 'MARKET' AND delete_ind = 'N' AND market_cd IN ('BEM', 'WLM')
+    ),
+    twinless AS (
+        SELECT 'RETIRE' AS action,
+               m.trip_master_id, m.guest_unique_id, m.market_cd, m.trip_start_dt, m.trip_end_dt,
+               IFF(m.created_dttm < '2026-08-12 11:16:26', 1, 0) AS is_seed
+        FROM mkt m
+        WHERE NOT EXISTS (SELECT 1 FROM prop p
+                          WHERE p.market_cd = m.market_cd AND p.guest_unique_id = m.guest_unique_id
+                            AND p.trip_start_dt = m.trip_start_dt AND p.trip_end_dt = m.trip_end_dt)
+        UNION ALL
+        SELECT 'COPY',
+               p.trip_master_id, p.guest_unique_id, p.market_cd, p.trip_start_dt, p.trip_end_dt,
+               0
+        FROM prop p
+        WHERE NOT EXISTS (SELECT 1 FROM mkt m
+                          WHERE m.market_cd = p.market_cd AND m.guest_unique_id = p.guest_unique_id
+                            AND m.trip_start_dt = p.trip_start_dt AND m.trip_end_dt = p.trip_end_dt)
+    ),
+    running AS (
+        SELECT t.*,
+               MAX(trip_end_dt) OVER (PARTITION BY guest_unique_id, market_cd
+                                      ORDER BY trip_start_dt, trip_end_dt, trip_master_id
+                                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run_max_end
+        FROM twinless t
+    ),
+    starts AS (
+        SELECT r.*,
+               IFF(LAG(run_max_end) OVER (PARTITION BY guest_unique_id, market_cd
+                                          ORDER BY trip_start_dt, trip_end_dt, trip_master_id)
+                   >= trip_start_dt, 0, 1) AS new_island
+        FROM running r
+    ),
+    islands AS (
+        SELECT s.*,
+               SUM(new_island) OVER (PARTITION BY guest_unique_id, market_cd
+                                     ORDER BY trip_start_dt, trip_end_dt, trip_master_id
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS island_no
+        FROM starts s
+    )
+    SELECT action, trip_master_id, guest_unique_id, market_cd, trip_start_dt, trip_end_dt, island_no,
+           MIN(trip_start_dt) OVER (PARTITION BY guest_unique_id, market_cd, island_no) AS island_start_dt,
+           MAX(is_seed)       OVER (PARTITION BY guest_unique_id, market_cd, island_no) AS in_scope
+    FROM islands
+    ) wl
+    WHERE in_scope = 1;
+
+    -- Tracy's check in the core tables (6.5): BEM/WLM market trips over the max
+    -- trip days with no hotel stay, the whole table.
+    SELECT COUNT(*) INTO :v_over_cap
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER tm
+    WHERE tm.trip_type = 'MARKET' AND tm.market_cd IN ('BEM', 'WLM') AND tm.delete_ind = 'N'
+      AND DATEDIFF(day, tm.trip_start_dt, tm.trip_end_dt) + 1 > DECODE(tm.market_cd, 'BEM', 1, 'WLM', 3, 999)
+      AND NOT EXISTS (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d
+                      WHERE d.trip_master_id = tm.trip_master_id
+                        AND d.transaction_type = 'HOTEL' AND d.delete_ind = 'N');
+
+    -- Live detail rows, market side minus property side (6.3): BEM vs IBE, WLM vs IWA.
+    SELECT COALESCE(SUM(IFF(tm.trip_type = 'MARKET' AND tm.market_cd = 'BEM', 1, 0)), 0)
+         - COALESCE(SUM(IFF(tm.trip_type = 'PROPERTY' AND tm.property_cd = 'IBE', 1, 0)), 0),
+           COALESCE(SUM(IFF(tm.trip_type = 'MARKET' AND tm.market_cd = 'WLM', 1, 0)), 0)
+         - COALESCE(SUM(IFF(tm.trip_type = 'PROPERTY' AND tm.property_cd = 'IWA', 1, 0)), 0)
+    INTO :v_bem_diff, :v_wlm_diff
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER tm
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d ON d.trip_master_id = tm.trip_master_id
+    WHERE tm.delete_ind = 'N' AND d.delete_ind = 'N'
+      AND ((tm.trip_type = 'MARKET' AND tm.market_cd IN ('BEM', 'WLM'))
+           OR (tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('IBE', 'IWA')));
+
+    -- Answer key: every trip this run created, the UAT run created too (information)
+    BEGIN
+        SELECT COUNT(*) INTO :v_not_in_uat
+        FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r
+        JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER t ON t.trip_master_id = r.new_trip_master_id
+        WHERE r.run_id = :v_run AND r.action = 'COPY'
+          AND NOT EXISTS (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TM_AFTER u
+                          WHERE u.trip_type = 'MARKET' AND u.delete_ind = 'N' AND u.created_by = 'DAASI-3641'
+                            AND u.guest_unique_id = t.guest_unique_id AND u.market_cd = t.market_cd
+                            AND u.trip_start_dt = t.trip_start_dt AND u.trip_end_dt = t.trip_end_dt);
+    EXCEPTION
+        WHEN OTHER THEN
+            v_not_in_uat := -1;
+    END;
+
+    v_fail := v_fail + IFF(v_left_bem + v_left_wlm = 0, 0, 1) + IFF(v_over_cap = 0, 0, 1);
+    IF (v_chain_result IS NOT NULL) THEN
+        v_result := v_chain_result;
+        v_reason := v_chain_reason;
+        IF (v_result = 'WAITING' AND v_fail > 0) THEN
+            v_result := 'FAIL';
+            v_reason := 'the core-table checks (the chain checks still waiting)';
+        END IF;
+    ELSE
+        v_result := IFF(v_fail = 0, 'PASS', 'FAIL');
+        v_reason := 'PASS';
+    END IF;
+
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+        (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+    VALUES
+        (:v_run, :v_phase, 1, 'In-scope trips still to fix after the run (BEM / WLM)',
+         '0 / 0', TO_VARCHAR(:v_left_bem) || ' / ' || TO_VARCHAR(:v_left_wlm), :v_left_bem + :v_left_wlm = 0, CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 2, 'BEM/WLM market trips over the max trip days without a hotel stay (whole table)',
+         '0', TO_VARCHAR(:v_over_cap), :v_over_cap = 0, CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 3, 'Live detail rows, BEM minus IBE (information; 0 right after the run)',
+         '0', TO_VARCHAR(:v_bem_diff), NULL, CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 4, 'Live detail rows, WLM minus IWA (information; 0 right after the run)',
+         '0', TO_VARCHAR(:v_wlm_diff), NULL, CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 5, 'New trips the UAT run did not also create (information)',
+         '0', IFF(:v_not_in_uat < 0, 'n/a', TO_VARCHAR(:v_not_in_uat)), NULL, CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 6, 'New trips missing from TRIP_SUMMARY_DT',
+         '0', IFF(:v_has_chain, IFF(:v_chain_result IS NULL OR :v_chain_result = 'PASS', TO_VARCHAR(:v_new_missing), 'not checked yet'), 'n/a (no chain)'),
+         IFF(:v_has_chain AND :v_chain_result IS NULL, :v_new_missing = 0, NULL), CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 7, 'New trips the chain removed (look before going on)',
+         '0', IFF(:v_has_chain, IFF(:v_chain_result IS NULL, TO_VARCHAR(:v_new_removed), 'not checked yet'), 'n/a (no chain)'),
+         IFF(:v_has_chain AND :v_chain_result IS NULL, :v_new_removed = 0, NULL), CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 8, 'New trips the chain updated (information)',
+         'any', IFF(:v_has_chain, IFF(:v_chain_result IS NULL, TO_VARCHAR(:v_new_updated), 'not checked yet'), 'n/a (no chain)'), NULL, CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 9, 'Retired trips still in TRIP_SUMMARY_DT',
+         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_tsdt), 'n/a (no chain)'),
+         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_tsdt = 0, NULL), CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 10, 'Retired trips still in TRIP_SUMMARY_VW',
+         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_vw), 'n/a (no chain)'),
+         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_vw = 0, NULL), CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 11, 'Retired trips still in TIBCO DWS TRIP_SUMMARY',
+         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_dws), 'n/a (no chain)'),
+         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_dws = 0, NULL), CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 12, 'Retired trips still in TIBCO TRIP_SUMMARY_18MO',
+         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_18mo), 'n/a (no chain)'),
+         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_18mo = 0, NULL), CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 13, 'Retired trips still in TIBCO SMART TRIP_SUMMARY',
+         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_smart), 'n/a (no chain)'),
+         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_smart = 0, NULL), CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 14, 'Retired trips still in DAILY_ACTIVITY_SUMMARY',
+         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_das), 'n/a (no chain)'),
+         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_das = 0, NULL), CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 15, 'Retired trips still in the trip-number gap metric',
+         IFF(:v_phase = 'POST3', '0', 'any for now'), IFF(:v_has_chain, TO_VARCHAR(:v_gap), 'n/a (no chain)'),
+         IFF(:v_phase = 'POST3' AND :v_has_chain AND :v_chain_result IS NULL, :v_gap = 0, NULL), CURRENT_TIMESTAMP()),
+        (:v_run, :v_phase, 99, 'RESULT',
+         :v_reason, :v_result, IFF(:v_result = 'WAITING', NULL, :v_result = 'PASS'), CURRENT_TIMESTAMP());
+
+    LET rs RESULTSET := (SELECT check_name, expected, actual, passed
+                         FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+                         WHERE run_id = :v_run AND phase = :v_phase
+                           AND checked_at = (SELECT MAX(checked_at) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+                                             WHERE run_id = :v_run AND phase = :v_phase)
+                         ORDER BY check_no);
+    RETURN TABLE(rs);
+END;
+$$;
+
+-- END OF FILE (UAT POST_CHECK).
