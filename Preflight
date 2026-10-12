@@ -1,0 +1,418 @@
+-- DAASI-3641 · one-call version · UAT · PREFLIGHT. One file per procedure; the notes that
+-- cover all of them are at the top of DAASI_3641_ONECALL_UAT_RUN_ALL.sql.
+
+-- -----------------------------------------------------------------------------
+-- 2. PREFLIGHT: the pre-test. Read-only apart from its own rows in
+--    DAASI_3641_CHECKS (it reads the whole work list once, so it takes a few
+--    minutes on the Large warehouse). RESULT must say READY. Rows with an empty
+--    "passed" are information: among them, what RUN_ALL will do, by market.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PREFLIGHT()
+COPY GRANTS
+RETURNS TABLE (CHECK_NAME VARCHAR, EXPECTED VARCHAR, ACTUAL VARCHAR, PASSED BOOLEAN)
+LANGUAGE SQL
+COMMENT = 'DAASI-3641: the pre-test. Changes nothing except adding its own rows to DAASI_3641_CHECKS. RESULT must say READY.'
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    v_has_chain     BOOLEAN DEFAULT FALSE;
+    v_has_backup    BOOLEAN DEFAULT FALSE;
+    v_id            VARCHAR;
+    v_val           VARCHAR;
+    v_n             NUMBER DEFAULT 0;
+    v_m             NUMBER DEFAULT 0;
+    v_k             NUMBER DEFAULT 0;
+    v_ts            TIMESTAMP_LTZ;
+    v_ts2           TIMESTAMP_LTZ;
+    v_failed        NUMBER DEFAULT 0;
+    v_timeout_s     NUMBER DEFAULT 0;
+    v_wh_timeout_s  NUMBER DEFAULT -1;
+    v_call_wh       VARCHAR;
+    v_bem_r         NUMBER DEFAULT 0;
+    v_bem_c         NUMBER DEFAULT 0;
+    v_bem_o         NUMBER DEFAULT 0;
+    v_wlm_r         NUMBER DEFAULT 0;
+    v_wlm_c         NUMBER DEFAULT 0;
+    v_wlm_o         NUMBER DEFAULT 0;
+    e_open_txn      EXCEPTION (-20657, 'DAASI-3641: this session has a transaction open (left by a cancelled call?), so nothing was done. Use a new worksheet. If that call was RUN_ALL or ROLLBACK: CALL DAASI_3641_RECOVER(''<its run_id>'') there.');
+BEGIN
+    -- Never inside a transaction left open by a cancelled call: the table
+    -- statements below are DDL, and DDL would commit it (with whatever that call
+    -- had half done). Use a new worksheet; RECOVER cleans the old one up.
+    IF (CURRENT_TRANSACTION() IS NOT NULL) THEN
+        RAISE e_open_txn;
+    END IF;
+    v_id := 'PF' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISSFF3');
+    v_call_wh := CURRENT_WAREHOUSE();
+    EXECUTE IMMEDIATE 'ALTER SESSION SET TIMEZONE = ''America/Los_Angeles''';
+    -- the six working tables, created only if missing (DDL, so before any transaction)
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS (
+        run_id          VARCHAR(20),
+        kind            VARCHAR(10),      -- RUN or ROLLBACK
+        from_dt         DATE,
+        to_dt           DATE,
+        status          VARCHAR(20),      -- STARTED, COMMITTED, NOTHING_TO_DO, CHECKS_FAILED, CHAIN_BUSY,
+                                          -- CHAIN_PAUSED, LOCK_BUSY, ERROR, ABORTED, ROLLED_BACK
+        chain_paused    BOOLEAN,          -- TRUE while this run holds the trip chain paused
+        started_at      TIMESTAMP_LTZ,
+        committed_at    TIMESTAMP_LTZ,
+        finished_at     TIMESTAMP_LTZ,
+        trips_retired   NUMBER(38,0),
+        trips_copied    NUMBER(38,0),
+        details_moved   NUMBER(38,0),
+        scan_from       DATE,
+        scan_to         DATE,
+        run_by          VARCHAR(200),
+        session_id      VARCHAR(100),     -- the Snowflake session that ran it (RECOVER uses it)
+        message         VARCHAR(4000)
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (
+        run_id          VARCHAR(20),
+        phase           VARCHAR(10),      -- GATE, POST1, POST3, ROLLBACK, PREFLIGHT, RECOVER
+        check_no        NUMBER(4,0),
+        check_name      VARCHAR(200),
+        expected        VARCHAR(100),
+        actual          VARCHAR(100),
+        passed          BOOLEAN,          -- NULL = information only
+        checked_at      TIMESTAMP_LTZ
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG (
+        run_id             VARCHAR(20),
+        logged_at          TIMESTAMP_NTZ,
+        from_dt            DATE,
+        to_dt              DATE,
+        action             VARCHAR(10),
+        trip_master_id     NUMBER(38,0),  -- RETIRE: the old market trip.  COPY: the source property trip.
+        new_trip_master_id NUMBER(38,0),  -- COPY only: the new market trip
+        market_cd          VARCHAR(100),
+        trip_start_dt      DATE,
+        trip_end_dt        DATE
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TM AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS run_id, t.*
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER t
+    WHERE FALSE;
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TD AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS run_id, d.*
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d
+    WHERE FALSE;
+    -- (created with its one row)
+    CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS holder, CAST(NULL AS TIMESTAMP_LTZ) AS since;
+
+    -- 1. AUTOCOMMIT on (every procedure refuses to start without it)
+    SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION;
+    SELECT LOWER(MAX("value")) INTO :v_val FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+    VALUES (:v_id, 'PREFLIGHT', 1, 'Session AUTOCOMMIT', 'true', COALESCE(:v_val, 'unknown'),
+            COALESCE(:v_val, 'true') = 'true', CURRENT_TIMESTAMP());
+
+    -- 2. the warehouse the run uses (start the call on it too)
+    BEGIN
+        EXECUTE IMMEDIATE 'USE WAREHOUSE DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE';
+        v_val := CURRENT_WAREHOUSE();
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES (:v_id, 'PREFLIGHT', 2, 'Warehouse the run uses (start the call on it too)', 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE',
+                LEFT(COALESCE(:v_val, 'none') || ' (this call started on ' || COALESCE(:v_call_wh, 'none') || ')', 100),
+                COALESCE(:v_val, '') = 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE', CURRENT_TIMESTAMP());
+    EXCEPTION
+        WHEN OTHER THEN
+            v_val := LEFT(SQLERRM, 100);
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            VALUES (:v_id, 'PREFLIGHT', 2, 'Warehouse the run uses (start the call on it too)', 'DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE', :v_val, FALSE, CURRENT_TIMESTAMP());
+    END;
+
+    -- 3. the statement timeout in force (the run must not be cut off partway)
+    SHOW PARAMETERS LIKE 'STATEMENT_TIMEOUT_IN_SECONDS' IN SESSION;
+    SELECT COALESCE(MAX(TRY_TO_NUMBER("value")), 0) INTO :v_timeout_s FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    BEGIN
+        SHOW PARAMETERS LIKE 'STATEMENT_TIMEOUT_IN_SECONDS' IN WAREHOUSE DAAS_PROD_STRATEGICANALYTICS_BIG_COMPUTE;
+        SELECT COALESCE(MAX(TRY_TO_NUMBER("value")), 0) INTO :v_wh_timeout_s FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    EXCEPTION
+        WHEN OTHER THEN
+            v_wh_timeout_s := -1;
+    END;
+    IF (v_wh_timeout_s > 0 AND (v_timeout_s = 0 OR v_wh_timeout_s < v_timeout_s)) THEN
+        v_timeout_s := v_wh_timeout_s;
+    END IF;
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+    VALUES (:v_id, 'PREFLIGHT', 3, 'Statement timeout in force (session and warehouse)', 'at least 4 hours',
+            LEFT(IFF(:v_timeout_s = 0, 'none (the 7-day maximum applies)', TO_VARCHAR(FLOOR(:v_timeout_s / 3600)::INTEGER) || ' hour(s)')
+              || IFF(:v_wh_timeout_s < 0, '; could not read the warehouse''s', ''), 100),
+            :v_timeout_s = 0 OR :v_timeout_s >= 14400, CURRENT_TIMESTAMP());
+
+    -- 4. the run lock: one row, free
+    SELECT COUNT(*), MAX(holder) INTO :v_n, :v_val FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOCK;
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+    VALUES (:v_id, 'PREFLIGHT', 4, 'Run lock', '1 row, free',
+            TO_VARCHAR(:v_n) || ' row(s), ' || COALESCE('held by run ' || :v_val, 'free'),
+            :v_n = 1 AND :v_val IS NULL, CURRENT_TIMESTAMP());
+
+    -- 5. the trip tables
+    BEGIN
+        SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER LIMIT 1))
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL LIMIT 1))
+        INTO :v_n;
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES (:v_id, 'PREFLIGHT', 5, 'Trip tables readable, with rows', '2 of 2', TO_VARCHAR(:v_n) || ' of 2',
+                :v_n = 2, CURRENT_TIMESTAMP());
+    EXCEPTION
+        WHEN OTHER THEN
+            v_val := LEFT(SQLERRM, 100);
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            VALUES (:v_id, 'PREFLIGHT', 5, 'Trip tables readable, with rows', '2 of 2', :v_val, FALSE, CURRENT_TIMESTAMP());
+    END;
+
+    -- 6. the kept-copy tables still have the trip tables' columns, same names in the
+    --    same order after run_id (a column added to a trip table after deploying
+    --    would make the copy and restore steps fail)
+    BEGIN
+        SELECT COUNT(*) INTO :v_n
+        FROM (SELECT pos, col
+              FROM (SELECT ordinal_position AS pos, column_name AS col
+                    FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
+                    WHERE table_schema = 'DAAS_TEMP_WORK' AND table_name = 'TRIP_MASTER'
+                    UNION ALL
+                    SELECT ordinal_position - 1, column_name
+                    FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
+                    WHERE table_schema = 'DAAS_TEMP_WORK' AND table_name = 'DAASI_3641_RETIRED_TM' AND column_name <> 'RUN_ID')
+              GROUP BY pos, col HAVING COUNT(*) <> 2);
+        SELECT COUNT(*) INTO :v_m
+        FROM (SELECT pos, col
+              FROM (SELECT ordinal_position AS pos, column_name AS col
+                    FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
+                    WHERE table_schema = 'DAAS_TEMP_WORK' AND table_name = 'TRIP_DETAIL'
+                    UNION ALL
+                    SELECT ordinal_position - 1, column_name
+                    FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
+                    WHERE table_schema = 'DAAS_TEMP_WORK' AND table_name = 'DAASI_3641_RETIRED_TD' AND column_name <> 'RUN_ID')
+              GROUP BY pos, col HAVING COUNT(*) <> 2);
+        SELECT COUNT(*) INTO :v_k FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
+        WHERE table_schema = 'DAAS_TEMP_WORK' AND table_name IN ('TRIP_MASTER', 'TRIP_DETAIL');
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES (:v_id, 'PREFLIGHT', 6, 'Kept-copy tables match the trip tables (column names and order)', '0 differences',
+                TO_VARCHAR(:v_n + :v_m) || ' difference(s); ' || TO_VARCHAR(:v_k) || ' trip-table columns seen',
+                :v_n + :v_m = 0 AND :v_k > 0, CURRENT_TIMESTAMP());
+    EXCEPTION
+        WHEN OTHER THEN
+            v_val := LEFT(SQLERRM, 100);
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            VALUES (:v_id, 'PREFLIGHT', 6, 'Kept-copy tables match the trip tables (column names and order)', '0 differences', :v_val,
+                    FALSE, CURRENT_TIMESTAMP());
+    END;
+
+    -- 7. backups (PROD: the clones BACKUP takes, within the last 2 days; UAT: none needed)
+    IF (v_has_backup) THEN
+        BEGIN
+            SELECT MAX(created) INTO :v_ts FROM DAAS_UAT.INFORMATION_SCHEMA.TABLES
+            WHERE table_schema = 'DAAS_TEMP_WORK' AND LEFT(table_name, 23) = 'TRIP_MASTER_DAASI_3641_';
+            SELECT MAX(created) INTO :v_ts2 FROM DAAS_UAT.INFORMATION_SCHEMA.TABLES
+            WHERE table_schema = 'DAAS_TEMP_WORK' AND LEFT(table_name, 23) = 'TRIP_DETAIL_DAASI_3641_';
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            VALUES (:v_id, 'PREFLIGHT', 7, 'Backups of the trip tables taken in the last 2 days', 'yes',
+                    'TRIP_MASTER: ' || COALESCE(TO_VARCHAR(:v_ts, 'YYYY-MM-DD HH24:MI'), 'none')
+                      || ', TRIP_DETAIL: ' || COALESCE(TO_VARCHAR(:v_ts2, 'YYYY-MM-DD HH24:MI'), 'none'),
+                    COALESCE(:v_ts >= DATEADD(hour, -48, CURRENT_TIMESTAMP()), FALSE)
+                    AND COALESCE(:v_ts2 >= DATEADD(hour, -48, CURRENT_TIMESTAMP()), FALSE), CURRENT_TIMESTAMP());
+        EXCEPTION
+            WHEN OTHER THEN
+                v_val := LEFT(SQLERRM, 100);
+                INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+                VALUES (:v_id, 'PREFLIGHT', 7, 'Backups of the trip tables taken in the last 2 days', 'yes', :v_val,
+                        FALSE, CURRENT_TIMESTAMP());
+        END;
+    ELSE
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES (:v_id, 'PREFLIGHT', 7, 'Backups of the trip tables taken in the last 2 days', 'n/a',
+                'n/a (UAT works on clones)', NULL, CURRENT_TIMESTAMP());
+    END IF;
+
+    -- 8-11. The trip chain and the tables it feeds. In PROD these must pass. In
+    --       UAT (no chain to pause) they are a read-only look at the PROD chain,
+    --       for information: they show whether this role can see what PROD needs.
+    BEGIN
+        SHOW TASKS LIKE 'TRIP_ROOT_TASK' IN SCHEMA DAAS_PROD.DAAS_COMMON;
+        SELECT MAX("state") INTO :v_val FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES (:v_id, 'PREFLIGHT', 8, 'Trip chain root task visible and running', 'started',
+                COALESCE(:v_val, 'not visible to this role'),
+                IFF(:v_has_chain, COALESCE(:v_val = 'started', FALSE), NULL), CURRENT_TIMESTAMP());
+    EXCEPTION
+        WHEN OTHER THEN
+            v_val := LEFT(SQLERRM, 100);
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            VALUES (:v_id, 'PREFLIGHT', 8, 'Trip chain root task visible and running', 'started', :v_val,
+                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP());
+    END;
+
+    BEGIN
+        SELECT COUNT(*) INTO :v_n
+        FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.CURRENT_TASK_GRAPHS(ROOT_TASK_NAME => 'TRIP_ROOT_TASK'))
+        WHERE database_name = 'DAAS_PROD' AND schema_name = 'DAAS_COMMON' AND state = 'EXECUTING';
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES (:v_id, 'PREFLIGHT', 9, 'Trip chain runs in progress readable', 'readable',
+                TO_VARCHAR(:v_n) || ' running now', IFF(:v_has_chain, TRUE, NULL), CURRENT_TIMESTAMP());
+    EXCEPTION
+        WHEN OTHER THEN
+            v_val := LEFT(SQLERRM, 100);
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            VALUES (:v_id, 'PREFLIGHT', 9, 'Trip chain runs in progress readable', 'readable', :v_val,
+                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP());
+    END;
+
+    -- (the post-test waits for a finished chain run after the commit, so this
+    --  role must be able to see the chain's history)
+    BEGIN
+        SELECT MAX(completed_time) INTO :v_ts
+        FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.TASK_HISTORY(
+                 SCHEDULED_TIME_RANGE_START => DATEADD(hour, -6, CURRENT_TIMESTAMP()),
+                 RESULT_LIMIT => 10000,
+                 TASK_NAME => 'TRIP_ROOT_TASK'))
+        WHERE database_name = 'DAAS_PROD' AND schema_name = 'DAAS_COMMON' AND state = 'SUCCEEDED';
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES (:v_id, 'PREFLIGHT', 10, 'Trip chain finished a run in the last 2 hours', 'yes',
+                COALESCE('last at ' || TO_VARCHAR(:v_ts, 'YYYY-MM-DD HH24:MI'), 'none seen in 6 hours'),
+                IFF(:v_has_chain, COALESCE(:v_ts >= DATEADD(hour, -2, CURRENT_TIMESTAMP()), FALSE), NULL),
+                CURRENT_TIMESTAMP());
+    EXCEPTION
+        WHEN OTHER THEN
+            v_val := LEFT(SQLERRM, 100);
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            VALUES (:v_id, 'PREFLIGHT', 10, 'Trip chain finished a run in the last 2 hours', 'yes', :v_val,
+                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP());
+    END;
+
+    BEGIN
+        SELECT (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT WHERE FALSE))
+             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE_MARKETING_VW.TRIP_SUMMARY_VW WHERE FALSE))
+             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY WHERE FALSE))
+             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY_18MO WHERE FALSE))
+             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_TIBCO_SMART.TRIP_SUMMARY WHERE FALSE))
+             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY WHERE FALSE))
+             + (SELECT COUNT(*) FROM (SELECT trip_master_id FROM DAAS_PROD.DAAS_CORE.DAAS_TRIP_NUM_GAP_DAILY_METRIC_MKTENT WHERE FALSE))
+        INTO :v_n;
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES (:v_id, 'PREFLIGHT', 11, 'Downstream tables the post-test reads', '7 readable', '7 readable',
+                IFF(:v_has_chain, TRUE, NULL), CURRENT_TIMESTAMP());
+    EXCEPTION
+        WHEN OTHER THEN
+            v_val := LEFT(SQLERRM, 100);
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            VALUES (:v_id, 'PREFLIGHT', 11, 'Downstream tables the post-test reads', '7 readable', :v_val,
+                    IFF(:v_has_chain, FALSE, NULL), CURRENT_TIMESTAMP());
+    END;
+
+    -- 12. a call made inside an open transaction would not behave (information)
+    v_val := CURRENT_TRANSACTION();
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+    VALUES (:v_id, 'PREFLIGHT', 12, 'Open transaction in this session (call with none open)', 'none',
+            COALESCE(:v_val, 'none'), NULL, CURRENT_TIMESTAMP());
+
+    -- 13-14. What RUN_ALL will do, by market (information): the same work list
+    --        RUN_ALL builds, read once. Compare with the UAT run's numbers.
+    SELECT COUNT_IF(market_cd = 'BEM' AND in_scope = 1 AND action = 'RETIRE'),
+           COUNT_IF(market_cd = 'BEM' AND in_scope = 1 AND action = 'COPY'),
+           COUNT_IF(market_cd = 'BEM' AND in_scope = 0),
+           COUNT_IF(market_cd = 'WLM' AND in_scope = 1 AND action = 'RETIRE'),
+           COUNT_IF(market_cd = 'WLM' AND in_scope = 1 AND action = 'COPY'),
+           COUNT_IF(market_cd = 'WLM' AND in_scope = 0)
+    INTO :v_bem_r, :v_bem_c, :v_bem_o, :v_wlm_r, :v_wlm_c, :v_wlm_o
+    FROM (
+    WITH prop AS (
+        SELECT trip_master_id, guest_unique_id,
+               DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd,
+               trip_start_dt, trip_end_dt
+        FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER
+        WHERE trip_type = 'PROPERTY' AND delete_ind = 'N' AND property_cd IN ('IBE', 'IWA')
+    ),
+    mkt AS (
+        SELECT trip_master_id, guest_unique_id, market_cd, trip_start_dt, trip_end_dt, created_dttm
+        FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER
+        WHERE trip_type = 'MARKET' AND delete_ind = 'N' AND market_cd IN ('BEM', 'WLM')
+    ),
+    twinless AS (
+        SELECT 'RETIRE' AS action,
+               m.trip_master_id, m.guest_unique_id, m.market_cd, m.trip_start_dt, m.trip_end_dt,
+               IFF(m.created_dttm < '2026-08-12 11:16:26', 1, 0) AS is_seed
+        FROM mkt m
+        WHERE NOT EXISTS (SELECT 1 FROM prop p
+                          WHERE p.market_cd = m.market_cd AND p.guest_unique_id = m.guest_unique_id
+                            AND p.trip_start_dt = m.trip_start_dt AND p.trip_end_dt = m.trip_end_dt)
+        UNION ALL
+        SELECT 'COPY',
+               p.trip_master_id, p.guest_unique_id, p.market_cd, p.trip_start_dt, p.trip_end_dt,
+               0
+        FROM prop p
+        WHERE NOT EXISTS (SELECT 1 FROM mkt m
+                          WHERE m.market_cd = p.market_cd AND m.guest_unique_id = p.guest_unique_id
+                            AND m.trip_start_dt = p.trip_start_dt AND m.trip_end_dt = p.trip_end_dt)
+    ),
+    running AS (
+        SELECT t.*,
+               MAX(trip_end_dt) OVER (PARTITION BY guest_unique_id, market_cd
+                                      ORDER BY trip_start_dt, trip_end_dt, trip_master_id
+                                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run_max_end
+        FROM twinless t
+    ),
+    starts AS (
+        SELECT r.*,
+               IFF(LAG(run_max_end) OVER (PARTITION BY guest_unique_id, market_cd
+                                          ORDER BY trip_start_dt, trip_end_dt, trip_master_id)
+                   >= trip_start_dt, 0, 1) AS new_island
+        FROM running r
+    ),
+    islands AS (
+        SELECT s.*,
+               SUM(new_island) OVER (PARTITION BY guest_unique_id, market_cd
+                                     ORDER BY trip_start_dt, trip_end_dt, trip_master_id
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS island_no
+        FROM starts s
+    )
+    SELECT action, trip_master_id, guest_unique_id, market_cd, trip_start_dt, trip_end_dt, island_no,
+           MIN(trip_start_dt) OVER (PARTITION BY guest_unique_id, market_cd, island_no) AS island_start_dt,
+           MAX(is_seed)       OVER (PARTITION BY guest_unique_id, market_cd, island_no) AS in_scope
+    FROM islands
+    ) wl;
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+    VALUES (:v_id, 'PREFLIGHT', 13, 'BEM: market trips to retire / property trips to copy / out of scope (information)',
+            'compare with UAT', TO_VARCHAR(:v_bem_r) || ' / ' || TO_VARCHAR(:v_bem_c) || ' / ' || TO_VARCHAR(:v_bem_o), NULL, CURRENT_TIMESTAMP()),
+           (:v_id, 'PREFLIGHT', 14, 'WLM: market trips to retire / property trips to copy / out of scope (information)',
+            'compare with UAT', TO_VARCHAR(:v_wlm_r) || ' / ' || TO_VARCHAR(:v_wlm_c) || ' / ' || TO_VARCHAR(:v_wlm_o), NULL, CURRENT_TIMESTAMP());
+
+    -- 15. PROD: the two sequences the run draws new IDs from are visible to this role
+    IF (v_has_backup) THEN
+        BEGIN
+            SELECT COUNT(*) INTO :v_n FROM DAAS_UAT.INFORMATION_SCHEMA.SEQUENCES
+            WHERE sequence_schema = 'DAAS_TEMP_WORK' AND sequence_name IN ('TRIP_MASTER_SEQ', 'TRIP_DETAIL_SEQ');
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+            VALUES (:v_id, 'PREFLIGHT', 15, 'Trip ID sequences visible to this role', '2 of 2', TO_VARCHAR(:v_n) || ' of 2',
+                    :v_n = 2, CURRENT_TIMESTAMP());
+        EXCEPTION
+            WHEN OTHER THEN
+                v_val := LEFT(SQLERRM, 100);
+                INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+                VALUES (:v_id, 'PREFLIGHT', 15, 'Trip ID sequences visible to this role', '2 of 2', :v_val, FALSE, CURRENT_TIMESTAMP());
+        END;
+    ELSE
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+        VALUES (:v_id, 'PREFLIGHT', 15, 'Trip ID sequences visible to this role', 'n/a', 'n/a (UAT continues from the clones'' highest IDs)',
+                NULL, CURRENT_TIMESTAMP());
+    END IF;
+
+    SELECT COUNT_IF(passed = FALSE) INTO :v_failed
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+    WHERE run_id = :v_id AND phase = 'PREFLIGHT';
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+    VALUES (:v_id, 'PREFLIGHT', 99, 'RESULT', 'READY',
+            IFF(:v_failed = 0, 'READY', 'NOT READY: ' || TO_VARCHAR(:v_failed) || ' check(s) failed'),
+            :v_failed = 0, CURRENT_TIMESTAMP());
+
+    LET rs RESULTSET := (SELECT check_name, expected, actual, passed
+                         FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+                         WHERE run_id = :v_id ORDER BY check_no);
+    RETURN TABLE(rs);
+END;
+$$;
+
+-- END OF FILE (UAT PREFLIGHT).
