@@ -1,0 +1,134 @@
+-- =============================================================================
+-- DAASI-3641 · PROD RUN SHEET · worksheet scripts: nothing to deploy
+-- =============================================================================
+-- After the UAT test has passed and Pete has signed off. Each step is one file,
+-- pasted whole into a NEW Snowsight worksheet and run with Ctrl+Enter. One
+-- statement each. Set the worksheet's role and warehouse by hand first: the
+-- scripts use both exactly as set and switch neither (Large or bigger; about
+-- 20 minutes on a Large, longer on anything smaller). Nothing to deploy, no
+-- session variables, nothing to edit (RECOVER is the exception: it takes a
+-- run_id at its top). Each file's header says what it does, how long it takes
+-- and what to expect.
+--
+-- WHO RUNS WHAT (two people, two laptops, different roles: fine, with this order)
+--   The scripts coordinate only through tables (the DAASI_3641_* work tables,
+--   the backup clones), never through a session, so any mix of people works.
+--   a. The person who will run POST_CHECK and, if ever, UNDO runs PREPARE
+--      first: PREPARE creates the six work tables and the clones, and they
+--      belong to the role that creates them. Another role sees them only if
+--      it sits above that role in the role hierarchy or is granted on them.
+--   b. The person who runs the FIX runs PREPARE too, in the worksheet the FIX
+--      will use, right before it (about 5 minutes, read-only; clones that
+--      exist are kept). Its checks are about that session and role: row 0
+--      must say "0 created, 10 already there" (it sees the backups), and rows
+--      1-3 and 16 that the session and role can do everything the fix needs.
+--      READY under that role means the FIX will run under it.
+--   c. RECOVER, if ever needed, must be run by the same user who ran the
+--      cut-off script (Snowflake lets a user end only their own transaction).
+--
+--   1. DAASI_3641_PROD_1_PREPARE.sql     takes the ten backup clones (seconds)
+--                                        and runs the pre-test. RESULT = READY.
+--                                        About 5 minutes. Safe to run again.
+--   2. DAASI_3641_PROD_2_DRY_RUN.sql     optional: the fix on an empty window.
+--                                        Exercises every PROD-only step, changes
+--                                        no data. RESULT = NOTHING_TO_DO.
+--      Heads-up to TIBCO's owners: BEM/WLM trip IDs from the last 18 months
+--      will change, and the first hourly chain run after the fix will be long.
+--   3. DAASI_3641_PROD_3_FIX.sql         the fix. RESULT = COMMITTED, 12 of 12.
+--                                        About 20 minutes. Best started just
+--                                        after a :15 chain run has finished.
+--   4. DAASI_3641_PROD_4_POST_CHECK.sql  after the next hourly chain run
+--                                        (RESULT = PASS; WAITING = not yet, run
+--                                        it again later), and again 3 days
+--                                        later (PASS). Then Tracy reruns her
+--                                        max(trip_days) query.
+--
+--   Only if needed:
+--   DAASI_3641_PROD_UNDO.sql             undoes the fix exactly, even after the
+--                                        archival step has purged the retired
+--                                        rows. RESULT = ROLLED BACK.
+--   DAASI_3641_PROD_RECOVER.sql          after a cancelled or cut-off script:
+--                                        run_id at its top, NEW worksheet, same
+--                                        user. RESULT = RECOVERED.
+--
+-- Keep the backup clones and the six DAASI_3641_* work tables in
+-- DAAS_PROD.DAAS_TEMP_WORK until Tracy signs off (UNDO needs them).
+-- =============================================================================
+
+-- THE SCOREBOARD, any time: every script's verdict in time order, what each run
+-- did, and any check that failed (expect no FAILED CHECK rows).
+SELECT checked_at AS at_time, 'verdict' AS what, phase AS step, actual AS detail
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+WHERE check_no = 99
+UNION ALL
+SELECT started_at, 'run', kind || ': ' || status,
+       IFF(kind = 'RUN' AND trips_retired IS NOT NULL,
+           TO_VARCHAR(trips_retired) || ' retired, ' || TO_VARCHAR(trips_copied) || ' copied, '
+             || TO_VARCHAR(details_moved) || ' detail rows moved',
+           LEFT(message, 100))
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+UNION ALL
+SELECT checked_at, 'FAILED CHECK', phase || ' #' || TO_VARCHAR(check_no) || ': ' || check_name,
+       'expected ' || COALESCE(expected, '?') || ', got ' || COALESCE(actual, '?')
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+WHERE passed = FALSE
+ORDER BY at_time, what;
+
+-- THE PROOF, one screen, after step 4 (about a minute). Every VERDICT = PASS.
+WITH latest AS (
+    SELECT run_id, trips_retired, trips_copied, details_moved
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+    WHERE kind = 'RUN' AND status = 'COMMITTED'
+    ORDER BY started_at DESC
+    LIMIT 1
+),
+pre AS (
+    SELECT actual
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+    WHERE phase = 'PREFLIGHT' AND check_no = 99
+    ORDER BY checked_at DESC
+    LIMIT 1
+),
+post AS (
+    SELECT c.actual
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_CHECKS c
+    JOIN latest l ON l.run_id = c.run_id
+    WHERE c.phase IN ('POST1', 'POST3') AND c.check_no = 99
+    ORDER BY c.checked_at DESC
+    LIMIT 1
+),
+gates AS (
+    SELECT COALESCE(COUNT_IF(c.passed), 0) AS n_passed, COUNT(*) AS n
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_CHECKS c
+    JOIN latest l ON l.run_id = c.run_id
+    WHERE c.phase = 'GATE' AND c.check_no < 99
+),
+over_cap AS (
+    SELECT COUNT(*) AS n
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER tm
+    WHERE tm.trip_type = 'MARKET' AND tm.market_cd IN ('BEM', 'WLM') AND tm.delete_ind = 'N'
+      AND DATEDIFF(day, tm.trip_start_dt, tm.trip_end_dt) + 1 > DECODE(tm.market_cd, 'BEM', 1, 'WLM', 3, 999)
+      AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                      WHERE d.trip_master_id = tm.trip_master_id
+                        AND d.transaction_type = 'HOTEL' AND d.delete_ind = 'N')
+)
+SELECT 1 AS step, 'Pre-test (PREPARE) said READY' AS what, actual AS result,
+       IFF(actual = 'READY', 'PASS', 'FAIL') AS verdict
+FROM pre
+UNION ALL
+SELECT 2, 'The fix committed: old market trips retired / new ones created / detail rows moved',
+       TO_VARCHAR(trips_retired) || ' / ' || TO_VARCHAR(trips_copied) || ' / ' || TO_VARCHAR(details_moved), 'PASS'
+FROM latest
+UNION ALL
+SELECT 3, 'Checks inside the fix that passed (it commits only if all 12 pass)',
+       TO_VARCHAR(n_passed) || ' of ' || TO_VARCHAR(n), IFF(n = 12 AND n_passed = 12, 'PASS', 'FAIL')
+FROM gates
+UNION ALL
+SELECT 4, 'Latest post-test said PASS (WAITING = the trip chain has not finished a run yet)', actual,
+       IFF(actual = 'PASS', 'PASS', IFF(actual = 'WAITING', 'WAIT', 'FAIL'))
+FROM post
+UNION ALL
+SELECT 5, 'BEM/WLM market trips still longer than their max trip days, with no hotel stay (the complaint)',
+       TO_VARCHAR(n), IFF(n = 0, 'PASS', 'FAIL')
+FROM over_cap
+ORDER BY step;
