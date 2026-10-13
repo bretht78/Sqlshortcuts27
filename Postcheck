@@ -231,8 +231,8 @@ BEGIN
               AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT x
                               WHERE x.trip_master_id = r.new_trip_master_id);
 
-            SELECT COUNT_IF(t.trip_master_id IS NULL OR t.delete_ind <> 'N'),
-                   COUNT_IF(t.delete_ind = 'N' AND COALESCE(t.updated_by, '') <> 'DAASI-3641')
+            SELECT COALESCE(COUNT_IF(t.trip_master_id IS NULL OR t.delete_ind <> 'N'), 0),
+                   COALESCE(COUNT_IF(t.delete_ind = 'N' AND COALESCE(t.updated_by, '') <> 'DAASI-3641'), 0)
             INTO :v_new_removed, :v_new_updated
             FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_LOG r
             LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER t ON t.trip_master_id = r.new_trip_master_id
@@ -261,7 +261,7 @@ BEGIN
 
     -- ---------- both environments: the core tables themselves ----------
     -- Final proof (6.0): no in-scope island is left to fix (the work list, read once).
-    SELECT COUNT_IF(market_cd = 'BEM'), COUNT_IF(market_cd = 'WLM') INTO :v_left_bem, :v_left_wlm
+    SELECT COALESCE(COUNT_IF(market_cd = 'BEM'), 0), COALESCE(COUNT_IF(market_cd = 'WLM'), 0) INTO :v_left_bem, :v_left_wlm
     FROM (
     WITH prop AS (
         SELECT trip_master_id, guest_unique_id,
