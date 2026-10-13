@@ -349,14 +349,21 @@ WHERE f.UPDATED_DTTM >= 'YYYY-MM-DD HH:MI:SS'   -- your deploy time
 
 
 /* ---------------------------------------------------------------------
-   STEP 3  PATCH THE COALESCE DYNAMIC TABLE (COMP_DETAIL_FACT_DT)
+   STEP 3  PATCH THE DYNAMIC TABLE (COMP_DETAIL_FACT_DT)
    The view doesn't read it, but it has the same comment join and looks
    like the proc's eventual replacement. Fixing it now keeps the bug from
    coming back at cutover.
 
-   In the node's SQL, replace the ECPCMPCM_RAW block (lines 268-297 in
-   the copy you pasted into a worksheet) with this. Quotes are single
-   here.
+   The DT is deployed from the repo file
+   daas-snowflake/sql/core/dynamictables/COMP_DETAIL_FACT_DT.sql, which
+   is plain SQL: the deploy script sends it to Snowflake as is. So the
+   FROM line below uses the plain table name. Match the form the
+   CMPLT_RAW subquery just above it uses (same prefix, if it has one).
+   The {{ ref('DAAS_RAW_HETCMS', 'ECPCMPCM_RAW') }} form belongs only in
+   the Coalesce node editor; in this file Snowflake rejects the braces.
+
+   Replace the ECPCMPCM_RAW block (about lines 1060-1088) with this.
+   Quotes are single here.
 
    LEFT JOIN
    (
@@ -374,7 +381,7 @@ WHERE f.UPDATED_DTTM >= 'YYYY-MM-DD HH:MI:SS'   -- your deploy time
                    CMNTCM,
                    PROPERTY_CODE
                FROM
-                   {{ ref('DAAS_RAW_HETCMS', 'ECPCMPCM_RAW') }} ECPCMPCM_RAW
+                   DAAS_RAW_HETCMS.ECPCMPCM_RAW ECPCMPCM_RAW
                QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
                        ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
            )
