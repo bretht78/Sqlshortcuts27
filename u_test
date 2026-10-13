@@ -66,7 +66,7 @@ $$;
 --         (The runbook's Part 4 note says 142,190 for WLM copies, one fewer.
 --         The log counts what Friday actually did, and step 6 compares with
 --         the log, so 142,191 is the number that matters.) Row 16 tries each
---         kind of write the procedures use (insert, update, delete, with bound
+--         kind of write the procedures use (inserts and updates with bound
 --         values) on a scratch table; it must say "all ran".
 CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PREFLIGHT();
 
@@ -84,10 +84,11 @@ CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUN_ALL();
 --         chain rows say n/a.
 CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_POST_CHECK();
 
--- STEP 5. Every check inside the transaction passed. Expect no rows.
-SELECT c.run_id, c.check_no, c.check_name, c.expected, c.actual
+-- STEP 5. Every check inside the transaction passed (a blank "passed" counts
+--         as not passed). Expect no rows.
+SELECT c.run_id, c.check_no, c.check_name, c.expected, c.actual, c.passed
 FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS c
-WHERE c.phase = 'GATE' AND c.passed = FALSE
+WHERE c.phase = 'GATE' AND COALESCE(c.passed, FALSE) = FALSE
 ORDER BY 1, 2;
 
 -- STEP 6. The answer key: same input as Friday's hand-run fix, so the same
@@ -224,13 +225,39 @@ SELECT 'live detail rows, whole table: before minus now',
        (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TD_BEFORE WHERE delete_ind = 'N')
      - (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL WHERE delete_ind = 'N');
 
+-- THE SCOREBOARD (any time): every call's verdict in time order, what each run
+-- did, and any check that failed. After step 7 expect, in order: PREFLIGHT READY;
+-- RUN: ROLLED_BACK with 399497 retired, 984143 copied, 14596393 detail rows
+-- moved; GATE COMMITTED; POST1 PASS; ROLLBACK: COMMITTED; ROLLBACK ROLLED BACK;
+-- and no FAILED CHECK rows.
+SELECT checked_at AS at_time, 'verdict' AS what, phase AS step, actual AS detail
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+WHERE check_no = 99
+UNION ALL
+SELECT started_at, 'run', kind || ': ' || status,
+       IFF(kind = 'RUN' AND trips_retired IS NOT NULL,
+           TO_VARCHAR(trips_retired) || ' retired, ' || TO_VARCHAR(trips_copied) || ' copied, '
+             || TO_VARCHAR(details_moved) || ' detail rows moved',
+           LEFT(message, 100))
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUNS
+UNION ALL
+SELECT checked_at, 'FAILED CHECK', phase || ' #' || TO_VARCHAR(check_no) || ': ' || check_name,
+       'expected ' || COALESCE(expected, '?') || ', got ' || COALESCE(actual, '?')
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+WHERE passed = FALSE
+ORDER BY at_time, what;
+
 -- STEP 8 (recommended: the one thing the simulator cannot prove). Rehearse a
 --         cut-off call and the recovery, now that UAT is back in its before
 --         state:
 --   8a. In this worksheet: CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUN_ALL();
---       and after a minute or two cancel it from Query History (or with the
---       worksheet's stop button). DAASI_3641_RUNS shows it STARTED, the lock
---       row shows it as holder, and SHOW TRANSACTIONS; shows its transaction.
+--       and about 8 to 10 minutes in, cancel it from Query History (or with
+--       the worksheet's stop button). Monday's run took 17 minutes and opens
+--       its transaction a few minutes in, after building the work list, so
+--       this cancels it mid-transaction. DAASI_3641_RUNS shows it STARTED, the
+--       lock row shows it as holder, and SHOW TRANSACTIONS; shows its
+--       transaction. (Cancelled earlier, there is no transaction yet: 8b then
+--       runs and says NOT READY because of the lock, and 8c still frees it.)
 --   8b. Still in THIS worksheet: CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PREFLIGHT();
 --       It must refuse with "this session has a transaction open" (-20657).
 --       That guard is what keeps a later call from committing the cancelled
@@ -241,8 +268,9 @@ SELECT 'live detail rows, whole table: before minus now',
 --       the run ABORTED, and no fix rows in TRIP_MASTER (the reset query from
 --       step 0 returns 0 again).
 --   8d. In the new worksheet: CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_RUN_ALL();
---       then step 6 again: "same" and six zeros. This also leaves UAT in its
---       fixed state for Tracy to look at.
+--       then CALL DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_POST_CHECK(); (RESULT = PASS), then step 6
+--       again: "same" and six zeros. This also leaves UAT in its fixed state
+--       for Tracy to look at.
 -- To start over at any point: step 0 again (the reset takes seconds).
 
 
