@@ -1,0 +1,344 @@
+-- =============================================================================
+-- DAASI-3641 · UAT VALIDATION: row-level evidence, no procedures involved
+-- =============================================================================
+-- Eight plain SELECTs against the trip tables as they are now (after the fix)
+-- and the frozen before-picture (DAASI_3641_TM_BEFORE / _TD_BEFORE, the clones
+-- taken before anything ran). Nothing here reads the fix's own log or check
+-- tables: new rows are paired with their source rows by guest and dates, and
+-- the fix's rows are recognised only by their audit stamp (created_by /
+-- updated_by = 'DAASI-3641'). Run one query at a time, after the FIX script
+-- (UAT must be in its fixed state). Queries 4 and 7 compare whole tables and
+-- take a few minutes on the Large warehouse.
+--
+-- What the fix changes, and so what these queries check:
+--   new market trips      every column copied from the property trip except
+--                         the identity and audit columns (new trip id,
+--                         trip_type MARKET, market_cd, property_cd 'N/A',
+--                         created/updated by DAASI-3641, batch_id -3641)
+--   their detail rows     all 10 content columns copied from the property
+--                         trip's live detail rows; only trip_detail_id,
+--                         trip_master_id and the audit columns differ
+--   retired market trips  exactly 5 columns change: delete_ind Y, last_dml_cd
+--                         U, updated_dttm, updated_by DAASI-3641, batch_id -3641
+--   everything else       identical, every column
+-- =============================================================================
+
+-- 1. SEE IT: the two longest over-cap market trips per market, before the fix,
+--    and what is there now. For each sample guest and date range, the rows
+--    marked 1-BEFORE are the old market trips (over their cap, no hotel stay),
+--    2-PROPERTY the property trips the fix copied, 3-AFTER the market trips
+--    there now. Expect every 3-AFTER row to equal a 2-PROPERTY row in dates,
+--    days and detail counts, and no 3-AFTER row over its cap.
+WITH picked AS (
+    SELECT b.guest_unique_id, b.market_cd, b.trip_start_dt AS win_from, b.trip_end_dt AS win_to,
+           DATEDIFF(day, b.trip_start_dt, b.trip_end_dt) + 1 AS days
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TM_BEFORE b
+    WHERE b.trip_type = 'MARKET' AND b.market_cd IN ('BEM', 'WLM') AND b.delete_ind = 'N'
+      AND DATEDIFF(day, b.trip_start_dt, b.trip_end_dt) + 1 > DECODE(b.market_cd, 'BEM', 1, 'WLM', 3)
+      AND NOT EXISTS (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TD_BEFORE d
+                      WHERE d.trip_master_id = b.trip_master_id AND d.transaction_type = 'HOTEL' AND d.delete_ind = 'N')
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY b.market_cd ORDER BY days DESC, b.trip_master_id) <= 2
+),
+rows_before AS (
+    SELECT s.guest_unique_id, s.market_cd AS sample_market, '1-BEFORE market trip' AS what,
+           t.trip_master_id, t.trip_type, t.market_cd, t.property_cd, t.trip_start_dt, t.trip_end_dt,
+           t.delete_ind, t.created_by, t.updated_by,
+           (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TD_BEFORE d WHERE d.trip_master_id = t.trip_master_id AND d.delete_ind = 'N') AS detail_rows,
+           (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TD_BEFORE d WHERE d.trip_master_id = t.trip_master_id AND d.delete_ind = 'N' AND d.transaction_type = 'RATINGS') AS rating_rows
+    FROM picked s
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TM_BEFORE t
+      ON t.guest_unique_id = s.guest_unique_id AND t.trip_type = 'MARKET' AND t.market_cd = s.market_cd
+     AND t.delete_ind = 'N' AND t.trip_start_dt <= s.win_to AND t.trip_end_dt >= s.win_from
+),
+rows_property AS (
+    SELECT s.guest_unique_id, s.market_cd, '2-PROPERTY trip (the source)',
+           t.trip_master_id, t.trip_type, t.market_cd, t.property_cd, t.trip_start_dt, t.trip_end_dt,
+           t.delete_ind, t.created_by, t.updated_by,
+           (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d WHERE d.trip_master_id = t.trip_master_id AND d.delete_ind = 'N'),
+           (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d WHERE d.trip_master_id = t.trip_master_id AND d.delete_ind = 'N' AND d.transaction_type = 'RATINGS')
+    FROM picked s
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER t
+      ON t.guest_unique_id = s.guest_unique_id AND t.trip_type = 'PROPERTY'
+     AND t.property_cd = DECODE(s.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
+     AND t.delete_ind = 'N' AND t.trip_start_dt <= s.win_to AND t.trip_end_dt >= s.win_from
+),
+rows_after AS (
+    SELECT s.guest_unique_id, s.market_cd, '3-AFTER market trip (now)',
+           t.trip_master_id, t.trip_type, t.market_cd, t.property_cd, t.trip_start_dt, t.trip_end_dt,
+           t.delete_ind, t.created_by, t.updated_by,
+           (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d WHERE d.trip_master_id = t.trip_master_id AND d.delete_ind = 'N'),
+           (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d WHERE d.trip_master_id = t.trip_master_id AND d.delete_ind = 'N' AND d.transaction_type = 'RATINGS')
+    FROM picked s
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER t
+      ON t.guest_unique_id = s.guest_unique_id AND t.trip_type = 'MARKET' AND t.market_cd = s.market_cd
+     AND t.delete_ind = 'N' AND t.trip_start_dt <= s.win_to AND t.trip_end_dt >= s.win_from
+)
+SELECT guest_unique_id, sample_market, what, trip_master_id, trip_type, market_cd, property_cd,
+       trip_start_dt, trip_end_dt, DATEDIFF(day, trip_start_dt, trip_end_dt) + 1 AS days,
+       IFF(trip_type = 'MARKET' AND DATEDIFF(day, trip_start_dt, trip_end_dt) + 1 > DECODE(market_cd, 'BEM', 1, 'WLM', 3), 'OVER CAP', '') AS over_cap,
+       detail_rows, rating_rows, delete_ind, created_by, updated_by
+FROM (SELECT * FROM rows_before UNION ALL SELECT * FROM rows_property UNION ALL SELECT * FROM rows_after)
+ORDER BY sample_market, guest_unique_id, trip_start_dt, what;
+
+
+-- 2. THE COMPLAINT, before and after: BEM/WLM market trips longer than their
+--    max trip days with no hotel stay. Expect "after" = 0 for both markets.
+SELECT market_cd, 'before the fix' AS picture, COUNT(*) AS over_cap_trips_no_hotel,
+       MAX(DATEDIFF(day, trip_start_dt, trip_end_dt) + 1) AS longest_days
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TM_BEFORE tm
+WHERE tm.trip_type = 'MARKET' AND tm.market_cd IN ('BEM', 'WLM') AND tm.delete_ind = 'N'
+  AND DATEDIFF(day, tm.trip_start_dt, tm.trip_end_dt) + 1 > DECODE(tm.market_cd, 'BEM', 1, 'WLM', 3)
+  AND NOT EXISTS (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TD_BEFORE d
+                  WHERE d.trip_master_id = tm.trip_master_id AND d.transaction_type = 'HOTEL' AND d.delete_ind = 'N')
+GROUP BY 1
+UNION ALL
+SELECT market_cd, 'after the fix', COUNT(*), MAX(DATEDIFF(day, trip_start_dt, trip_end_dt) + 1)
+FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER tm
+WHERE tm.trip_type = 'MARKET' AND tm.market_cd IN ('BEM', 'WLM') AND tm.delete_ind = 'N'
+  AND DATEDIFF(day, tm.trip_start_dt, tm.trip_end_dt) + 1 > DECODE(tm.market_cd, 'BEM', 1, 'WLM', 3)
+  AND NOT EXISTS (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d
+                  WHERE d.trip_master_id = tm.trip_master_id AND d.transaction_type = 'HOTEL' AND d.delete_ind = 'N')
+GROUP BY 1
+ORDER BY 1, 2 DESC;
+
+
+-- 3. THE RULE, before and after: every BEM/WLM market trip should have an
+--    identical property trip (same guest, same dates), and the other way
+--    round. Split by when the trip was built. Expect, after the fix: 0 twinless
+--    trips built before Aug 12 and 0 built by the fix. Trips built after Aug 12
+--    are outside this fix (the small mismatch logged for its own ticket) and
+--    show the same number before and after.
+WITH pics AS (
+    SELECT 'before the fix' AS picture, trip_master_id, guest_unique_id, trip_type, market_cd, property_cd, trip_start_dt, trip_end_dt,
+           CASE WHEN created_by = 'DAASI-3641' THEN '2 built by the fix'
+                WHEN created_dttm < '2026-08-12 11:16:26' THEN '1 built before Aug 12' ELSE '3 built after Aug 12 (out of scope)' END AS built
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TM_BEFORE WHERE delete_ind = 'N'
+    UNION ALL
+    SELECT 'after the fix', trip_master_id, guest_unique_id, trip_type, market_cd, property_cd, trip_start_dt, trip_end_dt,
+           CASE WHEN created_by = 'DAASI-3641' THEN '2 built by the fix'
+                WHEN created_dttm < '2026-08-12 11:16:26' THEN '1 built before Aug 12' ELSE '3 built after Aug 12 (out of scope)' END
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER WHERE delete_ind = 'N'
+),
+mkt AS (SELECT * FROM pics WHERE trip_type = 'MARKET' AND market_cd IN ('BEM', 'WLM')),
+prop AS (SELECT *, DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd_of_property FROM pics
+         WHERE trip_type = 'PROPERTY' AND property_cd IN ('IBE', 'IWA'))
+SELECT m.market_cd, m.built, m.picture, 'market trips' AS side, COUNT(*) AS trips,
+       COUNT_IF(NOT EXISTS (SELECT 1 FROM prop p WHERE p.picture = m.picture AND p.guest_unique_id = m.guest_unique_id
+                            AND p.market_cd_of_property = m.market_cd
+                            AND p.trip_start_dt = m.trip_start_dt AND p.trip_end_dt = m.trip_end_dt)) AS without_twin
+FROM mkt m
+GROUP BY 1, 2, 3
+UNION ALL
+SELECT p.market_cd_of_property, p.built, p.picture, 'property trips', COUNT(*),
+       COUNT_IF(NOT EXISTS (SELECT 1 FROM mkt m WHERE m.picture = p.picture AND m.guest_unique_id = p.guest_unique_id
+                            AND m.market_cd = p.market_cd_of_property
+                            AND m.trip_start_dt = p.trip_start_dt AND m.trip_end_dt = p.trip_end_dt))
+FROM prop p
+GROUP BY 1, 2, 3
+ORDER BY 1, 4, 2, 3 DESC;
+
+
+-- 4. NOTHING ELSE CHANGED: every trip row the fix did not retire or create is
+--    identical to the before-picture, in every column. The first result is
+--    the differing rows (expect none); the count row says how many rows were
+--    compared. (A few minutes: the whole table, both ways.)
+WITH untouched_before AS (
+    SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TM_BEFORE b
+    WHERE NOT EXISTS (SELECT 1 FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER n
+                      WHERE n.trip_master_id = b.trip_master_id AND n.updated_by = 'DAASI-3641')
+),
+untouched_now AS (
+    SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER n
+    WHERE COALESCE(n.created_by, '') <> 'DAASI-3641' AND COALESCE(n.updated_by, '') <> 'DAASI-3641'
+)
+SELECT 'in the before-picture, not identical now' AS what, COUNT(*) AS rows
+FROM (SELECT * FROM untouched_before MINUS SELECT * FROM untouched_now)
+UNION ALL
+SELECT 'now, not identical in the before-picture', COUNT(*)
+FROM (SELECT * FROM untouched_now MINUS SELECT * FROM untouched_before)
+UNION ALL
+SELECT 'trip rows compared (expect the same number both ways)', COUNT(*) FROM untouched_before
+UNION ALL
+SELECT 'trip rows compared, now', COUNT(*) FROM untouched_now;
+
+
+-- 5. RETIRED ROWS: for every trip the fix retired, the only columns that changed
+--    are delete_ind, last_dml_cd, updated_dttm, updated_by and batch_id. First
+--    the count of retired trips with any other column changed (expect 0), then
+--    five of them side by side, before and now.
+WITH pairs AS (
+    SELECT b.trip_master_id,
+           b.guest_unique_id = n.guest_unique_id AND b.property_cd = n.property_cd AND b.market_cd = n.market_cd
+             AND b.trip_type = n.trip_type AND b.trip_start_dt = n.trip_start_dt AND b.trip_end_dt = n.trip_end_dt
+             AND b.created_dttm = n.created_dttm AND b.created_by = n.created_by
+             AND EQUAL_NULL(b.replay_counter, n.replay_counter) AS rest_unchanged,
+           b.delete_ind AS delete_ind_before, n.delete_ind AS delete_ind_now,
+           b.updated_by AS updated_by_before, n.updated_by AS updated_by_now,
+           b.updated_dttm AS updated_dttm_before, n.updated_dttm AS updated_dttm_now,
+           b.last_dml_cd AS last_dml_before, n.last_dml_cd AS last_dml_now,
+           b.batch_id AS batch_before, n.batch_id AS batch_now,
+           n.guest_unique_id, n.market_cd, n.trip_start_dt, n.trip_end_dt
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER n
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TM_BEFORE b ON b.trip_master_id = n.trip_master_id
+    WHERE n.updated_by = 'DAASI-3641' AND n.delete_ind = 'Y'
+)
+SELECT 'retired trips' AS what, COUNT(*) AS n, COUNT_IF(NOT rest_unchanged) AS with_other_columns_changed,
+       COUNT_IF(delete_ind_before = 'N' AND delete_ind_now = 'Y') AS flipped_n_to_y
+FROM pairs;
+
+SELECT trip_master_id, guest_unique_id, market_cd, trip_start_dt, trip_end_dt,
+       delete_ind_before, delete_ind_now, updated_by_before, updated_by_now,
+       updated_dttm_before, updated_dttm_now, last_dml_before, last_dml_now, batch_before, batch_now, rest_unchanged
+FROM (
+    SELECT b.trip_master_id, n.guest_unique_id, n.market_cd, n.trip_start_dt, n.trip_end_dt,
+           b.delete_ind AS delete_ind_before, n.delete_ind AS delete_ind_now,
+           b.updated_by AS updated_by_before, n.updated_by AS updated_by_now,
+           b.updated_dttm AS updated_dttm_before, n.updated_dttm AS updated_dttm_now,
+           b.last_dml_cd AS last_dml_before, n.last_dml_cd AS last_dml_now,
+           b.batch_id AS batch_before, n.batch_id AS batch_now,
+           b.guest_unique_id = n.guest_unique_id AND b.property_cd = n.property_cd AND b.market_cd = n.market_cd
+             AND b.trip_type = n.trip_type AND b.trip_start_dt = n.trip_start_dt AND b.trip_end_dt = n.trip_end_dt
+             AND b.created_dttm = n.created_dttm AND b.created_by = n.created_by
+             AND EQUAL_NULL(b.replay_counter, n.replay_counter) AS rest_unchanged
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER n
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TM_BEFORE b ON b.trip_master_id = n.trip_master_id
+    WHERE n.updated_by = 'DAASI-3641' AND n.delete_ind = 'Y'
+)
+ORDER BY trip_master_id
+LIMIT 5;
+
+
+-- 6. NEW MARKET TRIPS ARE EXACT COPIES: each new market trip (created by the
+--    fix) pairs with exactly one live property trip of its market, same guest,
+--    same start, same end. First the counts (expect: new trips = paired,
+--    unpaired 0, paired twice 0), then five pairs side by side.
+WITH new_trips AS (
+    SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER
+    WHERE created_by = 'DAASI-3641' AND delete_ind = 'N' AND trip_type = 'MARKET'
+),
+paired AS (
+    SELECT n.trip_master_id AS new_trip_id, n.guest_unique_id, n.market_cd, n.trip_start_dt, n.trip_end_dt,
+           n.property_cd AS new_property_cd, n.created_by AS new_created_by, n.batch_id AS new_batch_id, n.last_dml_cd AS new_last_dml,
+           p.trip_master_id AS source_trip_id, p.property_cd AS source_property_cd, p.created_by AS source_created_by,
+           COUNT(p.trip_master_id) OVER (PARTITION BY n.trip_master_id) AS matches
+    FROM new_trips n
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER p
+      ON p.trip_type = 'PROPERTY' AND p.delete_ind = 'N'
+     AND p.property_cd = DECODE(n.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
+     AND p.guest_unique_id = n.guest_unique_id AND p.trip_start_dt = n.trip_start_dt AND p.trip_end_dt = n.trip_end_dt
+)
+SELECT 'new market trips' AS what, COUNT(DISTINCT new_trip_id) AS n,
+       COUNT(DISTINCT IFF(matches = 1, new_trip_id, NULL)) AS paired_with_one_property_trip,
+       COUNT(DISTINCT IFF(matches = 0, new_trip_id, NULL)) AS unpaired,
+       COUNT(DISTINCT IFF(matches > 1, new_trip_id, NULL)) AS paired_twice
+FROM paired;
+
+SELECT new_trip_id, source_trip_id, guest_unique_id, market_cd, trip_start_dt, trip_end_dt,
+       DATEDIFF(day, trip_start_dt, trip_end_dt) + 1 AS days,
+       new_property_cd, source_property_cd, new_created_by, source_created_by, new_batch_id, new_last_dml
+FROM (
+    SELECT n.trip_master_id AS new_trip_id, n.guest_unique_id, n.market_cd, n.trip_start_dt, n.trip_end_dt,
+           n.property_cd AS new_property_cd, n.created_by AS new_created_by, n.batch_id AS new_batch_id, n.last_dml_cd AS new_last_dml,
+           p.trip_master_id AS source_trip_id, p.property_cd AS source_property_cd, p.created_by AS source_created_by
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER n
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER p
+      ON p.trip_type = 'PROPERTY' AND p.delete_ind = 'N'
+     AND p.property_cd = DECODE(n.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
+     AND p.guest_unique_id = n.guest_unique_id AND p.trip_start_dt = n.trip_start_dt AND p.trip_end_dt = n.trip_end_dt
+    WHERE n.created_by = 'DAASI-3641' AND n.delete_ind = 'N' AND n.trip_type = 'MARKET'
+)
+ORDER BY new_trip_id
+LIMIT 5;
+
+
+-- 7. NEW DETAIL ROWS ARE EXACT COPIES: the detail rows under each new market
+--    trip carry the same 10 content columns as the live detail rows under its
+--    source property trip, row for row. Only trip_detail_id, trip_master_id and
+--    the audit columns differ. Expect both "not matched" counts to be 0 and the
+--    two totals equal. (A few minutes.)
+WITH pair AS (
+    SELECT n.trip_master_id AS new_trip_id, p.trip_master_id AS source_trip_id
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER n
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER p
+      ON p.trip_type = 'PROPERTY' AND p.delete_ind = 'N'
+     AND p.property_cd = DECODE(n.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
+     AND p.guest_unique_id = n.guest_unique_id AND p.trip_start_dt = n.trip_start_dt AND p.trip_end_dt = n.trip_end_dt
+    WHERE n.created_by = 'DAASI-3641' AND n.delete_ind = 'N' AND n.trip_type = 'MARKET'
+),
+new_rows AS (
+    SELECT pr.new_trip_id, d.transaction_table_sk, d.transaction_table, d.transaction_type, d.transaction_sub_type,
+           d.transaction_start_dttm, d.transaction_end_dttm, d.business_start_dt, d.business_end_dt,
+           d.transaction_modified_dttm, d.property_cd
+    FROM pair pr JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d ON d.trip_master_id = pr.new_trip_id
+    WHERE d.delete_ind = 'N'
+),
+source_rows AS (
+    SELECT pr.new_trip_id, d.transaction_table_sk, d.transaction_table, d.transaction_type, d.transaction_sub_type,
+           d.transaction_start_dttm, d.transaction_end_dttm, d.business_start_dt, d.business_end_dt,
+           d.transaction_modified_dttm, d.property_cd
+    FROM pair pr JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d ON d.trip_master_id = pr.source_trip_id
+    WHERE d.delete_ind = 'N'
+)
+SELECT 'detail rows under the new trips' AS what, COUNT(*) AS n FROM new_rows
+UNION ALL
+SELECT 'detail rows under their source property trips', COUNT(*) FROM source_rows
+UNION ALL
+SELECT 'new rows with no identical source row (expect 0)', COUNT(*) FROM (SELECT * FROM new_rows MINUS SELECT * FROM source_rows)
+UNION ALL
+SELECT 'source rows with no identical new row (expect 0)', COUNT(*) FROM (SELECT * FROM source_rows MINUS SELECT * FROM new_rows);
+
+-- 7b. Five of those detail pairs side by side, all columns: identical content,
+--     different ids and audit stamps.
+SELECT nd.trip_detail_id AS new_detail_id, sd.trip_detail_id AS source_detail_id,
+       nd.trip_master_id AS new_trip_id, sd.trip_master_id AS source_trip_id,
+       nd.transaction_table, nd.transaction_table_sk, nd.transaction_type, nd.transaction_sub_type,
+       nd.transaction_start_dttm, sd.transaction_start_dttm AS src_start_dttm,
+       nd.business_start_dt, sd.business_start_dt AS src_business_start_dt,
+       nd.business_end_dt, sd.business_end_dt AS src_business_end_dt,
+       nd.property_cd, sd.property_cd AS src_property_cd,
+       nd.created_by, sd.created_by AS src_created_by, nd.batch_id, sd.batch_id AS src_batch_id
+FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER n
+JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER p
+  ON p.trip_type = 'PROPERTY' AND p.delete_ind = 'N'
+ AND p.property_cd = DECODE(n.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
+ AND p.guest_unique_id = n.guest_unique_id AND p.trip_start_dt = n.trip_start_dt AND p.trip_end_dt = n.trip_end_dt
+JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL nd ON nd.trip_master_id = n.trip_master_id AND nd.delete_ind = 'N'
+JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL sd ON sd.trip_master_id = p.trip_master_id AND sd.delete_ind = 'N'
+ AND sd.transaction_table = nd.transaction_table AND sd.transaction_table_sk = nd.transaction_table_sk
+ AND sd.transaction_type = nd.transaction_type
+WHERE n.created_by = 'DAASI-3641' AND n.delete_ind = 'N' AND n.trip_type = 'MARKET'
+ORDER BY nd.trip_detail_id
+LIMIT 5;
+
+
+-- 8. NOTHING LOST, NOTHING DOUBLED: the live detail rows on BEM/WLM market
+--    trips, by type, before and after. Ratings (theo) must be the same number;
+--    other types may grow (the property trips carried hotel and other rows the
+--    old market trips lacked). Then: every transaction that was on a live
+--    BEM/WLM market trip before is on exactly one live BEM/WLM market trip now.
+WITH before_rows AS (
+    SELECT m.market_cd, d.transaction_type, d.transaction_table, d.transaction_table_sk
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TM_BEFORE m
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TD_BEFORE d ON d.trip_master_id = m.trip_master_id
+    WHERE m.trip_type = 'MARKET' AND m.market_cd IN ('BEM', 'WLM') AND m.delete_ind = 'N' AND d.delete_ind = 'N'
+),
+now_rows AS (
+    SELECT m.market_cd, d.transaction_type, d.transaction_table, d.transaction_table_sk
+    FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER m
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.TRIP_DETAIL d ON d.trip_master_id = m.trip_master_id
+    WHERE m.trip_type = 'MARKET' AND m.market_cd IN ('BEM', 'WLM') AND m.delete_ind = 'N' AND d.delete_ind = 'N'
+)
+SELECT COALESCE(b.market_cd, n.market_cd) AS market_cd, COALESCE(b.transaction_type, n.transaction_type) AS transaction_type,
+       COALESCE(b.n, 0) AS live_rows_before, COALESCE(n.n, 0) AS live_rows_after, COALESCE(n.n, 0) - COALESCE(b.n, 0) AS change
+FROM (SELECT market_cd, transaction_type, COUNT(*) AS n FROM before_rows GROUP BY 1, 2) b
+FULL OUTER JOIN (SELECT market_cd, transaction_type, COUNT(*) AS n FROM now_rows GROUP BY 1, 2) n
+  ON n.market_cd = b.market_cd AND n.transaction_type = b.transaction_type
+UNION ALL
+SELECT 'ALL', 'transactions on a live market trip before but on none now (expect 0)',
+       (SELECT COUNT(*) FROM (SELECT DISTINCT market_cd, transaction_table, transaction_table_sk FROM before_rows
+                              MINUS SELECT DISTINCT market_cd, transaction_table, transaction_table_sk FROM now_rows)), NULL, NULL
+UNION ALL
+SELECT 'ALL', 'ratings now on more than one live market trip (expect 0)',
+       (SELECT COUNT(*) FROM (SELECT market_cd, transaction_table, transaction_table_sk FROM now_rows
+                              WHERE transaction_type = 'RATINGS' GROUP BY 1, 2, 3 HAVING COUNT(*) > 1)), NULL, NULL
+ORDER BY 1, 2;
