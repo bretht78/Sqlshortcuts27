@@ -233,88 +233,104 @@ ORDER BY 2 DESC;
 
 /* ---------------------------------------------------------------------
    STEP 2  PATCH THE LOAD PROCS
-   Do this for HETCMS_COMP_DETAIL_FACT_LOAD_PROC and
-   HETCMS_COMP_DETAIL_FACT_LOAD_PROC_HIST, in UAT first.
+   Nothing to edit by hand. The block below pulls the proc's current
+   text, makes four changes to it, checks the result, and (only when
+   do_execute is TRUE) saves a rollback copy and runs the new text:
+     1. uncomments the four SYIDCM lines in the ECPCMPCM comment join
+     2. restores "CMPRW_RAW.SYIDRW = ECPCMPCM_RAW.SYIDCM AND" at the top
+        of that join's ON clause
+     3. adds COPY GRANTS, so the replace keeps existing grants
+     4. adds a Version 1.13 entry to the change log, after 1.12
+   If any check fails it stops before changing anything and says why.
 
-   2a. Pull the current definition. TRUE makes the first line carry the
-       full name; check that it says DAAS_UAT before you run anything.
-       For the _HIST proc, use the argument types from 0a. Save the output
-       unchanged somewhere: it is your rollback for the proc.
-   --------------------------------------------------------------------- */
-SELECT GET_DDL('PROCEDURE',
-  'DAAS_UAT.DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)',
-  TRUE);
-
-/* 2b. Edit the text in a new worksheet.
-
-   (1) Search for ECPCMPCM_RAW. Replace the block that starts with the
-       LEFT JOIN right after
-         AND CMPRW_RAW.PROPERTY_CODE = CMPLT_RAW.PROPERTY_CODE
-       and ends with
-         AND CMPRW_RAW.PROPERTY_CODE = ECPCMPCM_RAW.PROPERTY_CODE
-       (about lines 455-484 in the daily proc) with the block below.
-       The only changes from today: SYIDCM is uncommented in four places,
-       and the guest match is back as the first line of the ON clause.
-       Keep the doubled quotes in ''|''. The proc body is one
-       single-quoted string, so every quote inside it is doubled.
-
-   ---- REPLACEMENT BLOCK ----
-   LEFT JOIN
-   (
-       SELECT
-           SYIDCM,
-           "CMP#CM",
-           PROPERTY_CODE,
-           LISTAGG(CMNTCM,''|'') WITHIN GROUP (ORDER BY CSEQCM) AS CMNTCM
-       FROM
-           (
-               SELECT
-                   SYIDCM,
-                   "CMP#CM",
-                   CSEQCM,
-                   CMNTCM,
-                   PROPERTY_CODE
-               FROM
-                   DAAS_RAW_HETCMS.ECPCMPCM_RAW ECPCMPCM_RAW
-               QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
-                       ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
-           )
-       GROUP BY
-           SYIDCM,
-           "CMP#CM",
-           PROPERTY_CODE
-   ) ECPCMPCM_RAW
-   ON
-       CMPRW_RAW.SYIDRW = ECPCMPCM_RAW.SYIDCM
-       AND CMPRW_RAW.CNUMRW = ECPCMPCM_RAW."CMP#CM"
-       AND CMPRW_RAW.PROPERTY_CODE = ECPCMPCM_RAW.PROPERTY_CODE
-   ---- END REPLACEMENT BLOCK ----
-
-   (2) In the change log at the top, after the Version 1.12 lines, add:
-         Modify Date: <date>
-         Modified By: <you>
-         Version 1.13 Restored SYIDCM (guest ID) in the ECPCMPCM comment join
-         so a comment attaches only to the comp of the guest who wrote it.
-         Comp numbers are reused, so comments were copied across guests.
-         (DAASI-3640)
-       Don't type an apostrophe anywhere: an unescaped quote ends the
-       proc body.
-
-   (3) Add COPY GRANTS on its own line between the argument list and
-       RETURNS VARCHAR, so the replace keeps existing grants:
-         ... "CUSTOM_PARAM2" VARCHAR)
-         COPY GRANTS
-         RETURNS VARCHAR
-
-   2c. Run the edited CREATE OR REPLACE as the owner role from 0a.
-       COPY GRANTS keeps every grant except ownership, which goes to the
-       role that runs it. Repeat 2a-2c for the _HIST proc.
-
-   2d. After the next load run, check the comps it loaded (below). If the
-       mismatch count is large, put the saved DDL back and send me a few
-       rows.
+   2a. Set the four values at the top of the block, then run it as the
+       proc's owner role (0a). With do_execute FALSE it only returns
+       the patched DDL: read it, especially the change log and the
+       ECPCMPCM_RAW join.
+   2b. Set do_execute to TRUE and run it again. It saves the rollback
+       copy to DAAS_TEMP_WORK.DAASI3640_PROC_BACKUP, then replaces the
+       proc. (In PROD, change that schema in the two marked lines.)
+   2c. Change proc_name to the _HIST proc (argument types from 0a) and
+       repeat 2a-2b.
+   2d. After the next load run, check the comps it loaded (below).
    --------------------------------------------------------------------- */
 USE DATABASE DAAS_UAT;   -- DAAS_PROD after the PROD deploy
+
+EXECUTE IMMEDIATE $$
+DECLARE
+    proc_name    STRING  DEFAULT 'DAAS_UAT.DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)';
+    modified_by  STRING  DEFAULT 'Chris';          -- your name as the change log shows it
+    do_execute   BOOLEAN DEFAULT FALSE;            -- FALSE = show the patched DDL only. TRUE = save a rollback copy and run it.
+    ddl          STRING;
+    rollback_ddl STRING;
+    patched      STRING;
+    indent       STRING;
+    entry        STRING;
+BEGIN
+    SELECT GET_DDL('PROCEDURE', :proc_name, TRUE) INTO :ddl;
+
+    -- Checks on the current text. Each one stops the block if it fails.
+    IF (NOT STARTSWITH(ddl, 'CREATE OR REPLACE PROCEDURE ' || SPLIT_PART(proc_name, '(', 1))) THEN
+        RETURN 'STOPPED: the DDL does not start with the expected database.schema.name';
+    END IF;
+    IF (REGEXP_COUNT(ddl, '--SYIDCM,') <> 4) THEN
+        RETURN 'STOPPED: expected 4 commented SYIDCM lines, found ' || REGEXP_COUNT(ddl, '--SYIDCM,');
+    END IF;
+    IF (REGEXP_COUNT(ddl, '--CMPRW_RAW.SYIDRW = ECPCMPCM_RAW.SYIDCM') <> 1) THEN
+        RETURN 'STOPPED: the commented guest match in the ON clause was not found exactly once';
+    END IF;
+    IF (REGEXP_COUNT(ddl, 'RETURNS VARCHAR') <> 1 OR CONTAINS(ddl, 'COPY GRANTS')) THEN
+        RETURN 'STOPPED: RETURNS VARCHAR or COPY GRANTS is not where expected';
+    END IF;
+    IF (REGEXP_COUNT(ddl, 'Version 1.12') <> 1 OR CONTAINS(ddl, 'Version 1.13')) THEN
+        RETURN 'STOPPED: change log is not where expected (Version 1.12 missing, or 1.13 already there)';
+    END IF;
+
+    -- Rollback copy: the current text plus COPY GRANTS, so putting it back keeps the grants too.
+    rollback_ddl := REGEXP_REPLACE(ddl, 'RETURNS VARCHAR', 'COPY GRANTS\nRETURNS VARCHAR', 1, 1);
+
+    -- The patch.
+    patched := REPLACE(rollback_ddl, '--SYIDCM,', 'SYIDCM,');
+    patched := REPLACE(patched, '--CMPRW_RAW.SYIDRW = ECPCMPCM_RAW.SYIDCM',
+                                'CMPRW_RAW.SYIDRW = ECPCMPCM_RAW.SYIDCM AND');
+
+    -- Change-log entry, indented like the Version 1.12 line and placed right after it.
+    indent := COALESCE(REGEXP_SUBSTR(patched, '\n([ \t]*)Version 1\\.12', 1, 1, 'e', 1), '');
+    entry  := indent || 'Modify Date: ' || TO_CHAR(CURRENT_DATE(), 'MM/DD/YYYY') || '\n'
+           || indent || 'Modified By: ' || modified_by || '\n'
+           || indent || 'Version 1.13 Restored SYIDCM (guest ID) in the ECPCMPCM comment join so a comment attaches only to the comp of the guest who wrote it. Comp numbers are reused, so comments were copied across guests. (DAASI-3640)' || '\n';
+    patched := REGEXP_REPLACE(patched, '(Version 1\\.12[^\n]*\n)', '\\1' || entry, 1, 1);
+
+    -- Checks on the result.
+    IF (CONTAINS(patched, '--SYIDCM') OR CONTAINS(patched, '--CMPRW_RAW.SYIDRW')) THEN
+        RETURN 'STOPPED: a commented line survived the patch';
+    END IF;
+    IF (REGEXP_COUNT(patched, 'CMPRW_RAW.SYIDRW = ECPCMPCM_RAW.SYIDCM AND\\s+CMPRW_RAW.CNUMRW = ECPCMPCM_RAW."CMP#CM"') <> 1) THEN
+        RETURN 'STOPPED: the ON clause did not come out as expected';
+    END IF;
+    IF (REGEXP_COUNT(patched, 'COPY GRANTS') <> 1 OR NOT CONTAINS(patched, 'Version 1.13')) THEN
+        RETURN 'STOPPED: COPY GRANTS or the change-log entry is missing';
+    END IF;
+
+    IF (NOT do_execute) THEN
+        RETURN patched;
+    END IF;
+
+    -- Save the rollback copy, then replace the proc.
+    CREATE TABLE IF NOT EXISTS DAAS_TEMP_WORK.DAASI3640_PROC_BACKUP          -- PROD: your scratch schema
+        (proc_name STRING, saved_at TIMESTAMP_NTZ, ddl STRING);
+    INSERT INTO DAAS_TEMP_WORK.DAASI3640_PROC_BACKUP (proc_name, saved_at, ddl)   -- PROD: your scratch schema
+        SELECT :proc_name, CURRENT_TIMESTAMP(), :rollback_ddl;
+    EXECUTE IMMEDIATE :patched;
+    RETURN 'Patched ' || proc_name || '. Rollback copy saved in DAASI3640_PROC_BACKUP.';
+END;
+$$;
+
+-- 2b check. Both should be TRUE once the proc is replaced.
+SELECT CONTAINS(GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)', TRUE),
+                'ECPCMPCM_RAW.SYIDCM AND') AS guest_match_restored,
+       CONTAINS(GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)', TRUE),
+                'Version 1.13') AS change_logged;
 
 -- 2d. Comps loaded since the deploy should carry only their own guest's
 --     comment. Expect 0 mismatches, or a handful (comments typed after
@@ -602,10 +618,25 @@ WHERE f.COMP_NBR         = x.COMP_NBR
   AND f.DELETE_IND       = 'N'
   AND f.COMP_COMMENTS_DESC IS NOT DISTINCT FROM x.NEW_COMMENT;
 
--- Procs: rerun the original DDL saved in 2a.
+-- Procs: run this once per proc to put the saved text back.
+EXECUTE IMMEDIATE $$
+DECLARE
+    proc_name STRING DEFAULT 'DAAS_UAT.DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)';
+    ddl       STRING;
+BEGIN
+    SELECT ddl INTO :ddl
+    FROM DAAS_TEMP_WORK.DAASI3640_PROC_BACKUP                -- PROD: your scratch schema
+    WHERE proc_name = :proc_name
+    ORDER BY saved_at DESC
+    LIMIT 1;
+    EXECUTE IMMEDIATE :ddl;
+    RETURN 'Restored ' || proc_name;
+END;
+$$;
 -- Full-table fallback: the clone from 4a.
 
 -- Clean up after sign-off:
 -- DROP TABLE DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640;
 -- DROP TABLE DAAS_TEMP_WORK.DAASI3640_COMMENTS;
 -- DROP TABLE DAAS_TEMP_WORK.DAASI3640_COMMENT_FIX;
+-- DROP TABLE DAAS_TEMP_WORK.DAASI3640_PROC_BACKUP;
