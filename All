@@ -285,7 +285,7 @@ BEGIN
     END IF;
 
     -- Baseline for "nothing lost, nothing doubled" (6.2 in the runbook).
-    SELECT COUNT_IF(m.sk IS NULL) + COUNT_IF(p.sk IS NULL) + COUNT_IF(m.trips <> p.trips)
+    SELECT COALESCE(COUNT_IF(m.sk IS NULL), 0) + COALESCE(COUNT_IF(p.sk IS NULL), 0) + COALESCE(COUNT_IF(m.trips <> p.trips), 0)
     INTO :v_g62_before
     FROM (SELECT td.transaction_table_sk AS sk, COUNT(DISTINCT tm.trip_master_id) AS trips
           FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER tm
@@ -576,7 +576,7 @@ BEGIN
                         AND d.transaction_type = 'HOTEL' AND d.delete_ind = 'N');
 
     -- G7 nothing lost or doubled across all BEM/WLM ratings: no worse than before (6.2)
-    SELECT COUNT_IF(m.sk IS NULL) + COUNT_IF(p.sk IS NULL) + COUNT_IF(m.trips <> p.trips)
+    SELECT COALESCE(COUNT_IF(m.sk IS NULL), 0) + COALESCE(COUNT_IF(p.sk IS NULL), 0) + COALESCE(COUNT_IF(m.trips <> p.trips), 0)
     INTO :v_g62_after
     FROM (SELECT td.transaction_table_sk AS sk, COUNT(DISTINCT tm.trip_master_id) AS trips
           FROM DAAS_UAT.DAAS_TEMP_WORK.TRIP_MASTER tm
