@@ -315,12 +315,12 @@ BEGIN
 
     -- 13-14. What RUN_ALL will do, by market (information): the same work list
     --        RUN_ALL builds, read once. Compare with the UAT run's numbers.
-    SELECT COUNT_IF(market_cd = 'BEM' AND in_scope = 1 AND action = 'RETIRE'),
-           COUNT_IF(market_cd = 'BEM' AND in_scope = 1 AND action = 'COPY'),
-           COUNT_IF(market_cd = 'BEM' AND in_scope = 0),
-           COUNT_IF(market_cd = 'WLM' AND in_scope = 1 AND action = 'RETIRE'),
-           COUNT_IF(market_cd = 'WLM' AND in_scope = 1 AND action = 'COPY'),
-           COUNT_IF(market_cd = 'WLM' AND in_scope = 0)
+    SELECT COALESCE(COUNT_IF(market_cd = 'BEM' AND in_scope = 1 AND action = 'RETIRE'), 0),
+           COALESCE(COUNT_IF(market_cd = 'BEM' AND in_scope = 1 AND action = 'COPY'), 0),
+           COALESCE(COUNT_IF(market_cd = 'BEM' AND in_scope = 0), 0),
+           COALESCE(COUNT_IF(market_cd = 'WLM' AND in_scope = 1 AND action = 'RETIRE'), 0),
+           COALESCE(COUNT_IF(market_cd = 'WLM' AND in_scope = 1 AND action = 'COPY'), 0),
+           COALESCE(COUNT_IF(market_cd = 'WLM' AND in_scope = 0), 0)
     INTO :v_bem_r, :v_bem_c, :v_bem_o, :v_wlm_r, :v_wlm_c, :v_wlm_o
     FROM (
     WITH prop AS (
@@ -425,7 +425,7 @@ BEGIN
            SET n = n + 10, b = (:v_id IS NOT NULL), ts = CURRENT_TIMESTAMP()
          WHERE k = :v_id AND n = 1;
         -- now 11, 2 and 101: total 114, two of them marked
-        SELECT COALESCE(SUM(n), 0), COUNT_IF(b) INTO :v_m, :v_k FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST;
+        SELECT COALESCE(SUM(n), 0), COALESCE(COUNT_IF(b), 0) INTO :v_m, :v_k FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_TMP_SELFTEST;
         INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
         SELECT  :v_id, 'PREFLIGHT', 16, 'Writes with bound values run here (insert, update)', 'all ran',
                 IFF(:v_m = 114 AND :v_k = 2, 'all ran', 'ran, wrong result (' || TO_VARCHAR(:v_m) || ', ' || TO_VARCHAR(:v_k) || ')'),
@@ -438,7 +438,7 @@ BEGIN
                     :v_val, FALSE, CURRENT_TIMESTAMP();
     END;
 
-    SELECT COUNT_IF(passed = FALSE) INTO :v_failed
+    SELECT COALESCE(COUNT_IF(passed = FALSE), 0) INTO :v_failed
     FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS
     WHERE run_id = :v_id AND phase = 'PREFLIGHT';
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_CHECKS (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
