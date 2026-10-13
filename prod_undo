@@ -1,0 +1,391 @@
+-- =============================================================================
+-- DAASI-3641 · PROD · UNDO
+-- =============================================================================
+-- ONLY IF THE FIX HAS TO BE UNDONE. Puts every retired trip and detail row
+-- back exactly as it was and removes the trips the fix created, even after
+-- the nightly archival step has purged the retired rows (it restores them
+-- from the copies the fix kept). Pauses and resumes the trip chain like the
+-- fix. About 20 minutes. Expect RESULT = ROLLED BACK.
+--
+-- P_RUN_ID = 'ALL' undoes every committed run; a run_id from DAASI_3641_RUNS
+-- undoes that one.
+--
+-- How to run: paste the whole file into a NEW Snowsight worksheet, set the
+-- worksheet's role and warehouse (Large or bigger) by hand, put the cursor
+-- anywhere in the file and press Ctrl+Enter. It is one statement and uses
+-- the worksheet's role and warehouse exactly as set (it switches neither).
+-- Nothing to deploy, no session variables, nothing to edit (except where a
+-- script says so).
+-- =============================================================================
+EXECUTE IMMEDIATE $$
+DECLARE
+    P_RUN_ID        VARCHAR DEFAULT 'ALL';
+    v_has_chain      BOOLEAN DEFAULT TRUE;
+    v_autocommit     VARCHAR;
+    v_rb_id          VARCHAR;
+    v_err            VARCHAR;
+    v_task_state     VARCHAR;
+    v_locked         BOOLEAN DEFAULT FALSE;
+    v_logged         BOOLEAN DEFAULT FALSE;
+    v_holds_lock     BOOLEAN DEFAULT FALSE;
+    v_chain_paused   BOOLEAN DEFAULT FALSE;
+    v_resumed        BOOLEAN DEFAULT TRUE;
+    v_in_txn         BOOLEAN DEFAULT FALSE;
+    v_n              NUMBER DEFAULT 0;
+    v_waited         NUMBER DEFAULT 0;
+    v_scope          NUMBER DEFAULT 0;
+    v_new_live       NUMBER DEFAULT 0;
+    v_old_not_live   NUMBER DEFAULT 0;
+    v_no_market      NUMBER DEFAULT 0;
+    v_failed         NUMBER DEFAULT 0;
+    e_bad_arg        EXCEPTION (-20646, 'DAASI-3641: pass a run_id exactly as DAASI_3641_RUNS shows it, or ''ALL''.');
+    e_nothing        EXCEPTION (-20648, 'DAASI-3641: no committed run matches that run_id (it may have been rolled back already). Nothing was changed.');
+    e_run_active     EXCEPTION (-20643, 'DAASI-3641: another run holds the run lock (DAASI_3641_LOCK shows which). Nothing was changed. If that run was cancelled or timed out: run DAASI_3641_RECOVER for that run_id: the RECOVER script with the run_id at its top, or CALL DAASI_3641_RECOVER(''<run_id>'').');
+    e_chain_busy     EXCEPTION (-20642, 'DAASI-3641: the trip chain stayed busy for an hour, so nothing was changed and the chain was resumed. Try again later.');
+    e_no_chain       EXCEPTION (-20645, 'DAASI-3641: cannot see the trip root task, so the chain cannot be paused. Nothing was changed. Check that this role has OPERATE on it.');
+    e_rb_failed      EXCEPTION (-20649, 'DAASI-3641: a rollback check failed, so the rollback itself was rolled back and nothing changed. Details: DAASI_3641_CHECKS, latest ROLLBACK run.');
+    e_autocommit     EXCEPTION (-20650, 'DAASI-3641: this session has AUTOCOMMIT off. Run ALTER SESSION SET AUTOCOMMIT = TRUE; and call again. Nothing was changed.');
+    e_chain_paused   EXCEPTION (-20651, 'DAASI-3641: the trip chain is already paused by someone else, so nothing was changed. Run again once it is resumed.');
+    e_superseded     EXCEPTION (-20655, 'DAASI-3641: RECOVER had closed this rollback as cut off before it could commit, so it rolled back. Nothing was kept.');
+    e_open_txn      EXCEPTION (-20657, 'DAASI-3641: this session has a transaction open (left by a cancelled call?), so nothing was done. Use a new worksheet. If that call was RUN_ALL or ROLLBACK: run DAASI_3641_RECOVER for that run_id: the RECOVER script with the run_id at its top, or CALL DAASI_3641_RECOVER(''<run_id>'').');
+BEGIN
+    -- Never inside a transaction left open by a cancelled call: the table
+    -- statements below are DDL, and DDL would commit it (with whatever that call
+    -- had half done). Use a new worksheet; RECOVER cleans the old one up.
+    IF (CURRENT_TRANSACTION() IS NOT NULL) THEN
+        RAISE e_open_txn;
+    END IF;
+    SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION;
+    SELECT MAX("value") INTO :v_autocommit FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    IF (LOWER(COALESCE(v_autocommit, 'true')) <> 'true') THEN
+        RAISE e_autocommit;
+    END IF;
+    IF (P_RUN_ID IS NULL OR (P_RUN_ID <> 'ALL' AND NOT REGEXP_LIKE(P_RUN_ID, '[0-9]{8}_[0-9]{6,9}'))) THEN
+        RAISE e_bad_arg;
+    END IF;
+    -- the six working tables, created only if missing (DDL, so before any transaction)
+    CREATE TABLE IF NOT EXISTS DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS (
+        run_id          VARCHAR(20),
+        kind            VARCHAR(10),      -- RUN or ROLLBACK
+        from_dt         DATE,
+        to_dt           DATE,
+        status          VARCHAR(20),      -- STARTED, COMMITTED, NOTHING_TO_DO, CHECKS_FAILED, CHAIN_BUSY,
+                                          -- CHAIN_PAUSED, LOCK_BUSY, ERROR, ABORTED, ROLLED_BACK
+        chain_paused    BOOLEAN,          -- TRUE while this run holds the trip chain paused
+        started_at      TIMESTAMP_LTZ,
+        committed_at    TIMESTAMP_LTZ,
+        finished_at     TIMESTAMP_LTZ,
+        trips_retired   NUMBER(38,0),
+        trips_copied    NUMBER(38,0),
+        details_moved   NUMBER(38,0),
+        scan_from       DATE,
+        scan_to         DATE,
+        run_by          VARCHAR(200),
+        session_id      VARCHAR(100),     -- the Snowflake session that ran it (RECOVER uses it)
+        message         VARCHAR(4000)
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_CHECKS (
+        run_id          VARCHAR(20),
+        phase           VARCHAR(10),      -- GATE, POST1, POST3, ROLLBACK, PREFLIGHT, RECOVER
+        check_no        NUMBER(4,0),
+        check_name      VARCHAR(200),
+        expected        VARCHAR(100),
+        actual          VARCHAR(100),
+        passed          BOOLEAN,          -- NULL = information only
+        checked_at      TIMESTAMP_LTZ
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOG (
+        run_id             VARCHAR(20),
+        logged_at          TIMESTAMP_NTZ,
+        from_dt            DATE,
+        to_dt              DATE,
+        action             VARCHAR(10),
+        trip_master_id     NUMBER(38,0),  -- RETIRE: the old market trip.  COPY: the source property trip.
+        new_trip_master_id NUMBER(38,0),  -- COPY only: the new market trip
+        market_cd          VARCHAR(100),
+        trip_start_dt      DATE,
+        trip_end_dt        DATE
+    );
+    CREATE TABLE IF NOT EXISTS DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TM AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS run_id, t.*
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER t
+    WHERE FALSE;
+    CREATE TABLE IF NOT EXISTS DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TD AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS run_id, d.*
+    FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+    WHERE FALSE;
+    -- (created with its one row)
+    CREATE TABLE IF NOT EXISTS DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOCK AS
+    SELECT CAST(NULL AS VARCHAR(20)) AS holder, CAST(NULL AS TIMESTAMP_LTZ) AS since;
+
+    EXECUTE IMMEDIATE 'ALTER SESSION SET TIMEZONE = ''America/Los_Angeles''';
+    EXECUTE IMMEDIATE 'ALTER SESSION SET LOCK_TIMEOUT = 900';
+    EXECUTE IMMEDIATE 'ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = FALSE';
+    BEGIN
+        EXECUTE IMMEDIATE 'ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 604800';
+    EXCEPTION
+        WHEN OTHER THEN
+            v_n := 0;
+    END;
+
+    -- the run's record first, then the lock
+    v_rb_id := TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISSFF3');
+    INSERT INTO DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+        (run_id, kind, status, chain_paused, started_at, run_by, session_id, message)
+    SELECT  :v_rb_id, 'ROLLBACK', 'STARTED', FALSE, CURRENT_TIMESTAMP(), CURRENT_USER(), CURRENT_SESSION(),
+            'Started: rollback of ' || :P_RUN_ID || '.';
+    v_logged := TRUE;
+    UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOCK SET holder = :v_rb_id, since = CURRENT_TIMESTAMP() WHERE holder IS NULL;
+    IF (SQLROWCOUNT = 0) THEN
+        UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+           SET status = 'LOCK_BUSY', finished_at = CURRENT_TIMESTAMP(), message = 'Another run held the lock; nothing was done.'
+         WHERE run_id = :v_rb_id;
+        RAISE e_run_active;
+    END IF;
+    v_locked := TRUE;
+
+    -- Only committed runs that have not been undone already.
+    SELECT COUNT(*) INTO :v_scope
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+    WHERE kind = 'RUN' AND status = 'COMMITTED' AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID);
+    IF (v_scope = 0) THEN
+        UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS SET status = 'NOTHING_TO_DO', message = 'No committed run matches ' || :P_RUN_ID || '.'
+         WHERE run_id = :v_rb_id;
+        RAISE e_nothing;
+    END IF;
+
+    IF (v_has_chain) THEN
+        SHOW TASKS LIKE 'TRIP_ROOT_TASK' IN SCHEMA DAAS_PROD.DAAS_COMMON;
+        SELECT MAX("state") INTO :v_task_state FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+        IF (v_task_state IS NULL) THEN
+            UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS SET status = 'ERROR', message = 'Trip root task not visible to this role'
+             WHERE run_id = :v_rb_id;
+            RAISE e_no_chain;
+        END IF;
+        IF (v_task_state <> 'started') THEN
+            UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS SET status = 'CHAIN_PAUSED', message = 'The trip chain was already paused.'
+             WHERE run_id = :v_rb_id;
+            RAISE e_chain_paused;
+        END IF;
+        UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS SET chain_paused = TRUE WHERE run_id = :v_rb_id;
+        v_resumed := FALSE;
+        ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK SUSPEND;
+        v_chain_paused := TRUE;
+        LOOP
+            SELECT COUNT(*) INTO :v_n
+            FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.CURRENT_TASK_GRAPHS(ROOT_TASK_NAME => 'TRIP_ROOT_TASK'))
+            WHERE database_name = 'DAAS_PROD' AND schema_name = 'DAAS_COMMON' AND state = 'EXECUTING';
+            IF (v_n = 0) THEN
+                BREAK;
+            END IF;
+            IF (v_waited >= 3600) THEN
+                UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS SET status = 'CHAIN_BUSY' WHERE run_id = :v_rb_id;
+                RAISE e_chain_busy;
+            END IF;
+            SELECT SYSTEM$WAIT(30);
+            v_waited := v_waited + 30;
+        END LOOP;
+    END IF;
+
+    BEGIN TRANSACTION;
+    v_in_txn := TRUE;
+
+    -- 8.1 take back the new market trips and all their detail rows; only trips the fix created
+    UPDATE DAAS_PROD.DAAS_CORE.TRIP_DETAIL
+       SET delete_ind = 'Y', last_dml_cd = 'U',
+           updated_dttm = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, updated_by = 'DAASI-3641-ROLLBACK'
+     WHERE delete_ind = 'N'
+       AND trip_master_id IN (SELECT t.trip_master_id
+                              FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER t
+                              WHERE t.created_by = 'DAASI-3641'
+                                AND t.trip_master_id IN (SELECT l.new_trip_master_id
+                                                         FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOG l
+                                                         WHERE l.action = 'COPY'
+                                                           AND l.run_id IN (SELECT run_id FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+                                                                            WHERE kind = 'RUN' AND status = 'COMMITTED'
+                                                                              AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID))));
+
+    UPDATE DAAS_PROD.DAAS_CORE.TRIP_MASTER
+       SET delete_ind = 'Y', last_dml_cd = 'U',
+           updated_dttm = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, updated_by = 'DAASI-3641-ROLLBACK'
+     WHERE delete_ind = 'N'
+       AND created_by = 'DAASI-3641'
+       AND trip_master_id IN (SELECT l.new_trip_master_id
+                              FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOG l
+                              WHERE l.action = 'COPY'
+                                AND l.run_id IN (SELECT run_id FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+                                                 WHERE kind = 'RUN' AND status = 'COMMITTED'
+                                                   AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID)));
+
+    -- 8.2 bring back retired trips still in place
+    UPDATE DAAS_PROD.DAAS_CORE.TRIP_DETAIL
+       SET delete_ind = 'N', last_dml_cd = 'U',
+           updated_dttm = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, updated_by = 'DAASI-3641-ROLLBACK'
+     WHERE delete_ind = 'Y'
+       AND updated_by = 'DAASI-3641'
+       AND trip_master_id IN (SELECT l.trip_master_id
+                              FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOG l
+                              WHERE l.action = 'RETIRE'
+                                AND l.run_id IN (SELECT run_id FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+                                                 WHERE kind = 'RUN' AND status = 'COMMITTED'
+                                                   AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID)));
+
+    UPDATE DAAS_PROD.DAAS_CORE.TRIP_MASTER
+       SET delete_ind = 'N', last_dml_cd = 'U',
+           updated_dttm = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, updated_by = 'DAASI-3641-ROLLBACK'
+     WHERE delete_ind = 'Y'
+       AND updated_by = 'DAASI-3641'
+       AND trip_master_id IN (SELECT l.trip_master_id
+                              FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOG l
+                              WHERE l.action = 'RETIRE'
+                                AND l.run_id IN (SELECT run_id FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+                                                 WHERE kind = 'RUN' AND status = 'COMMITTED'
+                                                   AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID)));
+
+    -- 8.3 put back retired rows the archival step already removed, exactly as they were
+    --     when the run retired them (the newest kept copy, if a trip was retired twice)
+    INSERT INTO DAAS_PROD.DAAS_CORE.TRIP_MASTER
+    SELECT r.* EXCLUDE (run_id)
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TM r
+    WHERE r.run_id IN (SELECT run_id FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+                       WHERE kind = 'RUN' AND status = 'COMMITTED'
+                         AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID))
+      AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER t WHERE t.trip_master_id = r.trip_master_id)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY r.trip_master_id ORDER BY r.run_id DESC) = 1;
+
+    INSERT INTO DAAS_PROD.DAAS_CORE.TRIP_DETAIL
+    SELECT r.* EXCLUDE (run_id)
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RETIRED_TD r
+    WHERE r.run_id IN (SELECT run_id FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+                       WHERE kind = 'RUN' AND status = 'COMMITTED'
+                         AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID))
+      AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL t WHERE t.trip_detail_id = r.trip_detail_id)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY r.trip_detail_id ORDER BY r.run_id DESC) = 1;
+
+    -- checks before committing the rollback
+    SELECT COUNT(*) INTO :v_new_live
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER t
+    WHERE t.created_by = 'DAASI-3641' AND t.delete_ind = 'N'
+      AND t.trip_master_id IN (SELECT l.new_trip_master_id
+                               FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOG l
+                               WHERE l.action = 'COPY'
+                                 AND l.run_id IN (SELECT run_id FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+                                                  WHERE kind = 'RUN' AND status = 'COMMITTED'
+                                                    AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID)));
+
+    SELECT COUNT(DISTINCT l.trip_master_id) INTO :v_old_not_live
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOG l
+    WHERE l.action = 'RETIRE'
+      AND l.run_id IN (SELECT run_id FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+                       WHERE kind = 'RUN' AND status = 'COMMITTED'
+                         AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID))
+      AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER t
+                      WHERE t.trip_master_id = l.trip_master_id AND t.delete_ind = 'N');
+
+    v_failed := IFF(v_new_live = 0, 0, 1) + IFF(v_old_not_live = 0, 0, 1);
+    IF (v_failed = 0) THEN
+        -- the records change in the same transaction as the data: this run first
+        -- (one RECOVER has closed rolls back instead), then the undone runs
+        UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+           SET status = 'COMMITTED', committed_at = CURRENT_TIMESTAMP(),
+               message = 'Rolled back ' || :P_RUN_ID || ' (' || TO_VARCHAR(:v_scope) || ' run(s)).'
+         WHERE run_id = :v_rb_id AND status = 'STARTED';
+        IF (SQLROWCOUNT = 0) THEN
+            RAISE e_superseded;
+        END IF;
+        UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+           SET status = 'ROLLED_BACK', message = LEFT(COALESCE(message, '') || ' Rolled back by run ' || :v_rb_id || '.', 4000)
+         WHERE kind = 'RUN' AND status = 'COMMITTED' AND (:P_RUN_ID = 'ALL' OR run_id = :P_RUN_ID);
+        COMMIT;
+        v_in_txn := FALSE;
+    ELSE
+        ROLLBACK;
+        v_in_txn := FALSE;
+        UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+           SET status = 'CHECKS_FAILED', message = 'A check failed; nothing changed.'
+         WHERE run_id = :v_rb_id;
+    END IF;
+
+    SELECT COUNT(*) = 1 INTO :v_holds_lock FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOCK WHERE holder = :v_rb_id;
+    IF (v_chain_paused AND v_holds_lock) THEN
+        ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
+        v_chain_paused := FALSE;
+        v_resumed := TRUE;
+    END IF;
+    UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOCK SET holder = NULL, since = NULL WHERE holder = :v_rb_id;
+    v_locked := FALSE;
+    UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS SET chain_paused = FALSE, finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP())
+     WHERE run_id = :v_rb_id;
+
+    -- Ratings now on no BEM/WLM market trip (information: compare with before the fix;
+    -- new ones arrived after the run on a trip it created, and need a replay).
+    SELECT COUNT(*) INTO :v_no_market
+    FROM (SELECT DISTINCT td.transaction_table_sk AS sk
+          FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER tm
+          JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL td ON td.trip_master_id = tm.trip_master_id
+          WHERE tm.trip_type = 'PROPERTY' AND tm.property_cd IN ('IBE', 'IWA')
+            AND tm.delete_ind = 'N' AND td.delete_ind = 'N' AND td.transaction_type = 'RATINGS') p
+    WHERE NOT EXISTS (SELECT 1
+                      FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER tm
+                      JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL td ON td.trip_master_id = tm.trip_master_id
+                      WHERE tm.trip_type = 'MARKET' AND tm.market_cd IN ('BEM', 'WLM')
+                        AND tm.delete_ind = 'N' AND td.delete_ind = 'N'
+                        AND td.transaction_type = 'RATINGS' AND td.transaction_table_sk = p.sk);
+
+    INSERT INTO DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+        (run_id, phase, check_no, check_name, expected, actual, passed, checked_at)
+    SELECT  :v_rb_id, 'ROLLBACK', 1, 'New trips still live after the rollback',
+            '0', TO_VARCHAR(:v_new_live), :v_new_live = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_rb_id, 'ROLLBACK', 2, 'Retired trips not brought back',
+            '0', TO_VARCHAR(:v_old_not_live), :v_old_not_live = 0, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_rb_id, 'ROLLBACK', 3, 'IBE/IWA ratings on no BEM/WLM market trip (information: replay new ones)',
+            'compare with before the fix', TO_VARCHAR(:v_no_market), NULL, CURRENT_TIMESTAMP()
+    UNION ALL
+    SELECT  :v_rb_id, 'ROLLBACK', 99, 'RESULT',
+            'ROLLED BACK', IFF(:v_failed = 0, 'ROLLED BACK', 'NOTHING CHANGED'), :v_failed = 0, CURRENT_TIMESTAMP();
+
+    IF (v_failed > 0) THEN
+        RAISE e_rb_failed;
+    END IF;
+
+    LET rs RESULTSET := (SELECT check_name, expected, actual, passed
+                         FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_CHECKS
+                         WHERE run_id = :v_rb_id ORDER BY check_no);
+    RETURN TABLE(rs);
+
+EXCEPTION
+    WHEN e_rb_failed THEN
+        RAISE;
+    WHEN OTHER THEN
+        v_err := 'SQLCODE ' || SQLCODE || ': ' || SQLERRM;
+        IF (v_in_txn) THEN
+            ROLLBACK;
+        END IF;
+        IF (v_locked) THEN
+            SELECT COUNT(*) = 1 INTO :v_holds_lock FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOCK WHERE holder = :v_rb_id;
+        END IF;
+        IF (v_chain_paused AND v_holds_lock) THEN
+            BEGIN
+                ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
+                v_resumed := TRUE;
+            EXCEPTION
+                WHEN OTHER THEN
+                    v_err := v_err || ' | COULD NOT RESUME THE TRIP CHAIN. Resume it now: ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;';
+            END;
+        END IF;
+        IF (v_holds_lock) THEN
+            UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_LOCK SET holder = NULL, since = NULL WHERE holder = :v_rb_id;
+        END IF;
+        IF (v_logged) THEN
+            UPDATE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RUNS
+               SET status       = IFF(status = 'STARTED', 'ERROR', status),
+                   chain_paused = :v_holds_lock AND :v_chain_paused AND NOT :v_resumed,
+                   finished_at  = COALESCE(finished_at, CURRENT_TIMESTAMP()),
+                   message      = LEFT(COALESCE(message, '') || ' ' || :v_err, 4000)
+             WHERE run_id = :v_rb_id;
+        END IF;
+        RAISE;
+END;
+$$;
