@@ -1,0 +1,523 @@
+/* =====================================================================
+   DAASI-3640 | Comp comments attached to the wrong comps
+   Phase 1: match comments to the guest's own comp, then correct history
+   =====================================================================
+
+   WHAT THIS FIXES
+   The load matches comment lines (DAAS_RAW_HETCMS.ECPCMPCM_RAW) to comps
+   by comp number and property only. Comp numbers are reused, so a comp
+   that receives a number later picks up the comment written for an
+   earlier comp with that number. The comment table already carries the
+   guest ID (SYIDCM), and it matched the comp's guest on 17,193 of 17,193
+   recent comments. This script restores that guest match in the load
+   procs and the dynamic table, then corrects the comments already stored
+   in DAAS_CORE.COMP_DETAIL_FACT.
+
+   NOT IN THIS PHASE
+   - Remarks (CMPRM_RAW): waiting on Tracy (one field or two) and on the
+     remarks table's guest column.
+   - Late comments (about 44 comps a day): a comment typed after its comp
+     loads is still missed until phase 2. The backfill below catches every
+     one up to the day it runs.
+   - EDW_CZR history, the WCL (Hexlite) load, and soft-deleted rows
+     (DELETE_IND = 'Y'): left as they are.
+   - COMP_DETAIL_FACT_VW: no change. The column already exists; only its
+     values get corrected.
+
+   ORDER (all of it in UAT first, then PROD)
+   Step 0  Pre-flight checks (read-only, PROD)
+   Step 1  Preview the fix on Tracy's five comps (read-only, PROD)
+   Step 2  Patch the two load procs
+   Step 3  Patch the Coalesce dynamic table
+   Step 4  Back up, build the correction table, review it
+   Step 5  Apply the correction in batches
+   Step 6  Validate
+   Step 7  Rollback, only if needed
+
+   GATES BEFORE PROD
+   - Before Step 2: Step 1's FIXED_COMMENT matches the comment on Tracy's
+     Comp Detail screenshots.
+   - Before Step 5: your lead has approved; the owners of anything found
+     in 0b have agreed on timing; and Tracy knows how many comments will
+     disappear from the report (4d), because they belonged to other
+     guests' comps.
+
+   Steps 4 and 5 scan the whole fact table. Use a warehouse larger than
+   X-Small if you can.
+   ===================================================================== */
+
+
+/* ---------------------------------------------------------------------
+   STEP 0  PRE-FLIGHT  (read-only; PROD)
+   --------------------------------------------------------------------- */
+
+-- 0a. Owner and argument types of each load proc. Step 2 must run as
+--     this owner role (or through your team's proc deploy process).
+SELECT procedure_catalog, procedure_name, procedure_owner, argument_signature
+FROM SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES
+WHERE deleted IS NULL
+  AND procedure_name LIKE 'HETCMS_COMP_DETAIL_FACT_LOAD_PROC%';
+
+-- 0b. What reads COMP_DETAIL_FACT downstream. Anything that picks up
+--     changed rows through a stream or a filter on UPDATED_DTTM will see
+--     each comment Step 5 corrects; a job that picks up changes by
+--     BATCH_ID will not. Agree the timing with each owner first.
+SHOW STREAMS IN ACCOUNT;
+SELECT "database_name", "schema_name", "name", "table_name", "owner"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "table_name" ILIKE '%COMP_DETAIL_FACT%'
+   OR "base_tables" ILIKE '%COMP_DETAIL_FACT%';
+
+SELECT referencing_database, referencing_schema,
+       referencing_object_name, referencing_object_domain
+FROM SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES
+WHERE referenced_database = 'DAAS_PROD'
+  AND referenced_schema = 'DAAS_CORE'
+  AND referenced_object_name = 'COMP_DETAIL_FACT';
+
+SELECT procedure_catalog, procedure_schema, procedure_name
+FROM SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES
+WHERE deleted IS NULL
+  AND procedure_definition ILIKE '%DAAS_CORE.COMP_DETAIL_FACT%'
+  AND procedure_name NOT ILIKE '%COMP_DETAIL_FACT_LOAD_PROC%';
+
+-- 0c. When the load runs, and how long it takes.
+SELECT start_time, total_elapsed_time / 1000 AS seconds,
+       LEFT(query_text, 200) AS call_text
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE start_time > DATEADD(day, -2, CURRENT_TIMESTAMP())
+  AND query_type = 'CALL'
+  AND query_text ILIKE '%HETCMS_COMP_DETAIL_FACT_LOAD_PROC%'
+ORDER BY start_time DESC;
+
+-- 0d. Each proc should still hold the commented-out guest match that
+--     Step 2 restores. FALSE means that proc's text differs: find its
+--     ECPCMPCM_RAW block by eye and make the same change.
+SELECT procedure_catalog, procedure_name,
+       CONTAINS(procedure_definition, '--CMPRW_RAW.SYIDRW = ECPCMPCM_RAW.SYIDCM')
+           AS has_commented_guest_match
+FROM SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES
+WHERE deleted IS NULL
+  AND procedure_name LIKE 'HETCMS_COMP_DETAIL_FACT_LOAD_PROC%';
+
+
+/* ---------------------------------------------------------------------
+   STEP 1  PREVIEW THE FIX ON TRACY'S FIVE COMPS  (read-only; PROD)
+   FIXED_COMMENT is what each comp will show once the fix is in. When
+   Tracy's screenshots come back, the comment on her screen should match
+   FIXED_COMMENT. A note on her screen that FIXED_COMMENT doesn't have is
+   probably a remark, which is phase 2.
+   --------------------------------------------------------------------- */
+WITH tracy_comps AS (
+    SELECT column1 AS comp_nbr, column2 AS property_cd
+    FROM VALUES (2884740, 'GBI'), (5901079, 'CLV'), (3254281, 'UBA'),
+                (1905058, 'LUS'), (7762024, 'NOR')
+),
+comment_lines AS (
+    SELECT l.SYIDCM, l."CMP#CM", l.CSEQCM, l.CMNTCM, l.PROPERTY_CODE
+    FROM DAAS_PROD.DAAS_RAW_HETCMS.ECPCMPCM_RAW l
+    JOIN tracy_comps t
+      ON t.comp_nbr = l."CMP#CM"
+     AND t.property_cd = l.PROPERTY_CODE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY l.SYIDCM, l."CMP#CM", l.CSEQCM, l.PROPERTY_CODE
+            ORDER BY l.OPERATION_DATE DESC, l.OPERATION_SEQUENCE_NBR DESC, l.CREATED_DATE DESC) = 1
+),
+fixed AS (
+    SELECT SYIDCM, "CMP#CM" AS comp_nbr, PROPERTY_CODE,
+           LISTAGG(CMNTCM, '|') WITHIN GROUP (ORDER BY CSEQCM) AS fixed_comment
+    FROM comment_lines
+    GROUP BY SYIDCM, "CMP#CM", PROPERTY_CODE
+)
+SELECT f.comp_nbr, f.property_cd, f.guest_id,
+       f.comp_comments_desc AS current_comment,
+       x.fixed_comment
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT f
+JOIN tracy_comps t
+  ON t.comp_nbr = f.comp_nbr
+ AND t.property_cd = f.property_cd
+LEFT JOIN fixed x
+       ON x.SYIDCM = f.guest_id
+      AND x.comp_nbr = f.comp_nbr
+      AND x.PROPERTY_CODE = f.property_cd
+WHERE f.issue_dt = '2026-10-04'
+  AND f.delete_ind = 'N'
+ORDER BY f.property_cd;
+
+
+/* ---------------------------------------------------------------------
+   STEP 2  PATCH THE LOAD PROCS
+   Do this for HETCMS_COMP_DETAIL_FACT_LOAD_PROC and
+   HETCMS_COMP_DETAIL_FACT_LOAD_PROC_HIST, in UAT first.
+
+   2a. Pull the current definition. TRUE makes the first line carry the
+       full name; check that it says DAAS_UAT before you run anything.
+       For the _HIST proc, use the argument types from 0a. Save the output
+       unchanged somewhere: it is your rollback for the proc.
+   --------------------------------------------------------------------- */
+SELECT GET_DDL('PROCEDURE',
+  'DAAS_UAT.DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)',
+  TRUE);
+
+/* 2b. Edit the text in a new worksheet.
+
+   (1) Search for ECPCMPCM_RAW. Replace the block that starts with the
+       LEFT JOIN right after
+         AND CMPRW_RAW.PROPERTY_CODE = CMPLT_RAW.PROPERTY_CODE
+       and ends with
+         AND CMPRW_RAW.PROPERTY_CODE = ECPCMPCM_RAW.PROPERTY_CODE
+       (about lines 455-484 in the daily proc) with the block below.
+       The only changes from today: SYIDCM is uncommented in four places,
+       and the guest match is back as the first line of the ON clause.
+       Keep the doubled quotes in ''|''. The proc body is one
+       single-quoted string, so every quote inside it is doubled.
+
+   ---- REPLACEMENT BLOCK ----
+   LEFT JOIN
+   (
+       SELECT
+           SYIDCM,
+           "CMP#CM",
+           PROPERTY_CODE,
+           LISTAGG(CMNTCM,''|'') WITHIN GROUP (ORDER BY CSEQCM) AS CMNTCM
+       FROM
+           (
+               SELECT
+                   SYIDCM,
+                   "CMP#CM",
+                   CSEQCM,
+                   CMNTCM,
+                   PROPERTY_CODE
+               FROM
+                   DAAS_RAW_HETCMS.ECPCMPCM_RAW ECPCMPCM_RAW
+               QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+                       ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+           )
+       GROUP BY
+           SYIDCM,
+           "CMP#CM",
+           PROPERTY_CODE
+   ) ECPCMPCM_RAW
+   ON
+       CMPRW_RAW.SYIDRW = ECPCMPCM_RAW.SYIDCM
+       AND CMPRW_RAW.CNUMRW = ECPCMPCM_RAW."CMP#CM"
+       AND CMPRW_RAW.PROPERTY_CODE = ECPCMPCM_RAW.PROPERTY_CODE
+   ---- END REPLACEMENT BLOCK ----
+
+   (2) In the change log at the top, after the Version 1.12 lines, add:
+         Modify Date: <date>
+         Modified By: <you>
+         Version 1.13 Restored SYIDCM (guest ID) in the ECPCMPCM comment join
+         so a comment attaches only to the comp of the guest who wrote it.
+         Comp numbers are reused, so comments were copied across guests.
+         (DAASI-3640)
+       Don't type an apostrophe anywhere: an unescaped quote ends the
+       proc body.
+
+   (3) Add COPY GRANTS on its own line between the argument list and
+       RETURNS VARCHAR, so the replace keeps existing grants:
+         ... "CUSTOM_PARAM2" VARCHAR)
+         COPY GRANTS
+         RETURNS VARCHAR
+
+   2c. Run the edited CREATE OR REPLACE as the owner role from 0a.
+       COPY GRANTS keeps every grant except ownership, which goes to the
+       role that runs it. Repeat 2a-2c for the _HIST proc.
+
+   2d. After the next load run, check the comps it loaded (below). If the
+       mismatch count is large, put the saved DDL back and send me a few
+       rows.
+   --------------------------------------------------------------------- */
+USE DATABASE DAAS_UAT;   -- DAAS_PROD after the PROD deploy
+
+-- 2d. Comps loaded since the deploy should carry only their own guest's
+--     comment. Expect 0 mismatches, or a handful (comments typed after
+--     the run). Put your deploy time in the WHERE clause.
+WITH fixed AS (
+    SELECT SYIDCM, "CMP#CM" AS COMP_NBR, PROPERTY_CODE,
+           LISTAGG(CMNTCM, '|') WITHIN GROUP (ORDER BY CSEQCM) AS FIXED_COMMENT
+    FROM (SELECT SYIDCM, "CMP#CM", CSEQCM, CMNTCM, PROPERTY_CODE
+          FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+                  ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1)
+    GROUP BY SYIDCM, "CMP#CM", PROPERTY_CODE
+)
+SELECT COUNT(*) AS loaded_since_deploy,
+       COUNT_IF(f.COMP_COMMENTS_DESC IS DISTINCT FROM x.FIXED_COMMENT) AS mismatches
+FROM DAAS_CORE.COMP_DETAIL_FACT f
+LEFT JOIN fixed x
+       ON x.SYIDCM = f.GUEST_ID
+      AND x.COMP_NBR = f.COMP_NBR
+      AND x.PROPERTY_CODE = f.PROPERTY_CD
+WHERE f.UPDATED_DTTM >= 'YYYY-MM-DD HH:MI:SS'   -- your deploy time
+  AND f.DELETE_IND = 'N'
+  AND f.SOURCE_SYSTEM_NM = 'HETCMS';
+
+
+/* ---------------------------------------------------------------------
+   STEP 3  PATCH THE COALESCE DYNAMIC TABLE (COMP_DETAIL_FACT_DT)
+   The view doesn't read it, but it has the same comment join and looks
+   like the proc's eventual replacement. Fixing it now keeps the bug from
+   coming back at cutover.
+
+   In the node's SQL, replace the ECPCMPCM_RAW block (lines 268-297 in
+   the copy you pasted into a worksheet) with this. Quotes are single
+   here.
+
+   LEFT JOIN
+   (
+       SELECT
+           SYIDCM,
+           "CMP#CM",
+           PROPERTY_CODE,
+           LISTAGG(CMNTCM,'|') WITHIN GROUP (ORDER BY CSEQCM) AS CMNTCM
+       FROM
+           (
+               SELECT
+                   SYIDCM,
+                   "CMP#CM",
+                   CSEQCM,
+                   CMNTCM,
+                   PROPERTY_CODE
+               FROM
+                   {{ ref('DAAS_RAW_HETCMS', 'ECPCMPCM_RAW') }} ECPCMPCM_RAW
+               QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+                       ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+           )
+       GROUP BY
+           SYIDCM,
+           "CMP#CM",
+           PROPERTY_CODE
+   ) ECPCMPCM_RAW
+   ON
+       CMPRW_RAW.SYIDRW = ECPCMPCM_RAW.SYIDCM
+       AND CMPRW_RAW.CNUMRW = ECPCMPCM_RAW."CMP#CM"
+       AND CMPRW_RAW.PROPERTY_CODE = ECPCMPCM_RAW.PROPERTY_CODE
+
+   Leave the CMPRM_RAW (remarks) block below it alone; it has the same
+   flaw and gets fixed in phase 2. Deploy through the usual UAT -> PROD
+   pipeline. The dynamic table rebuilds from raw, so it needs no backfill.
+   --------------------------------------------------------------------- */
+
+
+/* ---------------------------------------------------------------------
+   STEP 4  BACK UP, BUILD THE CORRECTION TABLE, REVIEW IT
+   Build these after Step 2 is live in this environment, so comps loaded
+   from then on are already right and this snapshot covers the rest.
+   (You can also run 4b-4d in PROD before anything is deployed, to size
+   the correction for your lead. Rebuild them before Step 5.)
+   --------------------------------------------------------------------- */
+USE DATABASE DAAS_UAT;   -- DAAS_PROD for the real run
+
+-- 4a. Zero-copy backup of the whole fact: instant, and the full-table
+--     fallback if anything goes wrong.
+CREATE TABLE DAAS_TEMP.COMP_DETAIL_FACT_BKP_DAASI3640
+  CLONE DAAS_CORE.COMP_DETAIL_FACT;
+
+-- 4b. Every comment rebuilt the fixed way: one row per guest, comp number
+--     and property. Same logic as the patched proc.
+CREATE OR REPLACE TRANSIENT TABLE DAAS_TEMP.DAASI3640_COMMENTS AS
+SELECT SYIDCM, "CMP#CM" AS COMP_NBR, PROPERTY_CODE,
+       LISTAGG(CMNTCM, '|') WITHIN GROUP (ORDER BY CSEQCM) AS NEW_COMMENT
+FROM (SELECT SYIDCM, "CMP#CM", CSEQCM, CMNTCM, PROPERTY_CODE
+      FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+              ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1)
+GROUP BY SYIDCM, "CMP#CM", PROPERTY_CODE;
+
+-- 4c. One row per active comp whose comment will change, with the old and
+--     new values side by side. This table drives Step 5 and is the
+--     rollback for Step 7.
+CREATE OR REPLACE TRANSIENT TABLE DAAS_TEMP.DAASI3640_COMMENT_FIX AS
+SELECT f.COMP_NBR, f.ISHDRW, f.PROPERTY_CD, f.CASINO_OUTLET_CD,
+       f.GUEST_ID, f.ISSUE_DT,
+       f.COMP_COMMENTS_DESC AS OLD_COMMENT,
+       c.NEW_COMMENT,
+       CASE WHEN f.COMP_COMMENTS_DESC IS NULL THEN 'ADDED'
+            WHEN c.NEW_COMMENT IS NULL       THEN 'REMOVED'
+            ELSE 'REPLACED' END AS CHANGE_TYPE,
+       CASE WHEN f.ISSUE_DT < '2023-01-01' OR f.ISSUE_DT IS NULL THEN 1
+            WHEN f.ISSUE_DT < '2024-01-01' THEN 2
+            WHEN f.ISSUE_DT < '2025-01-01' THEN 3
+            WHEN f.ISSUE_DT < '2026-01-01' THEN 4
+            ELSE 5 END AS BATCH_NO
+FROM DAAS_CORE.COMP_DETAIL_FACT f
+LEFT JOIN DAAS_TEMP.DAASI3640_COMMENTS c
+       ON c.SYIDCM        = f.GUEST_ID
+      AND c.COMP_NBR      = f.COMP_NBR
+      AND c.PROPERTY_CODE = f.PROPERTY_CD
+LEFT JOIN (SELECT DISTINCT COMP_NBR, PROPERTY_CODE
+           FROM DAAS_TEMP.DAASI3640_COMMENTS) n   -- comp numbers with comment lines under any guest
+       ON n.COMP_NBR      = f.COMP_NBR
+      AND n.PROPERTY_CODE = f.PROPERTY_CD
+WHERE f.DELETE_IND = 'N'
+  AND f.SOURCE_SYSTEM_NM = 'HETCMS'
+  -- AND f.ISSUE_DT >= '2025-10-01'   -- add a floor only if Tracy needs just a recent window
+  AND f.COMP_COMMENTS_DESC IS DISTINCT FROM c.NEW_COMMENT
+  -- Leave a comment alone when raw has no comment lines for its comp
+  -- number at all, since raw can't say whose it is (4f counts these).
+  AND (c.NEW_COMMENT IS NOT NULL OR n.COMP_NBR IS NOT NULL);
+
+-- 4d. What will change:
+--     REMOVED  = the comment belongs to another guest's comp; this comp has
+--                none of its own. Expect this to be the biggest by far.
+--     REPLACED = the comp's own comment replaces another guest's.
+--     ADDED    = a comment typed after the comp loaded.
+SELECT CHANGE_TYPE, COUNT(*) AS comps
+FROM DAAS_TEMP.DAASI3640_COMMENT_FIX
+GROUP BY 1
+ORDER BY 2 DESC;
+
+-- 4e. Comments the fix would drop although they were written for this
+--     comp: the comp was moved to a different guest after the comment
+--     was written (proc v1.11 soft-deletes the old guest's row when that
+--     happens). Expect this to be small. If it's more than about 1% of
+--     REMOVED, stop and send me the number.
+SELECT COUNT(DISTINCT x.COMP_NBR, x.ISHDRW, x.PROPERTY_CD, x.CASINO_OUTLET_CD)
+           AS removed_after_guest_change
+FROM DAAS_TEMP.DAASI3640_COMMENT_FIX x
+JOIN DAAS_CORE.COMP_DETAIL_FACT d
+  ON  d.COMP_NBR         = x.COMP_NBR
+  AND d.ISHDRW           = x.ISHDRW
+  AND d.PROPERTY_CD      = x.PROPERTY_CD
+  AND d.CASINO_OUTLET_CD = x.CASINO_OUTLET_CD
+  AND d.DELETE_IND       = 'Y'
+  AND d.GUEST_ID IS DISTINCT FROM x.GUEST_ID
+JOIN DAAS_TEMP.DAASI3640_COMMENTS c
+  ON  c.SYIDCM        = d.GUEST_ID
+  AND c.COMP_NBR      = d.COMP_NBR
+  AND c.PROPERTY_CODE = d.PROPERTY_CD
+WHERE x.CHANGE_TYPE = 'REMOVED';
+
+-- 4f. Comments left untouched because raw has no comment lines for that
+--     comp number at all. Expect 0 or close to it. A large number means
+--     raw is missing history; tell your lead, since those can't be
+--     checked.
+SELECT COUNT(*) AS left_untouched
+FROM DAAS_CORE.COMP_DETAIL_FACT f
+LEFT JOIN (SELECT DISTINCT COMP_NBR, PROPERTY_CODE
+           FROM DAAS_TEMP.DAASI3640_COMMENTS) n
+       ON n.COMP_NBR      = f.COMP_NBR
+      AND n.PROPERTY_CODE = f.PROPERTY_CD
+WHERE f.DELETE_IND = 'N'
+  AND f.SOURCE_SYSTEM_NM = 'HETCMS'
+  AND TRIM(f.COMP_COMMENTS_DESC) > ''
+  AND n.COMP_NBR IS NULL;
+
+-- 4g. Eyeball a sample of old and new values.
+SELECT * FROM DAAS_TEMP.DAASI3640_COMMENT_FIX SAMPLE (30 ROWS);
+
+
+/* ---------------------------------------------------------------------
+   STEP 5  APPLY THE CORRECTION IN BATCHES  (batch_no 1 to 5)
+   Only the comment and the audit columns change. BATCH_ID and
+   LAST_DML_CD stay as they are, so the load's own counts aren't
+   affected. If 0b found a stream on the fact, run one batch per
+   downstream cycle so it isn't flooded.
+   MD5_CHECKSUM is left alone. If one of these comps is reloaded later,
+   the load sees a changed checksum and writes the same corrected comment
+   again, which is harmless.
+   Run batches between load runs if you can. If a load starts during a
+   batch, it waits for the batch to finish.
+   --------------------------------------------------------------------- */
+SET batch_no = 1;   -- then 2, 3, 4, 5
+
+UPDATE DAAS_CORE.COMP_DETAIL_FACT f
+SET COMP_COMMENTS_DESC = x.NEW_COMMENT,
+    UPDATED_DTTM       = CURRENT_TIMESTAMP(),
+    UPDATED_BY         = CURRENT_USER()
+FROM DAAS_TEMP.DAASI3640_COMMENT_FIX x
+WHERE f.COMP_NBR         = x.COMP_NBR
+  AND f.ISHDRW           = x.ISHDRW
+  AND f.PROPERTY_CD      = x.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = x.CASINO_OUTLET_CD
+  AND f.GUEST_ID IS NOT DISTINCT FROM x.GUEST_ID
+  AND f.DELETE_IND       = 'N'
+  -- skip any comp the load has rewritten since 4c; it's already right
+  AND f.COMP_COMMENTS_DESC IS NOT DISTINCT FROM x.OLD_COMMENT
+  AND x.BATCH_NO = $batch_no;
+
+-- The UPDATE's row count should equal this, or be slightly lower if the
+-- load has rewritten some of these comps since 4c.
+SELECT COUNT(*) AS expected_rows
+FROM DAAS_TEMP.DAASI3640_COMMENT_FIX
+WHERE BATCH_NO = $batch_no;
+
+
+/* ---------------------------------------------------------------------
+   STEP 6  VALIDATE
+   --------------------------------------------------------------------- */
+
+-- 6a. Comments shared with an earlier holder of the same comp number, by
+--     quarter. Before the fix this ran 300,000 to 530,000 a quarter. It
+--     should drop sharply. What remains should be mostly short, common
+--     notes (BOA, PD) that two guests happened to share.
+SELECT DATE_TRUNC('quarter', issue_dt) AS qtr,
+       COUNT(*) AS commented,
+       COUNT_IF(prev_guest <> guest_id) AS inherited
+FROM (SELECT issue_dt, guest_id,
+             LAG(guest_id) OVER (PARTITION BY property_cd, comp_nbr, comp_comments_desc
+                                 ORDER BY issue_dt) AS prev_guest
+      FROM DAAS_CORE.COMP_DETAIL_FACT
+      WHERE issue_dt BETWEEN '2022-01-01' AND CURRENT_DATE
+        AND TRIM(comp_comments_desc) > ''
+        AND delete_ind = 'N')
+GROUP BY 1
+ORDER BY 1;
+
+-- 6b. PROD only: rerun Step 1. CURRENT_COMMENT should now equal
+--     FIXED_COMMENT on every row.
+
+-- 6c. Corrections still not applied. Must be 0.
+SELECT COUNT(*) AS not_applied
+FROM DAAS_TEMP.DAASI3640_COMMENT_FIX x
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_NBR         = x.COMP_NBR
+  AND f.ISHDRW           = x.ISHDRW
+  AND f.PROPERTY_CD      = x.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = x.CASINO_OUTLET_CD
+  AND f.GUEST_ID IS NOT DISTINCT FROM x.GUEST_ID
+  AND f.DELETE_IND       = 'N'
+WHERE f.COMP_COMMENTS_DESC IS NOT DISTINCT FROM x.OLD_COMMENT;
+
+-- 6d. Comps with a comment, before (backup) and after, by quarter. The
+--     drop should roughly equal REMOVED minus ADDED from 4d. These are
+--     the numbers to give Tracy.
+SELECT 'before' AS version, DATE_TRUNC('quarter', issue_dt) AS qtr,
+       COUNT_IF(TRIM(comp_comments_desc) > '') AS comps_with_comment
+FROM DAAS_TEMP.COMP_DETAIL_FACT_BKP_DAASI3640
+WHERE delete_ind = 'N' AND source_system_nm = 'HETCMS' AND issue_dt >= '2022-01-01'
+GROUP BY 1, 2
+UNION ALL
+SELECT 'after', DATE_TRUNC('quarter', issue_dt),
+       COUNT_IF(TRIM(comp_comments_desc) > '')
+FROM DAAS_CORE.COMP_DETAIL_FACT
+WHERE delete_ind = 'N' AND source_system_nm = 'HETCMS' AND issue_dt >= '2022-01-01'
+GROUP BY 1, 2
+ORDER BY qtr, version DESC;
+
+
+/* ---------------------------------------------------------------------
+   STEP 7  ROLLBACK (only if needed)
+   Puts back every comment Step 5 changed, unless the load has changed
+   it again since.
+   --------------------------------------------------------------------- */
+UPDATE DAAS_CORE.COMP_DETAIL_FACT f
+SET COMP_COMMENTS_DESC = x.OLD_COMMENT,
+    UPDATED_DTTM       = CURRENT_TIMESTAMP(),
+    UPDATED_BY         = CURRENT_USER()
+FROM DAAS_TEMP.DAASI3640_COMMENT_FIX x
+WHERE f.COMP_NBR         = x.COMP_NBR
+  AND f.ISHDRW           = x.ISHDRW
+  AND f.PROPERTY_CD      = x.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = x.CASINO_OUTLET_CD
+  AND f.GUEST_ID IS NOT DISTINCT FROM x.GUEST_ID
+  AND f.DELETE_IND       = 'N'
+  AND f.COMP_COMMENTS_DESC IS NOT DISTINCT FROM x.NEW_COMMENT;
+
+-- Procs: rerun the original DDL saved in 2a.
+-- Full-table fallback: the clone from 4a.
+
+-- Clean up after sign-off:
+-- DROP TABLE DAAS_TEMP.COMP_DETAIL_FACT_BKP_DAASI3640;
+-- DROP TABLE DAAS_TEMP.DAASI3640_COMMENTS;
+-- DROP TABLE DAAS_TEMP.DAASI3640_COMMENT_FIX;
