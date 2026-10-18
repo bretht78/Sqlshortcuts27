@@ -10,9 +10,13 @@
 -- build the replacements with new ids; the merge, summary and comp-worth steps then finish the job, exactly as
 -- they do every hour for trips touched by voids.
 --
--- Changed in this version: A1 fixed (guest_unique_id was ambiguous in the QUALIFY); guest ids <= 0 excluded (the
--- pipeline uses -1 and 0 as placeholders); pre-checks for the extra steps; Part B is one block that runs every
--- chain step our change triggers and stops on the first problem; Part C opens with a one-screen scoreboard.
+-- Changed in this version (after the first run of the block stopped at its preflight, with nothing changed):
+-- B2 is new: it shows whether UAT's own trip chain will run, which roles you hold, and records who owns the
+-- DAAS_TEMP objects the steps recreate. B3 offers two routes: route A lets UAT's chain run the steps as the
+-- pipeline role (by its schedule, or one EXECUTE TASK), which is also how PROD will run; route B is the hand-run
+-- block, whose preflight now also refuses to run beside a chain run or with secondary roles on, and names the
+-- role it ran as. B4 confirms the run from the pipeline's own records. C8 restores ownership from B2's record.
+-- Parts A and B1 are unchanged and need not be run again.
 --
 -- One thing to expect, from the code: the comp-worth step (TRIP_COMP_WORTH_LOAD_PROC) values a market trip from
 -- the property trips whose detail rows changed in the same run. Here only market rows change, so it will likely
@@ -20,10 +24,12 @@
 -- REPLAY_COUNTER bump on the same guests' ratings after the rebuild (next file), which re-presents property and
 -- market rows together.
 --
--- Roles. PART A, B1 and PART C run as DAAS_TEAM. The B2 block runs as a role that can recreate the DAAS_TEMP work
---        tables the procedures replace on every run (its preflight checks this and stops before any change).
+-- Roles. PART A, B1, B2, B4 and PART C run as DAAS_TEAM. The run itself (B3) needs the pipeline role: the steps
+--        recreate DAAS_TEMP work tables owned by DOMAIN_TEMP_ADMIN_UAT and a stream owned by STREAM_OWNERS_UAT,
+--        and every procedure switches to the job warehouse. UAT's tasks do this every run as APP_SERVICE_UAT.
 -- Run statement by statement. Every check says what it expects.
--- Scratch tables (DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_*): GUESTS, LOG, MARKS, QUEUE, TM/TD/TS/DAS _BEFORE/_AFTER.
+-- Scratch tables (DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_*): GUESTS, LOG, MARKS, QUEUE, OWNERS,
+-- TM/TD/TS/DAS _BEFORE/_AFTER.
 
 
 -- ===================================================================================================
@@ -358,7 +364,7 @@ ORDER BY 1;
 -- ===================================================================================================
 
 -- B1. (DAAS_TEAM) Queue the trips: the same INSERT the pipeline itself makes into this table. BATCH_ID -3641 marks
---     the rows as ours. The queue stream must hold nothing else (the B2 block checks again).
+--     the rows as ours. The queue stream must hold nothing else (the block in B3 checks again).
 USE ROLE DAAS_TEAM;
 SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM') AS queue_stream_has_data_expect_false;
 
@@ -371,24 +377,117 @@ SELECT 'B1_QUEUED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, COUNT(*) || ' trips queu
 
 SELECT (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM WHERE METADATA$ACTION = 'INSERT') AS rows_waiting_in_stream,
        (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_QUEUE)                              AS trips_queued_expect_equal;
--- To take the rows back out before B2 runs (the stream then shows nothing for them):
+-- To take the rows back out before the run in B3 (the stream then shows nothing for them):
 --   DELETE FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE WHERE BATCH_ID = -3641
 
--- B2. (pipeline role) Session setup, then one block that runs, in chain order, every step our change triggers:
---     recalculation, merge check, merge (if anything was queued), the trip-master customer-merge check, summary,
---     comp worth, non-gaming revenue. Each step is the exact CALL its task makes. A preflight first confirms the
---     session is in DAAS_UAT, only our rows are waiting, the other streams are empty, and this role can recreate
---     the DAAS_TEMP work tables. It stops at the first problem and returns one row per step.
---     Secondary roles are switched off so the block runs with the primary role only, as a task does; the
---     procedures' CREATE OR REPLACE statements are authorised by the primary role anyway. If USE WAREHOUSE then
---     fails, the role reaches that warehouse only through a secondary role: run USE SECONDARY ROLES ALL instead and
---     carry on (if the primary role cannot recreate the work tables, step S1 then fails at its first statement,
---     before it changes any trip data).
-USE ROLE DAAS_UAT_DEVELOPER;
+-- B2. (DAAS_TEAM; read-only apart from one scratch table) Which way the run can happen. The steps after the queue
+--     recreate DAAS_TEMP work tables owned by DOMAIN_TEMP_ADMIN_UAT and a stream owned by STREAM_OWNERS_UAT, and
+--     every procedure switches to the job warehouse DAAS_UAT_IT_WHSRCTORAW_COMPUTE. UAT's own tasks do all of that
+--     on every run as their owner, APP_SERVICE_UAT. So the run goes either through those tasks (route A in B3, the
+--     way PROD will run it) or through the block in B3 under a role that holds both owner roles (route B).
+
+-- B2a. Will UAT's own chain run? Run the SHOW, then the SELECT right after it. A task graph runs only while its
+--      root is 'started', and each step task under it runs only while it is 'started' too. Expect the regular
+--      chain (root TRIP_ROOT_TASK) and the 2024 market-replay copy (root TRIP_ROOT_TASK_MARKET_REPLAY).
+SHOW TASKS IN SCHEMA DAAS_UAT.DAAS_COMMON;
+SELECT "name", "state", "schedule",
+       ARRAY_TO_STRING(TRY_PARSE_JSON("predecessors")::ARRAY, ', ')                           AS runs_after,
+       IFF(COALESCE("condition", '') = '', NULL,
+           CONTAINS(UPPER("condition"), 'TRIP_RECALC_QUEUE_STREAM'))                           AS wakes_on_recalc_queue,
+       "owner", "warehouse", "last_suspended_on"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" IN ('TRIP_ROOT_TASK', 'TRIP_ROOT_TASK_MARKET_REPLAY')
+   OR ("name" NOT ILIKE '%INITIAL_LOAD%'
+       AND "definition" ILIKE ANY ('%''TRIP_RECALCULATION''%', '%''TRIP_MERGE_CHECK''%', '%''TRIP_MERGE''%',
+                                   '%''TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER''%', '%''TRIP_SUMMARY_WRAPPER''%',
+                                   '%''TRIP_COMP_WORTH''%', '%''TRIP_NG_REVENUE_SUMMARY''%'))
+ORDER BY "name";
+
+-- B2b. Has UAT run these jobs lately? The pipeline's own batch log (all seven jobs log to shard S02). A task run
+--      shows as SYSTEM (or a service user) in last_run_by. Jobs that check a stream first (recalculation, merge
+--      check, merge, customer-merge check, summary) only log a run when their stream held rows.
+SELECT j.job_name, COUNT(*) AS runs_last_7_days, MAX(b.batch_start_date) AS last_run_start,
+       MAX_BY(b.batch_status, b.batch_id) AS last_status, MAX_BY(b.created_by, b.batch_id) AS last_run_by
+FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+WHERE j.job_name IN ('TRIP_RECALCULATION', 'TRIP_MERGE_CHECK', 'TRIP_MERGE', 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER',
+                     'TRIP_SUMMARY_WRAPPER', 'TRIP_COMP_WORTH', 'TRIP_NG_REVENUE_SUMMARY')
+  AND b.batch_start_date >= DATEADD(day, -7, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
+GROUP BY 1
+ORDER BY 3 DESC;
+
+-- B2c. The roles you hold anywhere in your grants (every role you can switch to, and every role under those).
+--      Route B needs a role holding both owner roles; APP_SERVICE_UAT holds them.
+SELECT CURRENT_USER()                                       AS you,
+       ARRAY_CONTAINS('APP_SERVICE_UAT'::VARIANT, r)       AS hold_app_service_uat,
+       ARRAY_CONTAINS('DOMAIN_TEMP_ADMIN_UAT'::VARIANT, r) AS hold_domain_temp_admin_uat,
+       ARRAY_CONTAINS('STREAM_OWNERS_UAT'::VARIANT, r)     AS hold_stream_owners_uat,
+       r                                                    AS every_role_you_hold
+FROM (SELECT PARSE_JSON(CURRENT_AVAILABLE_ROLES())::ARRAY AS r);
+
+-- B2d. Who owns the objects the steps recreate, and when the pipeline last recreated them (CREATE OR REPLACE gives
+--      them a new created_on on every run). Recorded for C8. Run each SHOW, then the statement right after it.
+--      Reading it: TRIP_RECALC_QUEUE_TEMP's date is the last recalculation run that had work, TRIP_DETAIL_TMP's the
+--      last summary run. A recent date with the owner still DOMAIN_TEMP_ADMIN_UAT means UAT hands new DAAS_TEMP
+--      tables to that role automatically, so ownership comes out right whichever role runs the steps.
+SHOW TABLES IN SCHEMA DAAS_UAT.DAAS_TEMP;
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_OWNERS AS
+SELECT 'TABLE'::VARCHAR AS object_kind, "name"::VARCHAR AS object_name, "owner"::VARCHAR AS owner_before,
+       "created_on"::TIMESTAMP_LTZ AS recreated_on_before
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" IN ('TRIP_RECALC_QUEUE_TEMP', 'TRIP_MERGE_TEMP', 'TRIP_MERGE_TEMP_1', 'TRIP_MERGE_TEMP_2',
+                 'TRIP_MERGE_TEMP_2A', 'CUSTOMER_MERGE_CHECK', 'CUSTOMER_MERGE_CHECK_2', 'TRIP_DETAIL_TMP',
+                 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM_TEMP', 'DAILY_ACTIVITY_SUMMARY_BM_TRIP',
+                 'DAILY_ACTIVITY_SUMMARY_TRIP', 'TRIP_NG_REVENUE_SUMMARY_TMP');
+
+SHOW STREAMS LIKE 'TRIP_MASTER_TRIP_MERGE_CHECK_STREAM' IN SCHEMA DAAS_UAT.DAAS_TEMP;
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_OWNERS
+SELECT 'STREAM', "name", "owner", "created_on" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+SELECT object_kind, object_name, owner_before, recreated_on_before
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_OWNERS
+ORDER BY recreated_on_before DESC;
+
+-- B3. The run. Pick the route B2 points to.
+--
+--   ROUTE A, preferred, and the way PROD will run: UAT's own chain runs the steps.
+--     TRIP_ROOT_TASK 'started' in B2a (with wakes_on_recalc_queue TRUE): nothing to run. Its next scheduled run finds
+--       our rows in the recalc queue stream and runs every step after them as APP_SERVICE_UAT. Go to B4 after that
+--       run, and repeat B4 until every step there shows a finished status.
+--     TRIP_ROOT_TASK 'suspended': one run of the chain, started by anyone with OPERATE on the root task (DevOps, or
+--       you if they grant it). It runs once as the task owner and leaves the task suspended. Step tasks that are
+--       suspended are skipped, so check B2a first: the recalculation, merge-check, merge, customer-merge-check,
+--       summary, comp-worth and non-gaming-revenue tasks under TRIP_ROOT_TASK should all show 'started'.
+--         EXECUTE TASK DAAS_UAT.DAAS_COMMON.TRIP_ROOT_TASK;
+--     Either way the chain also runs its other steps (ratings, hotel, POS, offers, comps, markers, freeplay) on
+--     whatever UAT has waiting for them, and its customer-merge step if the check queues a guest merge. That is the
+--     chain doing its normal job; scoreboard rows 19 and 20 report anything it changed for our guests beyond the
+--     queued trips.
+--
+--   ROUTE B: the block below, run by hand, which returns a verdict per step. Only while no chain run is under way
+--     (the block checks), and as a role that holds DOMAIN_TEMP_ADMIN_UAT and STREAM_OWNERS_UAT and can use the job
+--     warehouse (B2c; APP_SERVICE_UAT does). In Workspaces set that role, the warehouse DAAS_UAT_IT_WHSRCTORAW_COMPUTE
+--     and DAAS_UAT / DAAS_COMMON in this file's context picker (top right): the first attempt ran as DAAS_TEAM even
+--     after a USE ROLE line. Then run the four USE lines below one at a time, then B3a, then the block.
 USE SECONDARY ROLES NONE;
 USE DATABASE DAAS_UAT;
 USE SCHEMA DAAS_COMMON;
 USE WAREHOUSE DAAS_UAT_IT_WHSRCTORAW_COMPUTE;
+
+-- B3a. (route B) Who the block will run as. Expect the role you picked, empty roles in secondary_roles, the job
+--      warehouse, and TRUE in the last two columns. Anything else: fix the context picker before running the block
+--      (the block repeats these checks and stops if they fail).
+SELECT CURRENT_ROLE()                              AS runs_as,
+       CURRENT_SECONDARY_ROLES()                   AS secondary_roles,
+       CURRENT_WAREHOUSE()                         AS warehouse,
+       IS_ROLE_IN_SESSION('DOMAIN_TEMP_ADMIN_UAT') AS can_recreate_work_tables,
+       IS_ROLE_IN_SESSION('STREAM_OWNERS_UAT')     AS can_recreate_merge_stream;
+
+-- The block (route B). In chain order it runs every step our change triggers: recalculation, merge check, merge (if
+-- anything was queued), the trip-master customer-merge check, summary, comp worth, non-gaming revenue. Each step is
+-- the exact CALL its task makes. The preflight confirms no chain run is under way, the session is in DAAS_UAT with
+-- secondary roles off, only our rows are waiting, the other streams are empty, and this role can recreate the
+-- DAAS_TEMP objects. It stops at the first problem, before any step, and returns one row per check and step.
 
 EXECUTE IMMEDIATE $$
 DECLARE
@@ -408,11 +507,31 @@ DECLARE
     pilot_stop EXCEPTION (-20641, 'DAASI-3641 pilot stopped, see the step rows');
 BEGIN
     ---------------------------------------------------------------- preflight: nothing here changes data
+    -- P0. A chain run under way would race this block for the same streams and work tables.
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+            JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+            WHERE j.job_name LIKE 'TRIP%' AND b.batch_status = 'IN PROGRESS'
+              AND b.batch_start_date >= DATEADD(hour, -6, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ));
+    IF (v_n > 0) THEN
+        v_log := v_log || 'P0 chain~|~STOP~|~' || v_n || ' trip job(s) show IN PROGRESS in the last 6 hours (B2b lists the jobs): '
+                       || 'a chain run may be under way and may take our rows. Let it finish, then run B4#ROW#';
+        RAISE pilot_stop;
+    END IF;
+    v_log := v_log || 'P0 chain~|~ok~|~no trip job in progress#ROW#';
+
+    -- P1. Session: database, role, warehouse, and no secondary roles. CREATE OR REPLACE is authorised by the primary
+    --     role alone, so the owner checks in P4 must see the primary role alone, as a task run does.
     IF (CURRENT_DATABASE() IS DISTINCT FROM 'DAAS_UAT') THEN
         v_log := v_log || 'P1 session~|~STOP~|~session database is ' || COALESCE(CURRENT_DATABASE(), '(none)') || ': run USE DATABASE DAAS_UAT and this block again#ROW#';
         RAISE pilot_stop;
     END IF;
-    v_log := v_log || 'P1 session~|~ok~|~database DAAS_UAT, role ' || CURRENT_ROLE() || ', warehouse ' || COALESCE(CURRENT_WAREHOUSE(), '(none)') || '#ROW#';
+    v_txt := (SELECT COALESCE(TRY_PARSE_JSON(CURRENT_SECONDARY_ROLES()):roles::VARCHAR, ''));
+    IF (v_txt <> '') THEN
+        v_log := v_log || 'P1 session~|~STOP~|~running as ' || CURRENT_ROLE() || ' with secondary roles on (' || v_txt
+                       || '): run USE SECONDARY ROLES NONE on its own, check B3a, then run this block again#ROW#';
+        RAISE pilot_stop;
+    END IF;
+    v_log := v_log || 'P1 session~|~ok~|~database DAAS_UAT, role ' || CURRENT_ROLE() || ', warehouse ' || COALESCE(CURRENT_WAREHOUSE(), '(none)') || ', no secondary roles#ROW#';
 
     v_queued := (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM
                  WHERE METADATA$ACTION = 'INSERT' AND batch_id = -3641);
@@ -485,9 +604,9 @@ BEGIN
                  WHERE NOT IS_ROLE_IN_SESSION("owner"));
     v_txt := v_txt || v_stream;
     IF (v_n < 7 OR v_txt <> '') THEN
-        v_log := v_log || 'P4 work tables~|~STOP~|~this role sees ' || v_n || ' of the 7 work tables the steps refill'
+        v_log := v_log || 'P4 work tables~|~STOP~|~role ' || CURRENT_ROLE() || ' sees ' || v_n || ' of the 7 work tables the steps refill'
                        || IFF(v_txt <> '', ' and cannot recreate objects owned by: ' || v_txt, '')
-                       || '. Run the block as the owner role, or a role granted it#ROW#';
+                       || '. Use route A (B3), or run the block as a role that holds those (B2c)#ROW#';
         RAISE pilot_stop;
     END IF;
     v_txt := (SELECT COALESCE(LISTAGG(DISTINCT table_owner, ', '), '')
@@ -600,7 +719,7 @@ BEGIN
         v_log := v_log || 'S7 non-gaming revenue~|~skipped~|~its stream held other changes or could not be read at preflight#ROW#';
     END IF;
 
-    v_log := v_log || 'END~|~done~|~run PART C as DAAS_TEAM; if this ran as a role other than the work-table owner, also run C8#ROW#';
+    v_log := v_log || 'END~|~done~|~next: B4, then PART C as DAAS_TEAM, then C8#ROW#';
     res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
             FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
     RETURN TABLE(res);
@@ -617,8 +736,43 @@ EXCEPTION
 END;
 $$;
 
+-- (route B) After the block: the procedures set a query tag on the session; secondary roles back on.
 ALTER SESSION UNSET QUERY_TAG;
 USE SECONDARY ROLES ALL;
+
+-- B4. (DAAS_TEAM, both routes) Did the pipeline take our rows, and did every step after it finish? Until a run has
+--     happened B4a shows the rows still waiting; run it again after the chain's next run. After route B, set the
+--     context picker back to DAAS_TEAM first.
+USE ROLE DAAS_TEAM;
+
+-- B4a. Expect still_waiting 0, processed equal to trips_queued, still_live 0. processed_by is the user the
+--      recalculation ran under (SYSTEM for a task run).
+WITH q AS (SELECT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_QUEUE),
+p AS (SELECT r.trip_master_id, r.batch_id, r.created_by
+      FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_PROCESSED r
+      JOIN q ON q.trip_master_id = r.trip_master_id)
+SELECT (SELECT COUNT(*) FROM q)                                                   AS trips_queued,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM s
+         WHERE s.METADATA$ACTION = 'INSERT' AND s.batch_id = -3641)               AS still_waiting_expect_0,
+       (SELECT COUNT(DISTINCT trip_master_id) FROM p)                             AS processed_expect_queued,
+       (SELECT LISTAGG(DISTINCT batch_id, ', ') FROM p)                           AS recalculation_batch,
+       (SELECT LISTAGG(DISTINCT created_by, ', ') FROM p)                         AS processed_by,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+         JOIN q ON q.trip_master_id = m.trip_master_id WHERE m.delete_ind = 'N')  AS still_live_expect_0;
+
+-- B4b. Every trip job logged from the recalculation batch on. Expect TRIP_RECALCULATION, TRIP_MERGE_CHECK (TRIP_MERGE
+--      too if the check queued merges), TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER, TRIP_SUMMARY_WRAPPER, TRIP_COMP_WORTH and
+--      TRIP_NG_REVENUE_SUMMARY, each with a finished status. IN PROGRESS: that step is still running, wait and rerun.
+--      A route-A run logs its other steps here too (ratings, hotel...) when they had work.
+SELECT b.batch_id, j.job_name, b.batch_status, b.batch_start_date, b.updated_dttm AS last_update, b.created_by AS run_by
+FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+WHERE j.job_name LIKE 'TRIP%'
+  AND b.batch_id >= (SELECT MIN(r.batch_id)
+                     FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_PROCESSED r
+                     JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_QUEUE q ON q.trip_master_id = r.trip_master_id)
+ORDER BY b.batch_id
+LIMIT 50;
 
 
 -- ===================================================================================================
@@ -938,17 +1092,24 @@ ORDER BY 1, 6;
 
 INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_LOG VALUES ('C_DONE', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'checks run');
 
--- C8. Only if B2 ran as a role other than the work-table owner its P4 row named (normally APP_SERVICE_UAT): the
---     procedures recreated their DAAS_TEMP work tables, and possibly the merge-check stream, under the role that
---     ran them, and UAT's own tasks can no longer replace those. Hand them back. Run each SHOW, then its SELECT,
---     then run the GRANT statements it prints (change APP_SERVICE_UAT if P4 named another owner).
-USE ROLE DAAS_UAT_DEVELOPER;
+-- C8. (DAAS_TEAM) Ownership check: the owners of the recreated DAAS_TEMP objects now, against what B2d recorded.
+--     No rows: nothing to do. Rows with owner_now APP_SERVICE_UAT after a route-A run: leave them, that is what
+--     every UAT chain run does. Any other owner_now (route B under another role): UAT's own tasks may then fail to
+--     recreate those objects, so run the GRANT statements printed, as the role shown in owner_now.
+--     Run each SHOW, then the SELECT right after it.
 SHOW TABLES IN SCHEMA DAAS_UAT.DAAS_TEMP;
-SELECT 'GRANT OWNERSHIP ON TABLE DAAS_UAT.DAAS_TEMP.' || "name" || ' TO ROLE APP_SERVICE_UAT COPY CURRENT GRANTS;' AS run_this
-FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
-WHERE "owner" = 'DAAS_UAT_DEVELOPER' AND "created_on" >= CURRENT_DATE();
+SELECT o.object_name, o.owner_before, t."owner" AS owner_now, t."created_on" AS recreated_on,
+       'GRANT OWNERSHIP ON TABLE DAAS_UAT.DAAS_TEMP.' || o.object_name || ' TO ROLE ' || o.owner_before
+           || ' COPY CURRENT GRANTS;' AS run_this_as_owner_now
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_OWNERS o
+JOIN TABLE(RESULT_SCAN(LAST_QUERY_ID())) t ON t."name" = o.object_name
+WHERE o.object_kind = 'TABLE' AND t."owner" IS DISTINCT FROM o.owner_before
+ORDER BY 1;
 
-SHOW STREAMS IN SCHEMA DAAS_UAT.DAAS_TEMP;
-SELECT 'GRANT OWNERSHIP ON STREAM DAAS_UAT.DAAS_TEMP.' || "name" || ' TO ROLE APP_SERVICE_UAT COPY CURRENT GRANTS;' AS run_this
-FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
-WHERE "owner" = 'DAAS_UAT_DEVELOPER' AND "created_on" >= CURRENT_DATE();
+SHOW STREAMS LIKE 'TRIP_MASTER_TRIP_MERGE_CHECK_STREAM' IN SCHEMA DAAS_UAT.DAAS_TEMP;
+SELECT o.object_name, o.owner_before, t."owner" AS owner_now, t."created_on" AS recreated_on,
+       'GRANT OWNERSHIP ON STREAM DAAS_UAT.DAAS_TEMP.' || o.object_name || ' TO ROLE ' || o.owner_before
+           || ' COPY CURRENT GRANTS;' AS run_this_as_owner_now
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_OWNERS o
+JOIN TABLE(RESULT_SCAN(LAST_QUERY_ID())) t ON t."name" = o.object_name
+WHERE o.object_kind = 'STREAM' AND t."owner" IS DISTINCT FROM o.owner_before;
