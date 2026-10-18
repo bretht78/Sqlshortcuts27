@@ -1,0 +1,310 @@
+-- DAASI-3641 UAT readiness, part 3. Read-only except E5/P, which write two scratch tables in DAAS_TEMP_WORK.
+-- Run each statement on its own, as DAAS_TEAM unless a step says otherwise.
+--
+--   R   which role can run the pipeline steps in UAT (the procs recreate DAAS_TEMP tables and a stream, which
+--       needs the owner role), and whether the on-demand INITIAL_LOAD tasks offer a way around that
+--   E5  procedure code, PROD vs UAT, collected with GET_DDL (INFORMATION_SCHEMA hides definitions from
+--       non-owners, which is why part 2 said DIFFERENT on every row; GET_DDL is what the explorer uses and
+--       it worked for K)
+--   E6  the same comparison in one statement through ACCOUNT_USAGE, if your role sees definitions there
+--   P   source of the procedures that exist only in UAT (the market-replay chain and the ad hoc repair procs)
+--   Q   what the big recalculation batches of Aug 18 and Sep 21 actually rebuilt (PROD)
+
+
+-- ===================================================================================================
+-- R. Roles
+-- ===================================================================================================
+
+-- R1. Every role you can switch to. Look for APP_SERVICE_UAT (owner of the UAT tasks and of the DAAS_TEMP
+--     work tables): if it is here, the pilot runs under it and nothing else in R matters.
+SELECT CURRENT_USER() AS user_name, CURRENT_ROLE() AS session_role, CURRENT_AVAILABLE_ROLES() AS roles_you_can_use;
+
+-- R2. What DAAS_UAT_DEVELOPER holds: roles it inherits (granted_on = ROLE), warehouses, sequences, schemas.
+--     Run the SHOW, then the SELECT.
+SHOW GRANTS TO ROLE DAAS_UAT_DEVELOPER;
+SELECT "privilege", "granted_on", "name", "grantee_name"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "granted_on" IN ('ROLE', 'WAREHOUSE', 'SEQUENCE', 'SCHEMA', 'DATABASE', 'TASK')
+   OR "privilege" IN ('OWNERSHIP', 'CREATE TABLE', 'CREATE STREAM', 'OPERATE')
+ORDER BY "granted_on", "name", "privilege";
+
+-- R3. Who owns the work tables and the stream the four pilot procs recreate with CREATE OR REPLACE.
+--     CREATE OR REPLACE needs the owner role (or a role above it). Run each SHOW, then its SELECT.
+SHOW TABLES IN SCHEMA DAAS_UAT.DAAS_TEMP;
+SELECT "name", "owner", "created_on", "rows"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" IN ('TRIP_RECALC_QUEUE_TEMP', 'TRIP_RESULT_TMP_RECALC', 'TRIP_RESULT_TMP_RECALC_1',
+                 'TRIP_MERGE_TEMP', 'TRIP_MERGE_TEMP_1', 'TRIP_MERGE_TEMP_2', 'TRIP_MERGE_TEMP_2A',
+                 'TRIP_RESULT_TMP_MERGE', 'TRIP_RESULT_TMP_MERGE_1',
+                 'TRIP_DETAIL_TMP', 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM_TEMP',
+                 'DAILY_ACTIVITY_SUMMARY_BM_TRIP', 'DAILY_ACTIVITY_SUMMARY_TRIP',
+                 'TRIP_UNMAPPED_SPLIT_TRANS_TEMP', 'TRIP_UNMAPPED_TRANS_HOTEL_TEMP')
+ORDER BY "name";
+
+SHOW STREAMS IN SCHEMA DAAS_UAT.DAAS_TEMP;
+SELECT "name", "owner", "created_on", "stale"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" = 'TRIP_MASTER_TRIP_MERGE_CHECK_STREAM';
+
+-- R4. The on-demand tasks UAT already has for these steps (built for the 2022 initial load; no schedule).
+--     EXECUTE TASK runs a task as its owner with the task's warehouse, so if these have no predecessor and
+--     your role holds OPERATE on them, the pilot can run through them and the role question disappears.
+SHOW TASKS IN SCHEMA DAAS_UAT.DAAS_COMMON;
+SELECT "name", "state", "owner", "warehouse", "predecessors", "definition"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" IN ('CORE2CORE_TRIP_RECALCULATION_INITIAL_LOAD_TASK', 'CORE2CORE_TRIP_MERGE_CHECK_INITIAL_LOAD_TASK',
+                 'CORE2CORE_TRIP_MERGE_INITIAL_LOAD_TASK', 'CORE2CORE_TRIP_SUMMARY_INITIAL_LOAD_TASK')
+ORDER BY "name";
+
+SHOW GRANTS ON TASK DAAS_UAT.DAAS_COMMON.CORE2CORE_TRIP_RECALCULATION_INITIAL_LOAD_TASK;
+
+
+-- ===================================================================================================
+-- E5. Procedure code, PROD vs UAT, via GET_DDL. One block collects both sides into a scratch table
+--     (about 40 GET_DDL calls, under a minute); the SELECT after it gives the verdicts.
+-- ===================================================================================================
+USE DATABASE DAAS_UAT;
+USE SCHEMA DAAS_TEMP_WORK;
+
+EXECUTE IMMEDIATE $$
+DECLARE
+    c CURSOR FOR
+        SELECT env, procedure_name, argument_signature,
+               REGEXP_REPLACE(REPLACE(argument_signature, '"', ''), '[A-Za-z0-9_$]+ ([A-Za-z0-9_]+)', '\\1') AS types_only
+        FROM (
+            SELECT 'DAAS_PROD' AS env, procedure_name, argument_signature
+            FROM DAAS_PROD.INFORMATION_SCHEMA.PROCEDURES
+            WHERE procedure_schema = 'DAAS_COMMON'
+            UNION ALL
+            SELECT 'DAAS_UAT', procedure_name, argument_signature
+            FROM DAAS_UAT.INFORMATION_SCHEMA.PROCEDURES
+            WHERE procedure_schema = 'DAAS_COMMON'
+        )
+        WHERE procedure_name IN ('BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC', 'BATCH_CONTROL_GENERATE_BATCH_ID_PROC',
+                                 'BATCH_CONTROL_UPDATE_BATCH_STEPS_PROC', 'BATCH_CONTROL_UPDATE_BATCH_FINALSTATUS_PROC',
+                                 'BATCH_CONTROL_UPDATE_BATCH_METRICS_PROC', 'BATCH_CONTROL_UPDATE_BATCH_ERROR_LOG_PROC',
+                                 'TRIP_RECALCULATION_PROC', 'TRIP_MERGE_CHECK_PROC', 'TRIP_MERGE_PROC',
+                                 'TRIP_FIND_START_DATE_END_DATE_PROC', 'TRIP_IDENTIFIER_PROC',
+                                 'TRIP_SUMMARY_WRAPPER_PROC', 'TRIP_DIGITAL_PLAY_PROC', 'TRIP_INACTIVE_TXNS_ARCHIVAL_PROC',
+                                 'TRIP_RATING_SUMMARY_LOAD_PROC', 'TRIP_HOTEL_SUMMARY_LOAD_PROC', 'TRIP_POS_SUMMARY_LOAD_PROC',
+                                 'TRIP_OFFER_SUMMARY_LOAD_PROC', 'TRIP_COMP_SUMMARY_LOAD_PROC', 'TRIP_MARKERS_SUMMARY_LOAD_PROC',
+                                 'TRIP_FREEPLAY_SUMMARY_LOAD_PROC', 'TRIP_SUMMARY_PROPERTY_LIST_LOAD_PROC',
+                                 'TRIP_RATING_DOMAIN_PIPELINE_PROC')
+        ORDER BY procedure_name, argument_signature, env;
+    collected INTEGER DEFAULT 0;
+BEGIN
+    CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PROC_DDL (
+        env VARCHAR, procedure_name VARCHAR, argument_signature VARCHAR, ddl VARCHAR, problem VARCHAR);
+    FOR r IN c DO
+        LET v_env   VARCHAR := r.env;
+        LET v_name  VARCHAR := r.procedure_name;
+        LET v_sig   VARCHAR := r.argument_signature;
+        LET v_types VARCHAR := r.types_only;
+        LET v_ddl   VARCHAR := NULL;
+        LET v_prob  VARCHAR := NULL;
+        BEGIN
+            LET q VARCHAR := 'SELECT GET_DDL(''PROCEDURE'', ''' || v_env || '.DAAS_COMMON.' || v_name || v_types || ''') AS ddl_text';
+            LET rs RESULTSET := (EXECUTE IMMEDIATE :q);
+            LET cur CURSOR FOR rs;
+            FOR x IN cur DO
+                v_ddl := x.ddl_text;
+            END FOR;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_prob := SQLERRM;
+        END;
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PROC_DDL VALUES (:v_env, :v_name, :v_sig, :v_ddl, :v_prob);
+        collected := collected + 1;
+    END FOR;
+    RETURN collected || ' definitions collected into DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PROC_DDL';
+END;
+$$;
+
+-- E5b. Verdicts. The pass verdict is 'environment names only' (the header names the database). Whitespace and
+--      environment names are normalized away before comparing; a REAL DIFFERENCE row shows 140 characters
+--      around the first differing character on each side.
+WITH d AS (
+    SELECT procedure_name, argument_signature,
+           MAX(IFF(env = 'DAAS_PROD', ddl, NULL))     AS pd,
+           MAX(IFF(env = 'DAAS_UAT',  ddl, NULL))     AS ud,
+           MAX(IFF(env = 'DAAS_PROD', problem, NULL)) AS prod_problem,
+           MAX(IFF(env = 'DAAS_UAT',  problem, NULL)) AS uat_problem
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PROC_DDL
+    GROUP BY 1, 2
+),
+norm AS (
+    SELECT d.*,
+           REGEXP_REPLACE(REPLACE(REPLACE(UPPER(pd), 'DAAS_PROD', 'DAAS_X'), 'PROD', 'X'), '\\s+', ' ') AS pn,
+           REGEXP_REPLACE(REPLACE(REPLACE(UPPER(ud), 'DAAS_UAT',  'DAAS_X'), 'UAT',  'X'), '\\s+', ' ') AS un
+    FROM d
+),
+pos AS (SELECT SEQ4() + 1 AS n FROM TABLE(GENERATOR(ROWCOUNT => 400000))),
+firstdiff AS (
+    SELECT nm.procedure_name, nm.argument_signature, MIN(pos.n) AS first_diff
+    FROM norm nm
+    JOIN pos ON pos.n <= GREATEST(LENGTH(nm.pn), LENGTH(nm.un))
+    WHERE nm.pn IS NOT NULL AND nm.un IS NOT NULL
+      AND COALESCE(SUBSTR(nm.pn, pos.n, 1), '') <> COALESCE(SUBSTR(nm.un, pos.n, 1), '')
+    GROUP BY 1, 2
+)
+SELECT nm.procedure_name, nm.argument_signature,
+       LENGTH(nm.pd) AS prod_chars, LENGTH(nm.ud) AS uat_chars,
+       CASE WHEN nm.pd IS NULL THEN 'PROD definition not readable: ' || COALESCE(nm.prod_problem, 'no PROD row')
+            WHEN nm.ud IS NULL THEN 'MISSING IN UAT: ' || COALESCE(nm.uat_problem, 'no UAT row')
+            WHEN nm.pd = nm.ud THEN 'identical'
+            WHEN REGEXP_REPLACE(nm.pd, '\\s+', ' ') = REGEXP_REPLACE(nm.ud, '\\s+', ' ') THEN 'whitespace only'
+            WHEN nm.pn = nm.un THEN 'environment names only'
+            ELSE 'REAL DIFFERENCE' END AS verdict,
+       f.first_diff,
+       SUBSTR(nm.pn, GREATEST(COALESCE(f.first_diff, 1) - 60, 1), 140) AS prod_around_first_diff,
+       SUBSTR(nm.un, GREATEST(COALESCE(f.first_diff, 1) - 60, 1), 140) AS uat_around_first_diff
+FROM norm nm
+LEFT JOIN firstdiff f ON f.procedure_name = nm.procedure_name AND f.argument_signature = nm.argument_signature
+ORDER BY 1, 2;
+
+-- E5c. The 4-argument wrapper overload (the one every task calls; the file we have holds only the 3-argument one).
+--      Download this cell as text and send it.
+SELECT env, argument_signature, ddl
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PROC_DDL
+WHERE procedure_name = 'BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC'
+ORDER BY LENGTH(argument_signature) DESC, env;
+
+
+-- ===================================================================================================
+-- E6. Alternative in one statement, through ACCOUNT_USAGE (works only if your role sees definitions there;
+--     if the verdict column says 'definition not visible', E5 is the one to use).
+-- ===================================================================================================
+WITH names AS (
+    SELECT column1 AS procedure_name FROM VALUES
+        ('BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC'), ('BATCH_CONTROL_GENERATE_BATCH_ID_PROC'),
+        ('TRIP_RECALCULATION_PROC'), ('TRIP_MERGE_CHECK_PROC'), ('TRIP_MERGE_PROC'),
+        ('TRIP_FIND_START_DATE_END_DATE_PROC'), ('TRIP_IDENTIFIER_PROC'),
+        ('TRIP_SUMMARY_WRAPPER_PROC'), ('TRIP_DIGITAL_PLAY_PROC'), ('TRIP_INACTIVE_TXNS_ARCHIVAL_PROC'),
+        ('TRIP_RATING_SUMMARY_LOAD_PROC'), ('TRIP_HOTEL_SUMMARY_LOAD_PROC'), ('TRIP_POS_SUMMARY_LOAD_PROC'),
+        ('TRIP_OFFER_SUMMARY_LOAD_PROC'), ('TRIP_COMP_SUMMARY_LOAD_PROC'), ('TRIP_MARKERS_SUMMARY_LOAD_PROC'),
+        ('TRIP_FREEPLAY_SUMMARY_LOAD_PROC'), ('TRIP_SUMMARY_PROPERTY_LIST_LOAD_PROC'), ('TRIP_RATING_DOMAIN_PIPELINE_PROC')
+),
+defs AS (
+    SELECT procedure_catalog AS env, procedure_name, argument_signature, procedure_definition AS d
+    FROM SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES
+    WHERE deleted IS NULL
+      AND procedure_schema = 'DAAS_COMMON'
+      AND procedure_catalog IN ('DAAS_PROD', 'DAAS_UAT')
+      AND procedure_name IN (SELECT procedure_name FROM names)
+),
+pairs AS (
+    SELECT p.procedure_name, p.argument_signature, p.d AS pd, u.d AS ud,
+           REGEXP_REPLACE(REPLACE(REPLACE(UPPER(p.d), 'DAAS_PROD', 'DAAS_X'), 'PROD', 'X'), '\\s+', ' ') AS pn,
+           REGEXP_REPLACE(REPLACE(REPLACE(UPPER(u.d), 'DAAS_UAT',  'DAAS_X'), 'UAT',  'X'), '\\s+', ' ') AS un
+    FROM defs p
+    LEFT JOIN defs u ON u.env = 'DAAS_UAT' AND u.procedure_name = p.procedure_name AND u.argument_signature = p.argument_signature
+    WHERE p.env = 'DAAS_PROD'
+),
+pos AS (SELECT SEQ4() + 1 AS n FROM TABLE(GENERATOR(ROWCOUNT => 400000))),
+firstdiff AS (
+    SELECT pr.procedure_name, pr.argument_signature, MIN(pos.n) AS first_diff
+    FROM pairs pr
+    JOIN pos ON pos.n <= GREATEST(LENGTH(pr.pn), LENGTH(pr.un))
+    WHERE pr.un IS NOT NULL
+      AND COALESCE(SUBSTR(pr.pn, pos.n, 1), '') <> COALESCE(SUBSTR(pr.un, pos.n, 1), '')
+    GROUP BY 1, 2
+)
+SELECT pr.procedure_name, pr.argument_signature,
+       LENGTH(pr.pd) AS prod_chars, LENGTH(pr.ud) AS uat_chars,
+       CASE WHEN pr.pd IS NULL THEN 'definition not visible (use E5)'
+            WHEN pr.ud IS NULL THEN 'MISSING IN UAT'
+            WHEN pr.pd = pr.ud THEN 'identical'
+            WHEN REGEXP_REPLACE(pr.pd, '\\s+', ' ') = REGEXP_REPLACE(pr.ud, '\\s+', ' ') THEN 'whitespace only'
+            WHEN pr.pn = pr.un THEN 'environment names only'
+            ELSE 'REAL DIFFERENCE' END AS verdict,
+       f.first_diff,
+       SUBSTR(pr.pn, GREATEST(COALESCE(f.first_diff, 1) - 60, 1), 140) AS prod_around_first_diff,
+       SUBSTR(pr.un, GREATEST(COALESCE(f.first_diff, 1) - 60, 1), 140) AS uat_around_first_diff
+FROM pairs pr
+LEFT JOIN firstdiff f ON f.procedure_name = pr.procedure_name AND f.argument_signature = pr.argument_signature
+ORDER BY 1, 2;
+
+
+-- ===================================================================================================
+-- P. Procedures that exist only in UAT: the market-replay chain and the team's ad hoc repair procs.
+--    Same mechanism as E5; then download the SELECT as TSV and send it (the bodies are long).
+-- ===================================================================================================
+EXECUTE IMMEDIATE $$
+DECLARE
+    c CURSOR FOR
+        SELECT procedure_name, argument_signature,
+               REGEXP_REPLACE(REPLACE(argument_signature, '"', ''), '[A-Za-z0-9_$]+ ([A-Za-z0-9_]+)', '\\1') AS types_only
+        FROM DAAS_UAT.INFORMATION_SCHEMA.PROCEDURES
+        WHERE procedure_schema = 'DAAS_COMMON'
+          AND procedure_name IN ('TRIP_RECALCULATION_ADHOC_PROC', 'TRIP_MARKET_REPLAY_PROC', 'TRIP_MARKET_REPLAY_RANGE_GEN_PROC',
+                                 'TRIP_UPDATE_MARKET_REPLAY_COUNTER_PROC', 'TRIP_UPDATE_MARKET_REPLAY_RANGE_STATUS_PROC',
+                                 'TRIP_TMID_DELETE_PROC', 'TRIP_RESTORE_ADHOC_PROC', 'TRIP_HISTORY_LOAD_PROC',
+                                 'TRIP_DETAIL_DELTA_PROC')
+        ORDER BY procedure_name, argument_signature;
+    collected INTEGER DEFAULT 0;
+BEGIN
+    CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_UAT_ONLY_PROC_DDL (
+        procedure_name VARCHAR, argument_signature VARCHAR, ddl VARCHAR, problem VARCHAR);
+    FOR r IN c DO
+        LET v_name  VARCHAR := r.procedure_name;
+        LET v_sig   VARCHAR := r.argument_signature;
+        LET v_types VARCHAR := r.types_only;
+        LET v_ddl   VARCHAR := NULL;
+        LET v_prob  VARCHAR := NULL;
+        BEGIN
+            LET q VARCHAR := 'SELECT GET_DDL(''PROCEDURE'', ''DAAS_UAT.DAAS_COMMON.' || v_name || v_types || ''') AS ddl_text';
+            LET rs RESULTSET := (EXECUTE IMMEDIATE :q);
+            LET cur CURSOR FOR rs;
+            FOR x IN cur DO
+                v_ddl := x.ddl_text;
+            END FOR;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_prob := SQLERRM;
+        END;
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_UAT_ONLY_PROC_DDL VALUES (:v_name, :v_sig, :v_ddl, :v_prob);
+        collected := collected + 1;
+    END FOR;
+    RETURN collected || ' definitions collected into DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_UAT_ONLY_PROC_DDL';
+END;
+$$;
+
+SELECT procedure_name, argument_signature, LENGTH(ddl) AS chars, problem, ddl
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_UAT_ONLY_PROC_DDL
+ORDER BY 1, 2;
+
+
+-- ===================================================================================================
+-- Q. PROD: what the Aug 18 and Sep 21 recalculation batches were. If they were the IBE/IWA property
+--    trips, the team has already repaired one side of this pair through the queue, two months ago.
+-- ===================================================================================================
+
+-- Q1. Who queued trips for recalculation, by day, since the config change (days with 1,000+ trips).
+SELECT created_dttm::DATE AS queued_on, created_by, batch_id, COUNT(*) AS trips_queued
+FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE
+WHERE created_dttm >= '2026-08-12'
+GROUP BY ALL
+HAVING COUNT(*) >= 1000
+ORDER BY 1, 4 DESC;
+
+-- Q2. The trips those two batches rebuilt, as they looked beforehand: the Aug 12 clone has the pre-replay rows,
+--     the archive has rows the archival step has since removed, TRIP_MASTER has anything still there.
+SELECT p.created_dttm::DATE                                   AS processed_on,
+       COALESCE(b.trip_type, a.trip_type, t.trip_type)         AS trip_type,
+       COALESCE(b.market_cd, a.market_cd, t.market_cd)         AS market_cd,
+       COALESCE(b.property_cd, a.property_cd, t.property_cd)   AS property_cd,
+       COUNT(DISTINCT p.trip_master_id)                        AS trips,
+       COUNT_IF(b.trip_master_id IS NULL AND a.trip_master_id IS NULL AND t.trip_master_id IS NULL) AS trips_not_found_anywhere,
+       COUNT_IF(DATEDIFF(day, COALESCE(b.trip_start_dt, a.trip_start_dt, t.trip_start_dt),
+                              COALESCE(b.trip_end_dt,   a.trip_end_dt,   t.trip_end_dt)) + 1 > 3)   AS longer_than_3_days,
+       MAX(DATEDIFF(day, COALESCE(b.trip_start_dt, a.trip_start_dt, t.trip_start_dt),
+                         COALESCE(b.trip_end_dt,   a.trip_end_dt,   t.trip_end_dt)) + 1)            AS longest_days,
+       MIN(COALESCE(b.trip_start_dt, a.trip_start_dt, t.trip_start_dt))                               AS earliest_trip_start,
+       MAX(COALESCE(b.trip_end_dt,   a.trip_end_dt,   t.trip_end_dt))                                 AS latest_trip_end
+FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_PROCESSED p
+LEFT JOIN DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3376_20260812 b ON b.trip_master_id = p.trip_master_id
+LEFT JOIN DAAS_PROD.DAAS_TEMP.TRIP_MASTER_ARCHIVE                a ON a.trip_master_id = p.trip_master_id
+LEFT JOIN DAAS_PROD.DAAS_CORE.TRIP_MASTER                        t ON t.trip_master_id = p.trip_master_id
+WHERE p.created_dttm::DATE IN ('2026-08-18', '2026-09-21')
+GROUP BY ALL
+ORDER BY 1, 5 DESC;
