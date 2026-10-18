@@ -16,6 +16,9 @@
 -- pipeline role (by its schedule, or one EXECUTE TASK), which is also how PROD will run; route B is the hand-run
 -- block, whose preflight now also refuses to run beside a chain run or with secondary roles on, and names the
 -- role it ran as. B4 confirms the run from the pipeline's own records. C8 restores ownership from B2's record.
+-- Then, from B2's results (UAT's chain root is suspended; UAT has an on-demand task per step; no role you hold can
+-- recreate the work tables): route A2 in B3a, one block that starts those on-demand tasks in chain order and waits
+-- for each, is now the recommended run. B2a reads the task list's predecessors column as the array it is.
 -- Parts A and B1 are unchanged and need not be run again.
 --
 -- One thing to expect, from the code: the comp-worth step (TRIP_COMP_WORTH_LOAD_PROC) values a market trip from
@@ -391,7 +394,7 @@ SELECT (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM WHERE M
 --      chain (root TRIP_ROOT_TASK) and the 2024 market-replay copy (root TRIP_ROOT_TASK_MARKET_REPLAY).
 SHOW TASKS IN SCHEMA DAAS_UAT.DAAS_COMMON;
 SELECT "name", "state", "schedule",
-       ARRAY_TO_STRING(TRY_PARSE_JSON("predecessors")::ARRAY, ', ')                           AS runs_after,
+       ARRAY_TO_STRING("predecessors", ', ')                                                  AS runs_after,
        IFF(COALESCE("condition", '') = '', NULL,
            CONTAINS(UPPER("condition"), 'TRIP_RECALC_QUEUE_STREAM'))                           AS wakes_on_recalc_queue,
        "owner", "warehouse", "last_suspended_on"
@@ -448,33 +451,370 @@ SELECT object_kind, object_name, owner_before, recreated_on_before
 FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_OWNERS
 ORDER BY recreated_on_before DESC;
 
--- B3. The run. Pick the route B2 points to.
+-- B3. The run. What B2 found on 2026-10-18: UAT's TRIP_ROOT_TASK is suspended (last suspended Aug 5) while every step
+--     under it is 'started'; UAT also has one standalone on-demand task per step we need, owned by APP_SERVICE_UAT;
+--     and no role you hold can recreate the DAAS_TEMP work tables. So:
 --
---   ROUTE A, preferred, and the way PROD will run: UAT's own chain runs the steps.
---     TRIP_ROOT_TASK 'started' in B2a (with wakes_on_recalc_queue TRUE): nothing to run. Its next scheduled run finds
---       our rows in the recalc queue stream and runs every step after them as APP_SERVICE_UAT. Go to B4 after that
---       run, and repeat B4 until every step there shows a finished status.
---     TRIP_ROOT_TASK 'suspended': one run of the chain, started by anyone with OPERATE on the root task (DevOps, or
---       you if they grant it). It runs once as the task owner and leaves the task suspended. Step tasks that are
---       suspended are skipped, so check B2a first: the recalculation, merge-check, merge, customer-merge-check,
---       summary, comp-worth and non-gaming-revenue tasks under TRIP_ROOT_TASK should all show 'started'.
+--   ROUTE A2, recommended: start those on-demand tasks in chain order (B3a, one block). Each step runs as the
+--     pipeline role, exactly as its chain task would, and nothing else in UAT runs with it. Starting a task needs
+--     only OPERATE on it through a role in your session; the procedures run with the task owner's rights.
+--
+--   ROUTE A: one run of the whole chain, by anyone with OPERATE on the root (it runs once as the task owner and
+--     leaves the root suspended):
 --         EXECUTE TASK DAAS_UAT.DAAS_COMMON.TRIP_ROOT_TASK;
---     Either way the chain also runs its other steps (ratings, hotel, POS, offers, comps, markers, freeplay) on
---     whatever UAT has waiting for them, and its customer-merge step if the check queues a guest merge. That is the
---     chain doing its normal job; scoreboard rows 19 and 20 report anything it changed for our guests beyond the
---     queued trips.
+--     It would also push whatever UAT's feeds have loaded since Aug 5 through the ratings, hotel, POS, offer, comp,
+--     marker and freeplay steps, and run the customer merge if the check queues one. Use it only if A2 is not open.
 --
---   ROUTE B: the block below, run by hand, which returns a verdict per step. Only while no chain run is under way
---     (the block checks), and as a role that holds DOMAIN_TEMP_ADMIN_UAT and STREAM_OWNERS_UAT and can use the job
---     warehouse (B2c; APP_SERVICE_UAT does). In Workspaces set that role, the warehouse DAAS_UAT_IT_WHSRCTORAW_COMPUTE
---     and DAAS_UAT / DAAS_COMMON in this file's context picker (top right): the first attempt ran as DAAS_TEAM even
---     after a USE ROLE line. Then run the four USE lines below one at a time, then B3a, then the block.
+--   ROUTE B: the hand-run block further down, under a role holding DOMAIN_TEMP_ADMIN_UAT and STREAM_OWNERS_UAT
+--     (APP_SERVICE_UAT). B2c shows you hold only STREAM_OWNERS_UAT, so it is not open to you.
+
+-- B3a. ROUTE A2: the on-demand step tasks, in chain order, from one block. Preflight: no trip job in progress, only
+--      our rows in the recalc queue, the other streams empty, one suspended on-demand task per step whose
+--      definition calls what the chain task calls, and a role in this session that may start each one. Then, step
+--      by step: EXECUTE TASK, wait for that step's batch to finish in the pipeline's batch log (BATCH_S02), check
+--      what it did, go on. It stops at the first problem. If it stops in the preflight nothing has run. If it stops
+--      after a step ran, fix the cause and run the block again with v_start_at set to the step to resume from (the
+--      S rows number the steps). It waits on each step, so it can run for a while; B4b shows progress meanwhile. If
+--      the block itself is cancelled or times out, the step in flight still finishes on its own: check B4b, then
+--      resume with v_start_at set to the next step.
+--      Secondary roles on first, so OPERATE can come from whichever of your roles holds it.
+USE SECONDARY ROLES ALL;
+
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_start_at INTEGER DEFAULT 1;      -- 1 for a fresh run; to resume after a stop, the number of the step to start from
+    v_max_wait INTEGER DEFAULT 5400;   -- longest wait for one step, in seconds (90 minutes)
+    v_log      VARCHAR DEFAULT '';
+    v_txt      VARCHAR;
+    v_out      VARCHAR;
+    v_job      VARCHAR;
+    v_task     VARCHAR;
+    v_cmd      VARCHAR;
+    v_wait     VARCHAR;
+    v_who      VARCHAR DEFAULT '';
+    v_checked  INTEGER DEFAULT 0;
+    v_blocked  INTEGER DEFAULT 0;
+    v_status   VARCHAR;
+    v_has      BOOLEAN;
+    v_ng_clean BOOLEAN DEFAULT TRUE;
+    v_grants   BOOLEAN DEFAULT TRUE;
+    v_queued   INTEGER;
+    v_other    INTEGER;
+    v_n        INTEGER;
+    v_m        INTEGER;
+    v_step     INTEGER;
+    v_waited   INTEGER;
+    v_mark     NUMBER(38,0);
+    res        RESULTSET;
+    pilot_stop EXCEPTION (-20641, 'DAASI-3641 pilot stopped, see the step rows');
+BEGIN
+    ---------------------------------------------------------------- preflight: nothing here starts anything
+    -- P0. No chain or on-demand run under way.
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+            JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+            WHERE j.job_name LIKE 'TRIP%' AND b.batch_status = 'IN PROGRESS'
+              AND b.batch_start_date >= DATEADD(hour, -6, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ));
+    IF (v_n > 0) THEN
+        v_log := v_log || 'P0 runs~|~STOP~|~' || v_n || ' trip job(s) show IN PROGRESS in the last 6 hours (B2b lists the jobs): '
+                       || 'let them finish, then run this block again#ROW#';
+        RAISE pilot_stop;
+    END IF;
+    v_log := v_log || 'P0 runs~|~ok~|~no trip job in progress#ROW#';
+
+    -- P1. The session, for the record: the steps themselves run as the task owner.
+    v_txt := (SELECT COALESCE(TRY_PARSE_JSON(CURRENT_SECONDARY_ROLES()):roles::VARCHAR, ''));
+    v_log := v_log || 'P1 session~|~ok~|~role ' || CURRENT_ROLE()
+                   || IFF(v_txt = '', ', no secondary roles', ', secondary roles ' || v_txt)
+                   || ', warehouse ' || COALESCE(CURRENT_WAREHOUSE(), '(none)') || '#ROW#';
+
+    IF (v_start_at = 1) THEN
+        -- P2. Only our rows wait in the recalc queue.
+        v_queued := (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM
+                     WHERE METADATA$ACTION = 'INSERT' AND batch_id = -3641);
+        v_other  := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM
+                     WHERE METADATA$ACTION = 'INSERT' AND batch_id IS DISTINCT FROM -3641);
+        IF (v_queued = 0) THEN
+            v_log := v_log || 'P2 recalc queue~|~STOP~|~no pilot rows are waiting: run B4a to see whether the pilot already ran#ROW#';
+            RAISE pilot_stop;
+        END IF;
+        IF (v_other > 0) THEN
+            v_log := v_log || 'P2 recalc queue~|~STOP~|~' || v_other || ' other queue rows are waiting and would be rebuilt with ours#ROW#';
+            RAISE pilot_stop;
+        END IF;
+        v_log := v_log || 'P2 recalc queue~|~ok~|~' || v_queued || ' pilot trips waiting, nothing else#ROW#';
+
+        -- P3. The other streams hold nothing that would be processed with ours.
+        v_txt := '';
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' merge-check'; END IF;
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' merge-queue'; END IF;
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' customer-merge-check'; END IF;
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_CUSTOMER_MERGE_QUEUE_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' customer-merge-queue'; END IF;
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' detail-summary'; END IF;
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' daily-summary'; END IF;
+        IF (v_txt <> '') THEN
+            v_log := v_log || 'P3 other streams~|~STOP~|~these already hold changes that would be processed with ours:' || v_txt || '#ROW#';
+            RAISE pilot_stop;
+        END IF;
+        BEGIN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_NG_VW_STREAM'));
+            v_ng_clean := NOT v_has;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_ng_clean := FALSE;
+        END;
+        v_log := v_log || 'P3 other streams~|~ok~|~merge, customer-merge and summary streams empty; non-gaming stream '
+                       || IFF(v_ng_clean, 'empty', 'not empty or unreadable, that step will be skipped') || '#ROW#';
+    ELSE
+        v_log := v_log || 'P2 recalc queue~|~skipped~|~resuming at step ' || v_start_at || '#ROW#';
+    END IF;
+
+    -- P4. One suspended, standalone on-demand task per step, calling what the chain task calls (same job, same stream).
+    SHOW TASKS IN SCHEMA DAAS_UAT.DAAS_COMMON;
+    CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TASKS AS
+    WITH steps AS (
+        SELECT column1 AS step_no, column2 AS job_name, column3 AS stream_name
+        FROM VALUES (1, 'TRIP_RECALCULATION',                    'DAAS_CORE.TRIP_RECALC_QUEUE_STREAM'),
+                    (2, 'TRIP_MERGE_CHECK',                      'DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'),
+                    (3, 'TRIP_MERGE',                            'DAAS_CORE.TRIP_MERGE_QUEUE_STREAM'),
+                    (4, 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER', 'DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM'),
+                    (5, 'TRIP_SUMMARY_WRAPPER',                  'DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'),
+                    (6, 'TRIP_COMP_WORTH',                       NULL),
+                    (7, 'TRIP_NG_REVENUE_SUMMARY',               NULL)),
+    tasks AS (
+        SELECT "name"::VARCHAR AS task_name, "state"::VARCHAR AS task_state, "definition"::VARCHAR AS task_definition,
+               COALESCE(ARRAY_SIZE("predecessors"), 0) AS predecessor_count
+        FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+        WHERE "name" ILIKE '%ONDEMAND%')
+    SELECT s.step_no, s.job_name, s.stream_name, t.task_name, t.task_state, t.task_definition, t.predecessor_count,
+           COUNT(t.task_name) OVER (PARTITION BY s.step_no) AS candidates,
+           (s.stream_name IS NULL
+            OR REPLACE(UPPER(t.task_definition), ' ', '') ILIKE ('%' || s.stream_name || '''%')) AS definition_ok
+    FROM steps s
+    LEFT JOIN tasks t ON t.task_definition ILIKE ('%''' || s.job_name || '''%')
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY s.step_no ORDER BY t.task_name) = 1;
+
+    v_txt := (SELECT COALESCE(LISTAGG('step ' || step_no || ' ' || job_name || ': '
+                                      || CASE WHEN task_name IS NULL THEN 'no on-demand task calls this job'
+                                              WHEN candidates > 1 THEN candidates || ' on-demand tasks call this job'
+                                              WHEN predecessor_count > 0 THEN task_name || ' runs after another task'
+                                              WHEN NOT definition_ok THEN task_name || ' calls something else: ' || task_definition
+                                              ELSE task_name || ' is ' || task_state || ', so it runs on its own schedule'
+                                         END, '; ') WITHIN GROUP (ORDER BY step_no), '')
+              FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TASKS
+              WHERE step_no >= :v_start_at
+                AND (task_name IS NULL OR candidates > 1 OR predecessor_count > 0 OR NOT definition_ok
+                     OR task_state <> 'suspended'));
+    IF (v_txt <> '') THEN
+        v_log := v_log || 'P4 tasks~|~STOP~|~' || REPLACE(REPLACE(v_txt, '#ROW#', ''), '~|~', '') || '#ROW#';
+        RAISE pilot_stop;
+    END IF;
+    v_txt := (SELECT LISTAGG(step_no || ' ' || task_name, ', ') WITHIN GROUP (ORDER BY step_no)
+              FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TASKS WHERE step_no >= :v_start_at);
+    v_log := v_log || 'P4 tasks~|~ok~|~' || v_txt || '#ROW#';
+
+    -- P5. Which tasks a role active in this session may start (OPERATE, or ownership). Some but not all: stop, since
+    --     starting only some would leave the run half done. None: the first EXECUTE TASK settles it, and fails before
+    --     anything runs if this session really may not start them.
+    v_txt     := '';
+    v_who     := '';
+    v_checked := 0;
+    v_blocked := 0;
+    LET rs_perm RESULTSET := (SELECT step_no, task_name FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TASKS
+                              WHERE step_no >= :v_start_at ORDER BY step_no);
+    LET c_perm CURSOR FOR rs_perm;
+    FOR r IN c_perm DO
+        v_task := r.task_name;
+        BEGIN
+            v_cmd := 'SHOW GRANTS ON TASK DAAS_UAT.DAAS_COMMON.' || v_task;
+            EXECUTE IMMEDIATE v_cmd;
+            SELECT COALESCE(LISTAGG(DISTINCT "grantee_name", ', '), '(no role)'), COUNT_IF(IS_ROLE_IN_SESSION("grantee_name"))
+              INTO :v_out, :v_n
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+             WHERE "privilege" IN ('OPERATE', 'OWNERSHIP') AND "granted_to" = 'ROLE';
+            v_checked := v_checked + 1;
+            IF (v_n = 0) THEN
+                v_blocked := v_blocked + 1;
+                v_txt := v_txt || ' ' || v_task;
+                IF (v_who = '') THEN
+                    v_who := v_out;
+                END IF;
+            END IF;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_grants := FALSE;
+        END;
+    END FOR;
+    IF (v_blocked > 0 AND v_blocked < v_checked) THEN
+        v_log := v_log || 'P5 permission~|~STOP~|~this session may start some of the tasks but not:' || v_txt
+                       || ' (may be started by: ' || v_who || '). Get OPERATE on those first (DevOps), then run this again#ROW#';
+        RAISE pilot_stop;
+    END IF;
+    IF (v_blocked > 0) THEN
+        v_log := v_log || 'P5 permission~|~note~|~no role active in this session shows OPERATE on the tasks (they may be started by: '
+                       || v_who || '); the first EXECUTE TASK settles it#ROW#';
+    ELSE
+        v_log := v_log || 'P5 permission~|~' || IFF(v_grants, 'ok~|~this session may start every task',
+                                                    'note~|~grants are not visible to this session; the first EXECUTE TASK settles it') || '#ROW#';
+    END IF;
+
+    ---------------------------------------------------------------- the steps, each started as the task owner
+    v_queued := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_QUEUE);
+    LET rs_plan RESULTSET := (SELECT step_no, job_name, task_name FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TASKS
+                              WHERE step_no >= :v_start_at ORDER BY step_no);
+    LET c_plan CURSOR FOR rs_plan;
+    FOR r IN c_plan DO
+        v_step := r.step_no;
+        v_job  := r.job_name;
+        v_task := r.task_name;
+
+        -- Does the step have work? A stream-checked job logs no batch when its stream is empty.
+        v_has := TRUE;
+        IF (v_job = 'TRIP_RECALCULATION') THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM'));
+        ELSEIF (v_job = 'TRIP_MERGE_CHECK') THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'));
+        ELSEIF (v_job = 'TRIP_MERGE') THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM'));
+        ELSEIF (v_job = 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER') THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM'));
+        ELSEIF (v_job = 'TRIP_SUMMARY_WRAPPER') THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'));
+        ELSEIF (v_job = 'TRIP_NG_REVENUE_SUMMARY') THEN
+            v_has := v_ng_clean;
+        END IF;
+        IF (NOT v_has) THEN
+            IF (v_job = 'TRIP_RECALCULATION') THEN
+                v_log := v_log || 'S1 TRIP_RECALCULATION~|~STOP~|~the recalc queue stream is empty: nothing to rebuild#ROW#';
+                RAISE pilot_stop;
+            END IF;
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~skipped~|~'
+                           || IFF(v_job = 'TRIP_NG_REVENUE_SUMMARY', 'its stream held other changes or could not be read at preflight',
+                                  IFF(v_job = 'TRIP_MERGE', 'nothing was queued for merging', 'its stream is empty, so the job has no work'))
+                           || '#ROW#';
+            CONTINUE;
+        END IF;
+
+        -- Start it.
+        v_mark := (SELECT COALESCE(MAX(batch_id), 0) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02);
+        BEGIN
+            v_cmd := 'EXECUTE TASK DAAS_UAT.DAAS_COMMON.' || v_task;
+            EXECUTE IMMEDIATE v_cmd;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~could not start ' || v_task || ': '
+                               || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '')
+                               || IFF(v_who <> '', '. Roles that may start it: ' || v_who || ' (the ask for DevOps: run this block, or grant OPERATE on the on-demand tasks)', '')
+                               || '#ROW#';
+                RAISE pilot_stop;
+        END;
+
+        -- Wait for its batch in the pipeline's log to finish.
+        v_waited := 0;
+        v_status := NULL;
+        WHILE (v_waited < v_max_wait) DO
+            v_wait := (SELECT SYSTEM$WAIT(15));
+            v_waited := v_waited + 15;
+            v_status := (SELECT MAX_BY(b.batch_status, b.batch_id) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+                         JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+                         WHERE j.job_name = :v_job AND b.batch_id > :v_mark);
+            IF (v_status IS NOT NULL AND v_status <> 'IN PROGRESS') THEN
+                BREAK;
+            END IF;
+            IF (v_status IS NULL AND v_waited >= 900) THEN
+                BREAK;
+            END IF;
+        END WHILE;
+        IF (v_status IS NULL) THEN
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~' || v_task || ' was started but logged no run within 15 minutes; '
+                           || 'its TASK_HISTORY says why (a WHEN condition may have skipped it). Then rerun with v_start_at = ' || v_step || '#ROW#';
+            RAISE pilot_stop;
+        END IF;
+        IF (v_status = 'IN PROGRESS') THEN
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~still running after ' || (v_max_wait / 60)::INTEGER
+                           || ' minutes. Let it finish (B4b shows it), then rerun with v_start_at = ' || (v_step + 1) || '#ROW#';
+            RAISE pilot_stop;
+        END IF;
+
+        -- Check what it did.
+        IF (v_job = 'TRIP_RECALCULATION') THEN
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+                    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_QUEUE q ON q.trip_master_id = m.trip_master_id
+                    WHERE m.delete_ind = 'N');
+            v_m := (SELECT COUNT(DISTINCT p.trip_master_id) FROM DAAS_UAT.DAAS_CORE.TRIP_RECALC_PROCESSED p
+                    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_QUEUE q ON q.trip_master_id = p.trip_master_id);
+            IF (NOT STARTSWITH(v_status, 'SUCCESS') OR v_n > 0 OR v_m < v_queued) THEN
+                v_log := v_log || 'S1 TRIP_RECALCULATION~|~STOP~|~' || LEFT(v_status, 500) || '; ' || v_m || ' of ' || v_queued
+                               || ' logged as processed; ' || v_n || ' still live#ROW#';
+                RAISE pilot_stop;
+            END IF;
+            v_log := v_log || 'S1 TRIP_RECALCULATION~|~ok~|~' || v_m || ' trips retired and re-cut, logged in TRIP_RECALC_PROCESSED#ROW#';
+        ELSEIF (v_job = 'TRIP_MERGE_CHECK') THEN
+            IF (NOT STARTSWITH(v_status, 'SUCCESS')) THEN
+                v_log := v_log || 'S2 TRIP_MERGE_CHECK~|~STOP~|~' || LEFT(v_status, 500) || '#ROW#';
+                RAISE pilot_stop;
+            END IF;
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM WHERE METADATA$ACTION = 'INSERT');
+            v_log := v_log || 'S2 TRIP_MERGE_CHECK~|~ok~|~' || LEFT(v_status, 200) || '; ' || v_n || ' trip ids queued for merging#ROW#';
+        ELSEIF (v_job = 'TRIP_MERGE') THEN
+            IF (NOT (STARTSWITH(v_status, 'SUCCESS') OR STARTSWITH(v_status, 'Alert'))) THEN
+                v_log := v_log || 'S3 TRIP_MERGE~|~STOP~|~' || LEFT(v_status, 500) || '#ROW#';
+                RAISE pilot_stop;
+            END IF;
+            v_log := v_log || 'S3 TRIP_MERGE~|~ok~|~' || LEFT(v_status, 200) || '#ROW#';
+        ELSEIF (v_job = 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER') THEN
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_CUSTOMER_MERGE_QUEUE_STREAM WHERE METADATA$ACTION = 'INSERT');
+            v_log := v_log || 'S4 TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER~|~' || IFF(STARTSWITH(v_status, 'SUCCESS') AND v_n = 0, 'ok', 'note')
+                           || '~|~' || LEFT(v_status, 200)
+                           || IFF(v_n = 0, '; no guest merges queued',
+                                  '; ' || v_n || ' guest-merge rows queued and left for the chain (a guest merge rebuilds every trip of both guests)')
+                           || '#ROW#';
+        ELSEIF (v_job = 'TRIP_SUMMARY_WRAPPER') THEN
+            IF (NOT STARTSWITH(v_status, 'SUCCESS')) THEN
+                v_log := v_log || 'S5 TRIP_SUMMARY_WRAPPER~|~STOP~|~' || LEFT(v_status, 500)
+                               || '. TRIP_MASTER and TRIP_DETAIL are rebuilt and checkable; the summary rows are not#ROW#';
+                RAISE pilot_stop;
+            END IF;
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'));
+            v_log := v_log || 'S5 TRIP_SUMMARY_WRAPPER~|~ok~|~' || LEFT(v_status, 200)
+                           || IFF(v_has, '; detail-summary stream still holds rows', '; summary stream consumed') || '#ROW#';
+        ELSE
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~' || IFF(STARTSWITH(v_status, 'SUCCESS'), 'ok', 'note')
+                           || '~|~' || LEFT(v_status, 300) || '#ROW#';
+        END IF;
+    END FOR;
+
+    v_log := v_log || 'END~|~done~|~next: B4, then PART C, then C8#ROW#';
+    res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+            FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+    RETURN TABLE(res);
+EXCEPTION
+    WHEN pilot_stop THEN
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+    WHEN OTHER THEN
+        v_log := v_log || 'error~|~STOP~|~' || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '') || '#ROW#';
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+END;
+$$;
+
+-- ROUTE B only (not open to you, see B3): the session lines, the check, then the hand-run block. Set the role,
+-- warehouse DAAS_UAT_IT_WHSRCTORAW_COMPUTE and DAAS_UAT / DAAS_COMMON in this file's context picker first (the first
+-- attempt ran as DAAS_TEAM even after a USE ROLE line), then run the four USE lines one at a time, then B3b.
 USE SECONDARY ROLES NONE;
 USE DATABASE DAAS_UAT;
 USE SCHEMA DAAS_COMMON;
 USE WAREHOUSE DAAS_UAT_IT_WHSRCTORAW_COMPUTE;
 
--- B3a. (route B) Who the block will run as. Expect the role you picked, empty roles in secondary_roles, the job
+-- B3b. (route B) Who the block will run as. Expect the role you picked, empty roles in secondary_roles, the job
 --      warehouse, and TRUE in the last two columns. Anything else: fix the context picker before running the block
 --      (the block repeats these checks and stops if they fail).
 SELECT CURRENT_ROLE()                              AS runs_as,
@@ -528,7 +868,7 @@ BEGIN
     v_txt := (SELECT COALESCE(TRY_PARSE_JSON(CURRENT_SECONDARY_ROLES()):roles::VARCHAR, ''));
     IF (v_txt <> '') THEN
         v_log := v_log || 'P1 session~|~STOP~|~running as ' || CURRENT_ROLE() || ' with secondary roles on (' || v_txt
-                       || '): run USE SECONDARY ROLES NONE on its own, check B3a, then run this block again#ROW#';
+                       || '): run USE SECONDARY ROLES NONE on its own, check B3b, then run this block again#ROW#';
         RAISE pilot_stop;
     END IF;
     v_log := v_log || 'P1 session~|~ok~|~database DAAS_UAT, role ' || CURRENT_ROLE() || ', warehouse ' || COALESCE(CURRENT_WAREHOUSE(), '(none)') || ', no secondary roles#ROW#';
@@ -606,7 +946,7 @@ BEGIN
     IF (v_n < 7 OR v_txt <> '') THEN
         v_log := v_log || 'P4 work tables~|~STOP~|~role ' || CURRENT_ROLE() || ' sees ' || v_n || ' of the 7 work tables the steps refill'
                        || IFF(v_txt <> '', ' and cannot recreate objects owned by: ' || v_txt, '')
-                       || '. Use route A (B3), or run the block as a role that holds those (B2c)#ROW#';
+                       || '. Use route A2 (B3a), or run the block as a role that holds those (B2c)#ROW#';
         RAISE pilot_stop;
     END IF;
     v_txt := (SELECT COALESCE(LISTAGG(DISTINCT table_owner, ', '), '')
