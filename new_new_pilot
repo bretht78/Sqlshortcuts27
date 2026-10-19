@@ -2,383 +2,241 @@ USE ROLE DAAS_TEAM;
 USE SECONDARY ROLES ALL;
 
 
--- F1. Live trips of the pilot guests with no TRIP_SUMMARY row, market side and property side.
---     Expect built_by_the_pilot 0 and had_a_row_before_the_pilot 0: gaps that were there before we started.
---     Property side: twin_is_a_rebuilt_trip should be 112, and days_with_activity_twin_rebuilt close to C6's 148
---     (C6 counted days where the rebuilt trip has a daily row and its twin has none). The with_... columns say
---     what the gap trips hold; first_built and last_built say when they were made.
-WITH mark AS (
-    SELECT value AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_MARKS WHERE mark = 'max_trip_master_id_before'
+-- G1. Every distinct free-play, offer and (as a control) rating transaction on the pilot guests' live trips in UAT,
+--     by the year it happened, and how many of them the summary's lookup finds in UAT today. found_where_the_summary
+--     _looks means COMP_FREE_PLAY_DETAIL_FACT for free play, the view OFFER_LEDGER_FACT_TRIP_VW for offers and
+--     RATINGS_FACT for ratings; offers_in_base_table is the table under that view (OFFER_LEDGER_FACT): found there
+--     but not in the view means the view filters it out. Expect ratings at 100% (they matched in Part C).
+WITH td AS (
+    SELECT DISTINCT d.transaction_type, d.transaction_table_sk AS sk, YEAR(d.business_start_dt) AS yr
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TD_AFTER d
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER t ON t.trip_master_id = d.trip_master_id
+    WHERE t.delete_ind = 'N' AND d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+      AND d.transaction_type IN ('FREEPLAY', 'OFFER', 'RATINGS')
 ),
-live AS (
-    SELECT trip_master_id, trip_type, guest_unique_id, trip_start_dt, trip_end_dt, created_dttm,
-           IFF(trip_type = 'MARKET', market_cd, DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM')) AS mkt
-    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER
-    WHERE delete_ind = 'N'
-),
-ts_after  AS (SELECT DISTINCT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_AFTER),
-ts_before AS (SELECT DISTINCT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_BEFORE),
-daily AS (
-    SELECT trip_master_id, COUNT(DISTINCT guest_activity_date) AS daily_rows
-    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_DAS_AFTER
-    WHERE delete_ind = 'N'
-    GROUP BY 1
-),
-tx AS (
-    SELECT trip_master_id,
-           COUNT(DISTINCT business_start_dt)                             AS activity_days,
-           COUNT_IF(transaction_table = 'RATINGS_FACT')                  AS ratings,
-           COUNT_IF(transaction_table = 'HOTEL_GUEST_RESERVATIONS_FACT') AS hotel,
-           COUNT_IF(transaction_table = 'CHECK_SALES_FACT')              AS pos,
-           COUNT_IF(transaction_table = 'OFFER_LEDGER_FACT')             AS offers,
-           COUNT_IF(transaction_table = 'COMP_DETAIL_FACT')              AS comps,
-           COUNT_IF(transaction_table = 'COMP_FREE_PLAY_DETAIL_FACT')    AS freeplay
-    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TD_AFTER
-    WHERE delete_ind = 'N' AND transaction_sub_type = 'OPENED'
-    GROUP BY 1
-),
-twin AS (   -- each live trip's identical trip on the other side (same guest, market, start and end)
-    SELECT a.trip_master_id, MIN(b.trip_master_id) AS twin_id
-    FROM live a
-    JOIN live b
-      ON b.guest_unique_id = a.guest_unique_id AND b.mkt = a.mkt AND b.trip_type <> a.trip_type
-     AND b.trip_start_dt = a.trip_start_dt AND b.trip_end_dt = a.trip_end_dt
-    GROUP BY 1
-),
-gap AS (
-    SELECT l.trip_type, l.created_dttm, l.trip_start_dt,
-           l.trip_master_id > m.max_tm   AS built_by_pilot,
-           tb.trip_master_id IS NOT NULL AS had_row_before,
-           tw.twin_id > m.max_tm         AS twin_rebuilt,
-           tt.trip_master_id IS NOT NULL AS twin_has_row,
-           COALESCE(d.daily_rows, 0)     AS daily_rows,
-           COALESCE(x.activity_days, 0)  AS activity_days,
-           COALESCE(x.ratings, 0)  AS ratings,  COALESCE(x.hotel, 0) AS hotel, COALESCE(x.pos, 0)      AS pos,
-           COALESCE(x.offers, 0)   AS offers,   COALESCE(x.comps, 0) AS comps, COALESCE(x.freeplay, 0) AS freeplay
-    FROM live l
-    CROSS JOIN mark m
-    LEFT JOIN ts_after  ta ON ta.trip_master_id = l.trip_master_id
-    LEFT JOIN ts_before tb ON tb.trip_master_id = l.trip_master_id
-    LEFT JOIN twin      tw ON tw.trip_master_id = l.trip_master_id
-    LEFT JOIN ts_after  tt ON tt.trip_master_id = tw.twin_id
-    LEFT JOIN daily     d  ON d.trip_master_id  = l.trip_master_id
-    LEFT JOIN tx        x  ON x.trip_master_id  = l.trip_master_id
-    WHERE ta.trip_master_id IS NULL
-)
-SELECT trip_type                                AS side,
-       COUNT(*)                                 AS live_trips_with_no_summary_row,
-       COUNT_IF(built_by_pilot)                 AS built_by_the_pilot,
-       COUNT_IF(had_row_before)                 AS had_a_row_before_the_pilot,
-       COUNT_IF(twin_rebuilt)                   AS twin_is_a_rebuilt_trip,
-       COUNT_IF(twin_has_row)                   AS twin_has_a_summary_row,
-       COUNT_IF(daily_rows > 0)                 AS have_daily_rows,
-       SUM(IFF(twin_rebuilt, activity_days, 0)) AS days_with_activity_twin_rebuilt,
-       COUNT_IF(activity_days = 0)              AS no_live_transactions,
-       COUNT_IF(ratings > 0)                    AS with_ratings,
-       COUNT_IF(hotel > 0)                      AS with_hotel,
-       COUNT_IF(offers > 0)                     AS with_offers,
-       COUNT_IF(comps > 0)                      AS with_comps,
-       COUNT_IF(freeplay > 0)                   AS with_freeplay,
-       COUNT_IF(pos > 0)                        AS with_pos,
-       MIN(created_dttm)                        AS first_built,
-       MAX(created_dttm)                        AS last_built,
-       MIN(trip_start_dt)                       AS first_trip_start,
-       MAX(trip_start_dt)                       AS last_trip_start
-FROM gap
-GROUP BY 1
-ORDER BY 1;
-
--- F1b. The same trips by the month they were built, next to every live trip of the pilot guests built that month.
---      A gap bunched into a few months points to summary work lost in those months. Background: UAT's summary step
---      has stopped in its POS sub-step since 30 July. A stopped run keeps its waiting rows and retries, so rows only
---      go missing if the waiting rows are thrown away (a recreated stream, for instance): between the 9 Oct and
---      15 Oct runs that happened at least once (the 15 Oct run found nothing waiting).
-WITH live AS (
-    SELECT trip_master_id, trip_type, created_dttm, created_by
-    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER
-    WHERE delete_ind = 'N'
-),
-ts_after AS (SELECT DISTINCT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_AFTER)
-SELECT TO_CHAR(l.created_dttm, 'YYYY-MM')                                  AS built_in,
-       l.trip_type                                                         AS side,
-       COUNT(*)                                                            AS live_trips_built,
-       COUNT_IF(ta.trip_master_id IS NULL)                                 AS of_them_with_no_summary_row,
-       LISTAGG(DISTINCT IFF(ta.trip_master_id IS NULL, l.created_by, NULL), ', ') AS gap_trips_built_by
-FROM live l
-LEFT JOIN ts_after ta ON ta.trip_master_id = l.trip_master_id
+fp AS (SELECT DISTINCT comp_free_play_detail_fact_sk AS sk FROM DAAS_UAT.DAAS_CORE.COMP_FREE_PLAY_DETAIL_FACT
+       WHERE comp_free_play_detail_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'FREEPLAY')),
+ov AS (SELECT DISTINCT offer_ledger_fact_sk AS sk FROM DAAS_UAT.DAAS_CORE_MARKETING_VW.OFFER_LEDGER_FACT_TRIP_VW
+       WHERE offer_ledger_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'OFFER')),
+ob AS (SELECT DISTINCT offer_ledger_fact_sk AS sk FROM DAAS_UAT.DAAS_CORE.OFFER_LEDGER_FACT
+       WHERE offer_ledger_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'OFFER')),
+rf AS (SELECT DISTINCT ratings_fact_sk AS sk FROM DAAS_UAT.DAAS_CORE.RATINGS_FACT
+       WHERE ratings_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'RATINGS'))
+SELECT t.transaction_type,
+       t.yr                                                 AS activity_year,
+       COUNT(*)                                             AS transactions,
+       COUNT_IF(COALESCE(fp.sk, ov.sk, rf.sk) IS NOT NULL)  AS found_where_the_summary_looks,
+       COUNT_IF(ob.sk IS NOT NULL)                          AS offers_in_base_table
+FROM td t
+LEFT JOIN fp ON t.transaction_type = 'FREEPLAY' AND fp.sk = t.sk
+LEFT JOIN ov ON t.transaction_type = 'OFFER'    AND ov.sk = t.sk
+LEFT JOIN ob ON t.transaction_type = 'OFFER'    AND ob.sk = t.sk
+LEFT JOIN rf ON t.transaction_type = 'RATINGS'  AND rf.sk = t.sk
 GROUP BY 1, 2
-HAVING COUNT_IF(ta.trip_master_id IS NULL) > 0
+ORDER BY 1, 2;
+
+-- G1b. The same transaction ids looked up in PROD's tables. If UAT's trip data was copied from PROD, the ids are
+--      PROD's too: the ratings control tests that (expect ratings found, and with the same guest, at 100%). Then:
+--      PROD finding what UAT cannot means the transactions still exist in PROD and a PROD rebuild will carry them;
+--      a share missing in PROD as well, in older years only, would mean old trips rebuilt in PROD lose them too.
+--      If PROD access stops this statement, say so and skip it.
+WITH td AS (
+    SELECT DISTINCT d.transaction_type, d.transaction_table_sk AS sk, YEAR(d.business_start_dt) AS yr, t.guest_unique_id AS guest
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TD_AFTER d
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER t ON t.trip_master_id = d.trip_master_id
+    WHERE t.delete_ind = 'N' AND d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+      AND d.transaction_type IN ('FREEPLAY', 'OFFER', 'RATINGS')
+),
+fp AS (SELECT DISTINCT comp_free_play_detail_fact_sk AS sk FROM DAAS_PROD.DAAS_CORE.COMP_FREE_PLAY_DETAIL_FACT
+       WHERE comp_free_play_detail_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'FREEPLAY')),
+ov AS (SELECT DISTINCT offer_ledger_fact_sk AS sk FROM DAAS_PROD.DAAS_CORE_MARKETING_VW.OFFER_LEDGER_FACT_TRIP_VW
+       WHERE offer_ledger_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'OFFER')),
+ob AS (SELECT DISTINCT offer_ledger_fact_sk AS sk FROM DAAS_PROD.DAAS_CORE.OFFER_LEDGER_FACT
+       WHERE offer_ledger_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'OFFER')),
+rf AS (SELECT ratings_fact_sk AS sk, guest_unique_id AS guest FROM DAAS_PROD.DAAS_CORE.RATINGS_FACT
+       WHERE ratings_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'RATINGS')
+       QUALIFY ROW_NUMBER() OVER (PARTITION BY ratings_fact_sk ORDER BY guest_unique_id) = 1)
+SELECT t.transaction_type,
+       t.yr                                                 AS activity_year,
+       COUNT(*)                                             AS transactions,
+       COUNT_IF(COALESCE(fp.sk, ov.sk, rf.sk) IS NOT NULL)  AS prod_found_where_the_summary_looks,
+       COUNT_IF(ob.sk IS NOT NULL)                          AS prod_offers_in_base_table,
+       IFF(t.transaction_type = 'RATINGS', COUNT_IF(rf.guest = t.guest), NULL) AS ratings_same_guest_in_prod
+FROM td t
+LEFT JOIN fp ON t.transaction_type = 'FREEPLAY' AND fp.sk = t.sk
+LEFT JOIN ov ON t.transaction_type = 'OFFER'    AND ov.sk = t.sk
+LEFT JOIN ob ON t.transaction_type = 'OFFER'    AND ob.sk = t.sk
+LEFT JOIN rf ON t.transaction_type = 'RATINGS'  AND rf.sk = t.sk
+GROUP BY 1, 2
 ORDER BY 1, 2;
 
 
--- F2. Scoreboard rows 15-16, theo per guest (TOTAL_THEO_WIN_AMT: the house's expected win), split into parts.
---     Row 15, market after against market before: the rebuild's part (new trips minus the trips it retired) and the
---     part of the trips it left alone (expect 0.00).
---     Row 16, market against property: pairs where both twins have a summary row (expect 0 pairs differing and a
---     0.00 gap), plus the theo that sits on one side only because the other twin has no summary row.
---     row16_unexplained should be 0.00.
-WITH tmb AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_BEFORE),
-tma AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER),
-tsb AS (SELECT trip_master_id, SUM(total_theo_win_amt) AS theo FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_BEFORE GROUP BY 1),
-tsa AS (SELECT trip_master_id, SUM(total_theo_win_amt) AS theo FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_AFTER GROUP BY 1),
-mb AS (SELECT trip_master_id, guest_unique_id FROM tmb WHERE trip_type = 'MARKET' AND delete_ind = 'N'),
-ma AS (SELECT trip_master_id, guest_unique_id, market_cd, trip_start_dt, trip_end_dt
-       FROM tma WHERE trip_type = 'MARKET' AND delete_ind = 'N'),
-pa AS (SELECT trip_master_id, guest_unique_id, DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd,
-              trip_start_dt, trip_end_dt
-       FROM tma WHERE trip_type = 'PROPERTY' AND delete_ind = 'N'),
-r15 AS (
-    SELECT COALESCE(b.guest_unique_id, a.guest_unique_id)                                         AS guest_unique_id,
-           SUM(IFF(b.trip_master_id IS NOT NULL, COALESCE(sb.theo, 0), 0))                         AS before_theo,
-           SUM(IFF(a.trip_master_id IS NOT NULL, COALESCE(sa.theo, 0), 0))                         AS after_theo,
-           SUM(IFF(a.trip_master_id IS NULL, COALESCE(sb.theo, 0), 0))                             AS retired_theo,
-           SUM(IFF(b.trip_master_id IS NULL, COALESCE(sa.theo, 0), 0))                             AS new_theo,
-           SUM(IFF(a.trip_master_id IS NOT NULL AND b.trip_master_id IS NOT NULL,
-                   COALESCE(sa.theo, 0) - COALESCE(sb.theo, 0), 0))                                AS kept_change,
-           COUNT_IF(a.trip_master_id IS NULL)                                                      AS retired_trips,
-           COUNT_IF(a.trip_master_id IS NULL AND sb.trip_master_id IS NULL)                        AS retired_without_summary,
-           COUNT_IF(b.trip_master_id IS NULL)                                                      AS new_trips,
-           COUNT_IF(a.trip_master_id IS NOT NULL AND b.trip_master_id IS NOT NULL)                 AS kept_trips
-    FROM mb b
-    FULL OUTER JOIN ma a ON a.trip_master_id = b.trip_master_id
-    LEFT JOIN tsb sb ON sb.trip_master_id = b.trip_master_id
-    LEFT JOIN tsa sa ON sa.trip_master_id = a.trip_master_id
-    GROUP BY 1
+-- G2. Free play and offers recomputed today, with the sub-steps' own lookups, for both twins of every rebuilt pair
+--     whose twin has a summary row (the 4,081 pairs). If market_equals_property_today is all the pairs, the rebuilt
+--     trips hold exactly what today's data gives, and the property figures that differ are from before the data
+--     changed (property_stored_equals_today shows how many are still current). rebuilt_stored_equals_today checks
+--     that the run itself wrote today's figure.
+WITH mark AS (
+    SELECT value AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_MARKS WHERE mark = 'max_trip_master_id_before'
 ),
+tma AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER),
+ts AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_AFTER),
 pairs AS (
-    SELECT ma.guest_unique_id, ma.trip_master_id AS m_id, pa.trip_master_id AS p_id
-    FROM ma
-    JOIN pa ON pa.guest_unique_id = ma.guest_unique_id AND pa.market_cd = ma.market_cd
-           AND pa.trip_start_dt = ma.trip_start_dt AND pa.trip_end_dt = ma.trip_end_dt
-),
-r16 AS (
-    SELECT p.guest_unique_id,
-           COUNT_IF(sm.trip_master_id IS NOT NULL AND sp.trip_master_id IS NOT NULL)               AS both_rows,
-           COUNT_IF(sm.trip_master_id IS NOT NULL AND sp.trip_master_id IS NOT NULL
-                    AND ROUND(COALESCE(sm.theo, 0), 2) <> ROUND(COALESCE(sp.theo, 0), 2))         AS both_rows_theo_differs,
-           SUM(IFF(sm.trip_master_id IS NOT NULL AND sp.trip_master_id IS NOT NULL,
-                   COALESCE(sm.theo, 0) - COALESCE(sp.theo, 0), 0))                                AS both_rows_gap,
-           COUNT_IF(sm.trip_master_id IS NOT NULL AND sp.trip_master_id IS NULL)                   AS property_twin_no_row,
-           SUM(IFF(sm.trip_master_id IS NOT NULL AND sp.trip_master_id IS NULL, COALESCE(sm.theo, 0), 0)) AS market_theo_alone,
-           COUNT_IF(sm.trip_master_id IS NULL AND sp.trip_master_id IS NOT NULL)                   AS market_twin_no_row,
-           SUM(IFF(sm.trip_master_id IS NULL AND sp.trip_master_id IS NOT NULL, COALESCE(sp.theo, 0), 0)) AS property_theo_alone
-    FROM pairs p
-    LEFT JOIN tsa sm ON sm.trip_master_id = p.m_id
-    LEFT JOIN tsa sp ON sp.trip_master_id = p.p_id
-    GROUP BY 1
-),
-prop AS (
-    SELECT pa.guest_unique_id, SUM(COALESCE(sa.theo, 0)) AS property_theo
-    FROM pa LEFT JOIN tsa sa ON sa.trip_master_id = pa.trip_master_id
-    GROUP BY 1
-)
-SELECT r15.guest_unique_id,
-       ROUND(r15.before_theo, 2)                            AS market_theo_before,
-       ROUND(r15.after_theo, 2)                             AS market_theo_after,
-       ROUND(pr.property_theo, 2)                           AS property_theo,
-       ROUND(r15.after_theo - r15.before_theo, 2)           AS row15_change,
-       ROUND(r15.new_theo - r15.retired_theo, 2)            AS of_which_rebuilt_trips,
-       ROUND(r15.kept_change, 2)                            AS of_which_trips_left_alone_expect_0,
-       r15.retired_trips,
-       r15.retired_without_summary                          AS retired_trips_that_had_no_summary_row,
-       r15.new_trips,
-       r15.kept_trips                                       AS trips_left_alone,
-       ROUND(r15.after_theo - pr.property_theo, 2)          AS row16_gap,
-       r16.both_rows                                        AS pairs_both_with_summary_row,
-       r16.both_rows_theo_differs                           AS of_them_theo_differs_expect_0,
-       ROUND(r16.both_rows_gap, 2)                          AS gap_on_those_pairs_expect_0,
-       r16.property_twin_no_row                             AS property_twin_has_no_row,
-       ROUND(r16.market_theo_alone, 2)                      AS market_theo_on_those,
-       r16.market_twin_no_row                               AS market_twin_has_no_row,
-       ROUND(r16.property_theo_alone, 2)                    AS property_theo_on_those,
-       ROUND((r15.after_theo - pr.property_theo) - r16.both_rows_gap
-             - r16.market_theo_alone + r16.property_theo_alone, 2) AS row16_unexplained_expect_0
-FROM r15
-JOIN r16 ON r16.guest_unique_id = r15.guest_unique_id
-JOIN prop pr ON pr.guest_unique_id = r15.guest_unique_id
-ORDER BY 1;
-
--- F2b. Why the old market trips' theo differed from the new ones, day by day, from the daily rows: for every day the
---      market side covers, theo before (old trips) and after (new trips), and how many old trips covered that day.
---        2 = the day sat on two or more old trips at once, so its ratings were counted twice (the RCA's doubled
---            ratings);  3 = the old trips had no daily row for that day;  5 = one old daily row with another figure.
---      days_after_equals_property: the new figure agrees with the property side on that many of those days.
-WITH tmb AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_BEFORE),
-tma AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER),
-b AS (
-    SELECT d.guest_unique_id, d.guest_activity_date AS activity_day, SUM(d.total_theo_win_amt) AS theo,
-           COUNT(DISTINCT d.trip_master_id) AS trips
-    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_DAS_BEFORE d
-    JOIN tmb m ON m.trip_master_id = d.trip_master_id
-    WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND d.delete_ind = 'N'
-    GROUP BY 1, 2
-),
-a AS (
-    SELECT d.guest_unique_id, d.guest_activity_date AS activity_day, SUM(d.total_theo_win_amt) AS theo
-    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_DAS_AFTER d
-    JOIN tma m ON m.trip_master_id = d.trip_master_id
-    WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND d.delete_ind = 'N'
-    GROUP BY 1, 2
-),
-p AS (
-    SELECT d.guest_unique_id, d.guest_activity_date AS activity_day, SUM(d.total_theo_win_amt) AS theo
-    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_DAS_AFTER d
-    JOIN tma m ON m.trip_master_id = d.trip_master_id
-    WHERE m.trip_type = 'PROPERTY' AND m.delete_ind = 'N' AND d.delete_ind = 'N'
-    GROUP BY 1, 2
-),
-days AS (
-    SELECT COALESCE(b.guest_unique_id, a.guest_unique_id) AS guest_unique_id,
-           COALESCE(b.activity_day, a.activity_day)       AS activity_day,
-           b.theo AS before_theo, b.trips AS old_trips, a.theo AS after_theo, p.theo AS property_theo
-    FROM b
-    FULL OUTER JOIN a ON a.guest_unique_id = b.guest_unique_id AND a.activity_day = b.activity_day
-    LEFT JOIN p ON p.guest_unique_id = COALESCE(b.guest_unique_id, a.guest_unique_id)
-               AND p.activity_day = COALESCE(b.activity_day, a.activity_day)
-),
-k AS (
-    SELECT days.*,
-           CASE WHEN ROUND(COALESCE(before_theo, 0), 2) = ROUND(COALESCE(after_theo, 0), 2) THEN '1 same before and after'
-                WHEN old_trips >= 2     THEN '2 day sat on two or more old trips'
-                WHEN old_trips IS NULL  THEN '3 old trips had no daily row for the day'
-                WHEN after_theo IS NULL THEN '4 no new daily row for the day'
-                ELSE '5 one old daily row, another figure' END AS kind
-    FROM days
-)
-SELECT guest_unique_id, kind,
-       COUNT(*)                                                         AS days,
-       ROUND(SUM(COALESCE(before_theo, 0)), 2)                          AS theo_before,
-       ROUND(SUM(COALESCE(after_theo, 0)), 2)                           AS theo_after,
-       ROUND(SUM(COALESCE(after_theo, 0) - COALESCE(before_theo, 0)), 2) AS theo_change,
-       COUNT_IF(property_theo IS NOT NULL
-                AND ROUND(COALESCE(after_theo, 0), 2) = ROUND(property_theo, 2)) AS days_after_equals_property,
-       COUNT_IF(property_theo IS NULL)                                  AS days_with_no_property_row
-FROM k
-GROUP BY 1, 2
-ORDER BY 1, 2;
-
-
--- F3. Every other TRIP_SUMMARY column, one row per column: the kind of difference between the rebuilt trips and their
---     property twins (the 4,081 pairs where both have a summary row), and the column's total on the old trips the
---     rebuild retired, on the rebuilt trips, and on the twins. POS columns left out (no POS sub-step this run).
---       empty_vs_zero            one side empty (never written), the other 0 or N: cosmetic
---       market_0_property_value  the rebuilt trip has 0 where its twin has a value
---       market_value_property_0  the reverse
---       both_values_differ       both have a value, not the same one
---     Reading the totals: rebuilt = twins while retired differs -> the rebuild corrected the market figure;
---     rebuilt near 0 while retired and twins are not -> the figure only appears when property and market rows are
---     summed in the same run, as with comp worth; rebuilt = retired while twins differ -> market and property trips
---     have always been summed differently here, not something the rebuild did.
---     A column is listed when some pair differs or the rebuild moved the market total. Please attach as text.
-WITH mark AS (
-    SELECT value AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_MARKS WHERE mark = 'max_trip_master_id_before'
-),
-tmb AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_BEFORE),
-tma AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER),
-retired AS (   -- market trips live before the run that the run retired
-    SELECT b.trip_master_id
-    FROM tmb b
-    JOIN tma a ON a.trip_master_id = b.trip_master_id
-    WHERE b.trip_type = 'MARKET' AND b.delete_ind = 'N' AND a.delete_ind = 'Y'
-),
-rebuilt AS (
-    SELECT trip_master_id FROM tma
-    WHERE trip_type = 'MARKET' AND delete_ind = 'N' AND trip_master_id > (SELECT max_tm FROM mark)
-),
-twin AS (      -- a rebuilt trip and its property twin, both with a summary row
-    SELECT mk.trip_master_id AS market_trip_id, pr.trip_master_id AS property_trip_id
+    SELECT mk.trip_master_id AS m_id, pr.trip_master_id AS p_id
     FROM tma mk
     JOIN tma pr
       ON pr.guest_unique_id = mk.guest_unique_id AND pr.trip_type = 'PROPERTY' AND pr.delete_ind = 'N'
      AND pr.property_cd = DECODE(mk.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
      AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt
-    WHERE mk.trip_master_id IN (SELECT trip_master_id FROM rebuilt)
-      AND mk.trip_master_id IN (SELECT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_AFTER)
-      AND pr.trip_master_id IN (SELECT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_AFTER)
+    WHERE mk.trip_type = 'MARKET' AND mk.delete_ind = 'N' AND mk.trip_master_id > (SELECT max_tm FROM mark)
+      AND mk.trip_master_id IN (SELECT trip_master_id FROM ts)
+      AND pr.trip_master_id IN (SELECT trip_master_id FROM ts)
     QUALIFY ROW_NUMBER() OVER (PARTITION BY mk.trip_master_id ORDER BY pr.trip_master_id) = 1
 ),
-sb AS (
-    SELECT trip_master_id,
-           OBJECT_DELETE(OBJECT_CONSTRUCT(*), 'TRIP_SUMMARY_ID', 'TRIP_MASTER_ID', 'LAST_DML_CD',
-                         'CREATED_DTTM', 'CREATED_BY', 'UPDATED_DTTM', 'UPDATED_BY', 'BATCH_ID') AS o
-    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_BEFORE
+td AS (
+    SELECT d.trip_master_id, d.transaction_type, d.transaction_table_sk, d.delete_ind
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TD_AFTER d
+    WHERE d.transaction_type IN ('FREEPLAY', 'OFFER')
+      AND d.trip_master_id IN (SELECT m_id FROM pairs UNION SELECT p_id FROM pairs)
 ),
-sa AS (
-    SELECT trip_master_id,
-           OBJECT_DELETE(OBJECT_CONSTRUCT(*), 'TRIP_SUMMARY_ID', 'TRIP_MASTER_ID', 'LAST_DML_CD',
-                         'CREATED_DTTM', 'CREATED_BY', 'UPDATED_DTTM', 'UPDATED_BY', 'BATCH_ID') AS o
-    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_AFTER
-),
-kr AS (SELECT f.key AS col, f.value AS val FROM retired r JOIN sb ON sb.trip_master_id = r.trip_master_id, LATERAL FLATTEN(input => sb.o) f),
-ka AS (SELECT f.key AS col, f.value AS val FROM rebuilt r JOIN sa ON sa.trip_master_id = r.trip_master_id, LATERAL FLATTEN(input => sa.o) f),
-km AS (SELECT t.market_trip_id, f.key AS col, f.value AS val FROM twin t JOIN sa ON sa.trip_master_id = t.market_trip_id,   LATERAL FLATTEN(input => sa.o) f),
-kp AS (SELECT t.market_trip_id, f.key AS col, f.value AS val FROM twin t JOIN sa ON sa.trip_master_id = t.property_trip_id, LATERAL FLATTEN(input => sa.o) f),
-pv AS (
-    SELECT COALESCE(km.col, kp.col) AS col, km.val AS m_val, kp.val AS p_val
-    FROM km
-    FULL OUTER JOIN kp ON kp.market_trip_id = km.market_trip_id AND kp.col = km.col
-),
-pvf AS (   -- "has a value": not empty, not 0, not N
-    SELECT col, m_val, p_val,
-           IFF(m_val IS NULL, FALSE, COALESCE(TRY_TO_DOUBLE(m_val::VARCHAR) <> 0, m_val::VARCHAR NOT IN ('N', '', '^'))) AS m_set,
-           IFF(p_val IS NULL, FALSE, COALESCE(TRY_TO_DOUBLE(p_val::VARCHAR) <> 0, p_val::VARCHAR NOT IN ('N', '', '^'))) AS p_set
-    FROM pv
-),
-kinds AS (
-    SELECT col,
-           COUNT_IF(NOT EQUAL_NULL(m_val, p_val))                             AS pairs_differ,
-           COUNT_IF(NOT EQUAL_NULL(m_val, p_val) AND NOT m_set AND NOT p_set) AS empty_vs_zero,
-           COUNT_IF(NOT m_set AND p_set)                                      AS market_0_property_value,
-           COUNT_IF(m_set AND NOT p_set)                                      AS market_value_property_0,
-           COUNT_IF(m_set AND p_set AND NOT EQUAL_NULL(m_val, p_val))         AS both_values_differ,
-           COUNT_IF(m_set)                                                    AS rebuilt_with_value,
-           COUNT_IF(p_set)                                                    AS twins_with_value,
-           SUM(TRY_TO_DOUBLE(m_val::VARCHAR))                                 AS rebuilt_total,
-           SUM(TRY_TO_DOUBLE(p_val::VARCHAR))                                 AS twins_total
-    FROM pvf
+fp AS (   -- TRIP_FREEPLAY_SUMMARY_LOAD_PROC: DLC_FSP_POINT_AMT
+    SELECT td.trip_master_id, COALESCE(ABS(SUM(IFF(td.delete_ind = 'N', f.free_play_points, NULL))), 0) AS v
+    FROM td
+    JOIN DAAS_UAT.DAAS_CORE.COMP_FREE_PLAY_DETAIL_FACT f ON f.comp_free_play_detail_fact_sk = td.transaction_table_sk
+    WHERE td.transaction_type = 'FREEPLAY'
     GROUP BY 1
 ),
-totals AS (
-    SELECT col,
-           SUM(IFF(src = 'retired', TRY_TO_DOUBLE(val::VARCHAR), NULL)) AS retired_total,
-           SUM(IFF(src = 'rebuilt', TRY_TO_DOUBLE(val::VARCHAR), NULL)) AS rebuilt_total_all
-    FROM (SELECT 'retired' AS src, col, val FROM kr
-          UNION ALL
-          SELECT 'rebuilt', col, val FROM ka) x
+ofr AS (  -- TRIP_OFFER_SUMMARY_LOAD_PROC: OFFER_NBR_OFFERS and OFFER_TOTAL_COST
+    SELECT td.trip_master_id,
+           COUNT(DISTINCT IFF(td.delete_ind = 'N', o.offer_id, NULL)) AS nbr_offers,
+           SUM(CASE WHEN td.delete_ind = 'N' AND o.coupon_type = '0A' AND SUBSTRING(o.coupon_id, 1, 1) NOT IN ('V', 'Z', 'W', 'X')
+                     AND o.coupon_id NOT IN ('GR', 'GS', 'BJ', 'BA', 'BB', 'BC', 'BD', 'BE', 'BF') THEN o.redeem_amt_cost_adjusted ELSE 0 END)
+         + SUM(CASE WHEN td.delete_ind = 'N' AND o.coupon_type = '0H' THEN o.redeem_amt_cost_adjusted ELSE 0 END)
+         + SUM(CASE WHEN td.delete_ind = 'N' AND o.coupon_type NOT IN ('0H', '0A') THEN o.redeem_amt_cost_adjusted ELSE 0 END)
+         + SUM(CASE WHEN td.delete_ind = 'N' AND ((o.coupon_type = '0A' AND (SUBSTRING(o.coupon_id, 1, 1) IN ('V', 'Z', 'W', 'X')
+                     OR o.coupon_id IN ('GR', 'GS', 'BJ', 'BA', 'BB', 'BC', 'BD', 'BE', 'BF')))
+                     OR (o.coupon_type = '0L' AND o.coupon_id = 'FP')) THEN o.redeem_amt_cost_adjusted ELSE 0 END) AS total_cost
+    FROM td
+    JOIN DAAS_UAT.DAAS_CORE_MARKETING_VW.OFFER_LEDGER_FACT_TRIP_VW o ON o.offer_ledger_fact_sk = td.transaction_table_sk
+    WHERE td.transaction_type = 'OFFER'
     GROUP BY 1
+),
+cmp AS (
+    SELECT 'free play points (DLC_FSP_POINT_AMT)' AS measure,
+           COALESCE(fm.v, 0) AS m_today, COALESCE(fpp.v, 0) AS p_today,
+           COALESCE(sm.dlc_fsp_point_amt, 0) AS m_stored, COALESCE(sp.dlc_fsp_point_amt, 0) AS p_stored
+    FROM pairs x
+    JOIN ts sm ON sm.trip_master_id = x.m_id
+    JOIN ts sp ON sp.trip_master_id = x.p_id
+    LEFT JOIN fp fm  ON fm.trip_master_id  = x.m_id
+    LEFT JOIN fp fpp ON fpp.trip_master_id = x.p_id
+    UNION ALL
+    SELECT 'offers (OFFER_NBR_OFFERS)',
+           COALESCE(om.nbr_offers, 0), COALESCE(op.nbr_offers, 0),
+           COALESCE(sm.offer_nbr_offers, 0), COALESCE(sp.offer_nbr_offers, 0)
+    FROM pairs x
+    JOIN ts sm ON sm.trip_master_id = x.m_id
+    JOIN ts sp ON sp.trip_master_id = x.p_id
+    LEFT JOIN ofr om ON om.trip_master_id = x.m_id
+    LEFT JOIN ofr op ON op.trip_master_id = x.p_id
+    UNION ALL
+    SELECT 'offer cost (OFFER_TOTAL_COST)',
+           COALESCE(om.total_cost, 0), COALESCE(op.total_cost, 0),
+           COALESCE(sm.offer_total_cost, 0), COALESCE(sp.offer_total_cost, 0)
+    FROM pairs x
+    JOIN ts sm ON sm.trip_master_id = x.m_id
+    JOIN ts sp ON sp.trip_master_id = x.p_id
+    LEFT JOIN ofr om ON om.trip_master_id = x.m_id
+    LEFT JOIN ofr op ON op.trip_master_id = x.p_id
 )
-SELECT COALESCE(k.col, t.col)                       AS summary_column,
-       CASE WHEN COALESCE(k.pairs_differ, 0) = 0         THEN 'pairs agree; market total moved'
-            WHEN k.empty_vs_zero = k.pairs_differ        THEN 'empty vs 0 only'
-            WHEN k.rebuilt_with_value = 0 AND k.twins_with_value > 0 THEN 'never set on rebuilt trips'
-            ELSE 'values differ' END                AS pattern,
-       k.pairs_differ,
-       k.empty_vs_zero,
-       k.market_0_property_value,
-       k.market_value_property_0,
-       k.both_values_differ,
-       k.rebuilt_with_value                         AS rebuilt_trips_with_a_value,
-       k.twins_with_value                           AS twins_with_a_value,
-       ROUND(k.rebuilt_total, 2)                    AS rebuilt_total_on_pairs,
-       ROUND(k.twins_total, 2)                      AS twins_total_on_pairs,
-       ROUND(t.retired_total, 2)                    AS retired_trips_total,
-       ROUND(t.rebuilt_total_all, 2)                AS rebuilt_trips_total
-FROM kinds k
-FULL OUTER JOIN totals t ON t.col = k.col
-WHERE NOT REGEXP_LIKE(COALESCE(k.col, t.col), '(NBR_)?POS_.*')
-  AND (COALESCE(k.pairs_differ, 0) > 0
-       OR ROUND(COALESCE(t.retired_total, 0), 2) <> ROUND(COALESCE(t.rebuilt_total_all, 0), 2))
-ORDER BY COALESCE(k.pairs_differ, 0) DESC, 1;
+SELECT measure,
+       COUNT(*)                                          AS pairs,
+       COUNT_IF(ROUND(m_today, 2) = ROUND(p_today, 2))   AS market_equals_property_today,
+       COUNT_IF(ROUND(m_stored, 2) = ROUND(m_today, 2))  AS rebuilt_stored_equals_today,
+       COUNT_IF(ROUND(p_stored, 2) = ROUND(p_today, 2))  AS property_stored_equals_today,
+       ROUND(SUM(m_today), 2)                            AS rebuilt_today,
+       ROUND(SUM(p_today), 2)                            AS property_today,
+       ROUND(SUM(m_stored), 2)                           AS rebuilt_stored,
+       ROUND(SUM(p_stored), 2)                           AS property_stored
+FROM cmp
+GROUP BY 1
+ORDER BY 1;
 
 
--- F4. TRIP_NG_REVENUE_SUMMARY, the one trip table Part C did not cover: non-gaming spend (hotel folios, food and
---     beverage checks) per trip, transaction (SK), revenue centre and day, written by step 7 for the rebuilt trips.
---     Each rebuilt market trip against its property twin, row for row. Expect missing_on_market 0, extra_on_market 0
---     and values_differ 0. Step 7 reads the POS facts itself, so food-and-beverage spend is here even though step 5
---     ran without its POS sub-step: this is where UAT can check POS at transaction level.
---     The last row is information only: rows on the trips the rebuild retired stay where they are (no step removes
---     them, after any recalculation) and hang off retired trips, so readers that join to live trips skip them.
---     Reads the live table once: a minute or two.
+-- G3. The three small differences, each against the explanation the code gives.
+--     Non-play days: the ratings sub-step works out non-play days as trip length minus play days, but only when the
+--       trip's ratings are in the run; a trip later stretched by other transactions (a hotel stay) gets its new
+--       length from the wrapper and keeps its old non-play count. Expect the 13 differing pairs to be property rows
+--       where non-play days <> trip days - play days, and no such market rows.
+--     Most-played denomination: the vote counts soft-deleted ratings too (no delete filter), and the rebuilt trips
+--       carry only live ones. Expect the 6 differing pairs to have soft-deleted ratings on the property trip.
+--     Hotel comps: UAT's hotel summary (v1.7, UAT only) handles soft-deleted hotel rows. Expect the 1 differing pair
+--       to have a soft-deleted hotel row on the property trip.
+WITH mark AS (
+    SELECT value AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_MARKS WHERE mark = 'max_trip_master_id_before'
+),
+tma AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER),
+ts AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_AFTER),
+pairs AS (
+    SELECT mk.trip_master_id AS m_id, pr.trip_master_id AS p_id
+    FROM tma mk
+    JOIN tma pr
+      ON pr.guest_unique_id = mk.guest_unique_id AND pr.trip_type = 'PROPERTY' AND pr.delete_ind = 'N'
+     AND pr.property_cd = DECODE(mk.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
+     AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt
+    WHERE mk.trip_type = 'MARKET' AND mk.delete_ind = 'N' AND mk.trip_master_id > (SELECT max_tm FROM mark)
+      AND mk.trip_master_id IN (SELECT trip_master_id FROM ts)
+      AND pr.trip_master_id IN (SELECT trip_master_id FROM ts)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY mk.trip_master_id ORDER BY pr.trip_master_id) = 1
+),
+deleted AS (
+    SELECT trip_master_id,
+           COUNT_IF(transaction_type = 'RATINGS') AS deleted_ratings,
+           COUNT_IF(transaction_type = 'HOTEL')   AS deleted_hotel
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TD_AFTER
+    WHERE delete_ind = 'Y'
+    GROUP BY 1
+),
+p AS (
+    SELECT x.*,
+           sm.nbr_nonplay_days AS m_np, sp.nbr_nonplay_days AS p_np,
+           sm.trip_days - sm.nbr_play_days AS m_np_expected, sp.trip_days - sp.nbr_play_days AS p_np_expected,
+           sm.most_played_denom_amt AS m_denom, sp.most_played_denom_amt AS p_denom,
+           sm.hotel_comp_amt_total AS m_hc, sp.hotel_comp_amt_total AS p_hc,
+           COALESCE(dl.deleted_ratings, 0) AS p_deleted_ratings, COALESCE(dl.deleted_hotel, 0) AS p_deleted_hotel
+    FROM pairs x
+    JOIN ts sm ON sm.trip_master_id = x.m_id
+    JOIN ts sp ON sp.trip_master_id = x.p_id
+    LEFT JOIN deleted dl ON dl.trip_master_id = x.p_id
+)
+SELECT 'non-play days' AS item,
+       COUNT_IF(NOT EQUAL_NULL(m_np, p_np))                                             AS pairs_differ,
+       COUNT_IF(NOT EQUAL_NULL(m_np, p_np) AND NOT EQUAL_NULL(p_np, p_np_expected))     AS of_them_explained,
+       COUNT_IF(NOT EQUAL_NULL(m_np, m_np_expected))                                    AS rebuilt_rows_inconsistent_expect_0,
+       COUNT_IF(NOT EQUAL_NULL(p_np, p_np_expected))                                    AS property_rows_inconsistent
+FROM p
+UNION ALL
+SELECT 'most-played denomination',
+       COUNT_IF(NOT EQUAL_NULL(m_denom, p_denom)),
+       COUNT_IF(NOT EQUAL_NULL(m_denom, p_denom) AND p_deleted_ratings > 0),
+       NULL, NULL
+FROM p
+UNION ALL
+SELECT 'hotel comps',
+       COUNT_IF(NOT EQUAL_NULL(m_hc, p_hc)),
+       COUNT_IF(NOT EQUAL_NULL(m_hc, p_hc) AND p_deleted_hotel > 0),
+       NULL, NULL
+FROM p;
+
+
+-- G4. TRIP_NG_REVENUE_SUMMARY: every row F4 found on one twin only, with the likely reason.
+--       1  the other twin has no NG rows at all (UAT's summary outage stopped this step too: it runs after it)
+--       2  the other twin has the same transaction on another day or revenue centre (hotel folio lines are dated
+--          by rules that depend on the trips around the stay and on the day the step ran)
+--       3  the other twin holds the transaction but has no NG row for it (that twin's NG rows are older)
+--       4  the other twin does not hold the transaction (its row was written before the transaction moved or was
+--          deleted)
+--     Values matched on every row both twins have (F4), so these are the only open NG rows.
 WITH mark AS (
     SELECT value AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_MARKS WHERE mark = 'max_trip_master_id_before'
 ),
@@ -398,69 +256,77 @@ ng AS (
     FROM DAAS_UAT.DAAS_CORE.TRIP_NG_REVENUE_SUMMARY n
     WHERE n.trip_master_id IN (SELECT trip_master_id FROM tma)
 ),
-m AS (
-    SELECT t.market_trip_id AS pair_id, ng.o,
-           COALESCE(ng.o:TRANSACTION_TABLE_SK::VARCHAR, '~') || '|' || COALESCE(ng.o:TRANSACTION_SECONDARY_TABLE_SK::VARCHAR, '~')
-           || '|' || COALESCE(ng.o:REVENUE_CENTER_CD::VARCHAR, '~') || '|' || COALESCE(ng.o:BUSINESS_START_DT::VARCHAR, '~') AS k
-    FROM twin t
-    JOIN ng ON ng.trip_master_id = t.market_trip_id
+both_sides AS (
+    SELECT t.market_trip_id AS pair_id, 'M' AS s, t.market_trip_id AS own_id, t.property_trip_id AS other_id, ng.o
+    FROM twin t JOIN ng ON ng.trip_master_id = t.market_trip_id
+    WHERE COALESCE(ng.o:DELETE_IND::VARCHAR, 'N') = 'N'
+    UNION ALL
+    SELECT t.market_trip_id, 'P', t.property_trip_id, t.market_trip_id, ng.o
+    FROM twin t JOIN ng ON ng.trip_master_id = t.property_trip_id
     WHERE COALESCE(ng.o:DELETE_IND::VARCHAR, 'N') = 'N'
 ),
-p AS (
-    SELECT t.market_trip_id AS pair_id, ng.o,
-           COALESCE(ng.o:TRANSACTION_TABLE_SK::VARCHAR, '~') || '|' || COALESCE(ng.o:TRANSACTION_SECONDARY_TABLE_SK::VARCHAR, '~')
-           || '|' || COALESCE(ng.o:REVENUE_CENTER_CD::VARCHAR, '~') || '|' || COALESCE(ng.o:BUSINESS_START_DT::VARCHAR, '~') AS k
-    FROM twin t
-    JOIN ng ON ng.trip_master_id = t.property_trip_id
-    WHERE COALESCE(ng.o:DELETE_IND::VARCHAR, 'N') = 'N'
+keyed AS (
+    SELECT b.*,
+           COALESCE(o:TRANSACTION_TABLE_SK::VARCHAR, '~') || '|' || COALESCE(o:TRANSACTION_SECONDARY_TABLE_SK::VARCHAR, '~') AS txn,
+           COALESCE(o:TRANSACTION_TABLE_SK::VARCHAR, '~') || '|' || COALESCE(o:TRANSACTION_SECONDARY_TABLE_SK::VARCHAR, '~')
+           || '|' || COALESCE(o:REVENUE_CENTER_CD::VARCHAR, '~') || '|' || COALESCE(o:BUSINESS_START_DT::VARCHAR, '~') AS k
+    FROM both_sides b
 ),
-m2 AS (SELECT m.*, ROW_NUMBER() OVER (PARTITION BY pair_id, k ORDER BY HASH(o)) AS n FROM m),
-p2 AS (SELECT p.*, ROW_NUMBER() OVER (PARTITION BY pair_id, k ORDER BY HASH(o)) AS n FROM p),
-cmp AS (
-    SELECT COALESCE(m2.o:TRANSACTION_TYPE::VARCHAR, p2.o:TRANSACTION_TYPE::VARCHAR, '?') AS transaction_type,
-           m2.pair_id AS m_pair, p2.pair_id AS p_pair,
-           m2.o:F_CASH_SPND_AMT::NUMBER(38,4)     AS m_amt, p2.o:F_CASH_SPND_AMT::NUMBER(38,4)     AS p_amt,
-           m2.o:F_CASH_SPND_TAX_AMT::NUMBER(38,4) AS m_tax, p2.o:F_CASH_SPND_TAX_AMT::NUMBER(38,4) AS p_tax,
-           m2.o:F_CASH_SPND_TIP_AMT::NUMBER(38,4) AS m_tip, p2.o:F_CASH_SPND_TIP_AMT::NUMBER(38,4) AS p_tip,
-           m2.o:REVENUE_CATEGORY_NM::VARCHAR      AS m_cat, p2.o:REVENUE_CATEGORY_NM::VARCHAR      AS p_cat,
-           m2.o:TXN_TBL_DELETE_IND::VARCHAR       AS m_src, p2.o:TXN_TBL_DELETE_IND::VARCHAR       AS p_src
-    FROM m2
-    FULL OUTER JOIN p2 ON p2.pair_id = m2.pair_id AND p2.k = m2.k AND p2.n = m2.n
+numbered AS (SELECT keyed.*, ROW_NUMBER() OVER (PARTITION BY pair_id, s, k ORDER BY HASH(o)) AS n FROM keyed),
+lonely AS (   -- rows with no identical row on the other twin
+    SELECT a.*
+    FROM numbered a
+    LEFT JOIN numbered b ON b.pair_id = a.pair_id AND b.s <> a.s AND b.k = a.k AND b.n = a.n
+    WHERE b.pair_id IS NULL
+),
+other_any AS (SELECT DISTINCT pair_id, s FROM keyed),
+other_txn AS (SELECT DISTINCT pair_id, s, txn FROM keyed),
+holds AS (
+    SELECT DISTINCT trip_master_id, transaction_table_sk::VARCHAR AS sk
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TD_AFTER
+    WHERE delete_ind = 'N' AND transaction_sub_type = 'OPENED' AND transaction_type IN ('HOTEL', 'POS')
+),
+classified AS (
+    SELECT l.s, l.o,
+           CASE WHEN oa.pair_id IS NULL THEN '1 other twin has no NG rows at all'
+                WHEN ot.pair_id IS NOT NULL THEN '2 same transaction on the other twin, other day or revenue centre'
+                WHEN h.trip_master_id IS NOT NULL THEN '3 other twin holds the transaction, no NG row for it'
+                ELSE '4 other twin does not hold the transaction' END AS reason
+    FROM lonely l
+    LEFT JOIN other_any oa ON oa.pair_id = l.pair_id AND oa.s <> l.s
+    LEFT JOIN other_txn ot ON ot.pair_id = l.pair_id AND ot.s <> l.s AND ot.txn = l.txn
+    LEFT JOIN holds h      ON h.trip_master_id = l.other_id AND h.sk = l.o:TRANSACTION_TABLE_SK::VARCHAR
 )
-SELECT transaction_type,
-       COUNT_IF(m_pair IS NOT NULL AND p_pair IS NOT NULL)                       AS rows_on_both,
-       COUNT_IF(m_pair IS NULL)                                                  AS missing_on_market,
-       COUNT_IF(p_pair IS NULL)                                                  AS extra_on_market,
-       COUNT_IF(m_pair IS NOT NULL AND p_pair IS NOT NULL
-                AND NOT (EQUAL_NULL(m_amt, p_amt) AND EQUAL_NULL(m_tax, p_tax) AND EQUAL_NULL(m_tip, p_tip)
-                         AND EQUAL_NULL(m_cat, p_cat)))                          AS values_differ,
-       COUNT_IF(m_pair IS NOT NULL AND p_pair IS NOT NULL AND NOT EQUAL_NULL(m_src, p_src)) AS source_deleted_flag_differs,
-       ROUND(SUM(m_amt), 2)                                                      AS market_spend,
-       ROUND(SUM(p_amt), 2)                                                      AS property_spend
-FROM cmp
-GROUP BY 1
-UNION ALL
-SELECT 'rows on the retired trips (info)', COUNT(*), NULL, NULL, NULL, NULL,
-       ROUND(SUM(o:F_CASH_SPND_AMT::NUMBER(38,4)), 2), NULL
-FROM ng
-WHERE trip_master_id IN (SELECT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_QUEUE)
-ORDER BY 1;
+SELECT IFF(s = 'P', 'missing on market', 'extra on market') AS side,
+       COALESCE(o:TRANSACTION_TYPE::VARCHAR, '?')            AS transaction_type,
+       reason,
+       COUNT(*)                                              AS ng_rows,
+       ROUND(SUM(o:F_CASH_SPND_AMT::NUMBER(38,4)), 2)        AS spend
+FROM classified
+GROUP BY 1, 2, 3
+ORDER BY 1, 2, 3;
 
 
--- F5. The code behind the columns still open: free play (DLC_FSP_*) and hotel comps in UAT and PROD (their code
---     differs), and offers, ratings (play days, most-played denomination) and comps (CW_/RC_DLRS_USED) in UAT (the
---     same in both). Seven rows. Please download the result and attach it.
-SELECT 'TRIP_FREEPLAY_SUMMARY_LOAD_PROC' AS procedure_name, 'UAT' AS env,
-       GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_FREEPLAY_SUMMARY_LOAD_PROC()') AS code
+-- G5. When the tables behind free play and offers, and the offer view, were created and last changed, UAT next to
+--     PROD, with row counts. A UAT table re-created after the property trips were summarised (about June) would
+--     explain G1. Includes OFFER_LEDGER_FACT_HISTORY, where old ledger rows may be moved.
+SELECT 'UAT' AS env, table_schema, table_name, table_type, table_owner, row_count, created, last_altered
+FROM DAAS_UAT.INFORMATION_SCHEMA.TABLES
+WHERE (table_schema = 'DAAS_CORE'
+       AND table_name IN ('COMP_FREE_PLAY_DETAIL_FACT', 'OFFER_LEDGER_FACT', 'OFFER_LEDGER_FACT_HISTORY', 'RATINGS_FACT'))
+   OR (table_schema = 'DAAS_CORE_MARKETING_VW' AND table_name = 'OFFER_LEDGER_FACT_TRIP_VW')
 UNION ALL
-SELECT 'TRIP_FREEPLAY_SUMMARY_LOAD_PROC', 'PROD', GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_FREEPLAY_SUMMARY_LOAD_PROC()')
+SELECT 'PROD', table_schema, table_name, table_type, table_owner, row_count, created, last_altered
+FROM DAAS_PROD.INFORMATION_SCHEMA.TABLES
+WHERE (table_schema = 'DAAS_CORE'
+       AND table_name IN ('COMP_FREE_PLAY_DETAIL_FACT', 'OFFER_LEDGER_FACT', 'OFFER_LEDGER_FACT_HISTORY', 'RATINGS_FACT'))
+   OR (table_schema = 'DAAS_CORE_MARKETING_VW' AND table_name = 'OFFER_LEDGER_FACT_TRIP_VW')
+ORDER BY 3, 1 DESC;
+
+
+-- G6. The offer view's definition in both environments: whether it keeps only the current status of each offer, or
+--     drops purged or older rows, decides whether a PROD rebuild of old trips keeps their offers. A secure view
+--     shows its text only to its owner; if this stops on a permissions error, skip it.
+SELECT 'UAT' AS env, GET_DDL('VIEW', 'DAAS_UAT.DAAS_CORE_MARKETING_VW.OFFER_LEDGER_FACT_TRIP_VW') AS view_definition
 UNION ALL
-SELECT 'TRIP_HOTEL_SUMMARY_LOAD_PROC', 'UAT', GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_HOTEL_SUMMARY_LOAD_PROC()')
-UNION ALL
-SELECT 'TRIP_HOTEL_SUMMARY_LOAD_PROC', 'PROD', GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_HOTEL_SUMMARY_LOAD_PROC()')
-UNION ALL
-SELECT 'TRIP_OFFER_SUMMARY_LOAD_PROC', 'UAT', GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_OFFER_SUMMARY_LOAD_PROC()')
-UNION ALL
-SELECT 'TRIP_RATING_SUMMARY_LOAD_PROC', 'UAT', GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_RATING_SUMMARY_LOAD_PROC()')
-UNION ALL
-SELECT 'TRIP_COMP_SUMMARY_LOAD_PROC', 'UAT', GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_COMP_SUMMARY_LOAD_PROC()');
+SELECT 'PROD', GET_DDL('VIEW', 'DAAS_PROD.DAAS_CORE_MARKETING_VW.OFFER_LEDGER_FACT_TRIP_VW');
