@@ -451,6 +451,27 @@ SELECT object_kind, object_name, owner_before, recreated_on_before
 FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_OWNERS
 ORDER BY recreated_on_before DESC;
 
+-- B2e. (only if B3a's P6 row says 'differs') The lines where UAT's 3-argument pipeline wrapper, which the on-demand
+--      tasks call, differs from PROD's. Declarations (VARCHAR vs VARCHAR(16777216)) are evened out first.
+WITH d AS (
+    SELECT 'PROD' AS env,
+           REPLACE(REPLACE(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC(VARCHAR, VARCHAR, VARCHAR)'),
+                           'VARCHAR(16777216)', 'VARCHAR'), CHR(13), '') AS ddl
+    UNION ALL
+    SELECT 'UAT',
+           REPLACE(REPLACE(GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC(VARCHAR, VARCHAR, VARCHAR)'),
+                           'VARCHAR(16777216)', 'VARCHAR'), CHR(13), '')),
+l AS (
+    SELECT d.env, s.index AS line_no, TRIM(s.value) AS line_text
+    FROM d, LATERAL SPLIT_TO_TABLE(d.ddl, CHR(10)) s
+    WHERE TRIM(s.value) <> '')
+SELECT 'only in PROD' AS where_found, p.line_no, p.line_text
+FROM l p WHERE p.env = 'PROD' AND p.line_text NOT IN (SELECT line_text FROM l WHERE env = 'UAT')
+UNION ALL
+SELECT 'only in UAT', u.line_no, u.line_text
+FROM l u WHERE u.env = 'UAT' AND u.line_text NOT IN (SELECT line_text FROM l WHERE env = 'PROD')
+ORDER BY 2, 1;
+
 -- B3. The run. What B2 found on 2026-10-18: UAT's TRIP_ROOT_TASK is suspended (last suspended Aug 5) while every step
 --     under it is 'started'; UAT also has one standalone on-demand task per step we need, owned by APP_SERVICE_UAT;
 --     and no role you hold can recreate the DAAS_TEMP work tables. So:
@@ -468,9 +489,14 @@ ORDER BY recreated_on_before DESC;
 --   ROUTE B: the hand-run block further down, under a role holding DOMAIN_TEMP_ADMIN_UAT and STREAM_OWNERS_UAT
 --     (APP_SERVICE_UAT). B2c shows you hold only STREAM_OWNERS_UAT, so it is not open to you.
 
--- B3a. ROUTE A2: the on-demand step tasks, in chain order, from one block. Preflight: no trip job in progress, only
+-- B3a. ROUTE A2: the on-demand step tasks, in chain order, from one block. Most of them call the pipeline wrapper
+--      in its 3-argument form, which runs the step without first checking that the step's stream has rows (the
+--      chain's tasks pass the stream so the wrapper can check); the step's procedure is the same either way, and
+--      this block makes that stream check itself before starting each step. P6 compares UAT's 3-argument wrapper
+--      with PROD's. Preflight: no trip job in progress, only
 --      our rows in the recalc queue, the other streams empty, one suspended on-demand task per step whose
---      definition calls what the chain task calls, and a role in this session that may start each one. Then, step
+--      definition calls the same job (with no stream, or the chain's stream), and a role in this session that may
+--      start each one. Then, step
 --      by step: EXECUTE TASK, wait for that step's batch to finish in the pipeline's batch log (BATCH_S02), check
 --      what it did, go on. It stops at the first problem. If it stops in the preflight nothing has run. If it stops
 --      after a step ran, fix the cause and run the block again with v_start_at set to the step to resume from (the
@@ -588,13 +614,20 @@ BEGIN
                     (7, 'TRIP_NG_REVENUE_SUMMARY',               NULL)),
     tasks AS (
         SELECT "name"::VARCHAR AS task_name, "state"::VARCHAR AS task_state, "definition"::VARCHAR AS task_definition,
+               REPLACE(UPPER("definition"::VARCHAR), ' ', '') AS def_n,
                COALESCE(ARRAY_SIZE("predecessors"), 0) AS predecessor_count
         FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
         WHERE "name" ILIKE '%ONDEMAND%')
+    -- A matching task calls the pipeline wrapper for the job, either in its 3-argument form (no stream argument: the
+    -- wrapper then skips its "does the stream have rows" check and runs the step) or in the 4-argument form with the
+    -- same stream the chain task names. Either way the step's procedure, chosen by job name, is the same.
     SELECT s.step_no, s.job_name, s.stream_name, t.task_name, t.task_state, t.task_definition, t.predecessor_count,
            COUNT(t.task_name) OVER (PARTITION BY s.step_no) AS candidates,
-           (s.stream_name IS NULL
-            OR REPLACE(UPPER(t.task_definition), ' ', '') ILIKE ('%' || s.stream_name || '''%')) AS definition_ok
+           (t.def_n ILIKE ('%BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC(''' || s.job_name || '''%')
+            AND (s.stream_name IS NULL
+                 OR REGEXP_COUNT(t.def_n, ',') = 2
+                 OR t.def_n ILIKE ('%' || s.stream_name || '''%'))) AS definition_ok,
+           (s.stream_name IS NOT NULL AND REGEXP_COUNT(t.def_n, ',') = 2) AS skips_stream_check
     FROM steps s
     LEFT JOIN tasks t ON t.task_definition ILIKE ('%''' || s.job_name || '''%')
     QUALIFY ROW_NUMBER() OVER (PARTITION BY s.step_no ORDER BY t.task_name) = 1;
@@ -616,7 +649,11 @@ BEGIN
     END IF;
     v_txt := (SELECT LISTAGG(step_no || ' ' || task_name, ', ') WITHIN GROUP (ORDER BY step_no)
               FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TASKS WHERE step_no >= :v_start_at);
-    v_log := v_log || 'P4 tasks~|~ok~|~' || v_txt || '#ROW#';
+    v_n := (SELECT COUNT_IF(skips_stream_check) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TASKS WHERE step_no >= :v_start_at);
+    v_log := v_log || 'P4 tasks~|~ok~|~' || v_txt
+                   || IFF(v_n > 0, '. ' || v_n || ' of them call the wrapper without a stream argument, so it skips its stream check;'
+                                   || ' this block checks each stream itself before starting the step', '')
+                   || '#ROW#';
 
     -- P5. Which tasks a role active in this session may start (OPERATE, or ownership). Some but not all: stop, since
     --     starting only some would leave the run half done. None: the first EXECUTE TASK settles it, and fails before
@@ -662,6 +699,33 @@ BEGIN
         v_log := v_log || 'P5 permission~|~' || IFF(v_grants, 'ok~|~this session may start every task',
                                                     'note~|~grants are not visible to this session; the first EXECUTE TASK settles it') || '#ROW#';
     END IF;
+
+    -- P6. The on-demand tasks run the steps through the wrapper's 3-argument version. Is UAT's copy the same as PROD's?
+    --     Information only (B2e lists any differing lines); a failure here does not stop the block.
+    BEGIN
+        v_n := (WITH d AS (
+                    SELECT 'PROD' AS env,
+                           REPLACE(REPLACE(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC(VARCHAR, VARCHAR, VARCHAR)'),
+                                           'VARCHAR(16777216)', 'VARCHAR'), CHR(13), '') AS ddl
+                    UNION ALL
+                    SELECT 'UAT',
+                           REPLACE(REPLACE(GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC(VARCHAR, VARCHAR, VARCHAR)'),
+                                           'VARCHAR(16777216)', 'VARCHAR'), CHR(13), '')),
+                l AS (
+                    SELECT d.env, TRIM(s.value) AS line_text
+                    FROM d, LATERAL SPLIT_TO_TABLE(d.ddl, CHR(10)) s
+                    WHERE TRIM(s.value) <> '')
+                SELECT COUNT(*) FROM (
+                    (SELECT line_text FROM l WHERE env = 'PROD' MINUS SELECT line_text FROM l WHERE env = 'UAT')
+                    UNION ALL
+                    (SELECT line_text FROM l WHERE env = 'UAT' MINUS SELECT line_text FROM l WHERE env = 'PROD')));
+        v_log := v_log || 'P6 wrapper~|~' || IFF(v_n = 0, 'ok~|~the 3-argument wrapper is the same in UAT and PROD (declarations aside)',
+                                                 'note~|~the 3-argument wrapper differs from PROD''s in ' || v_n || ' line(s); B2e lists them') || '#ROW#';
+    EXCEPTION
+        WHEN OTHER THEN
+            v_log := v_log || 'P6 wrapper~|~note~|~could not compare the wrapper with PROD: '
+                           || REPLACE(REPLACE(LEFT(SQLERRM, 200), '#ROW#', ''), '~|~', '') || '#ROW#';
+    END;
 
     ---------------------------------------------------------------- the steps, each started as the task owner
     v_queued := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_QUEUE);
