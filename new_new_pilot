@@ -827,7 +827,9 @@ BEGIN
             v_log := v_log || 'S2 TRIP_MERGE_CHECK~|~ok~|~' || LEFT(v_status, 200) || '; ' || v_n || ' trip ids queued for merging#ROW#';
         ELSEIF (v_job = 'TRIP_MERGE') THEN
             IF (NOT (STARTSWITH(v_status, 'SUCCESS') OR STARTSWITH(v_status, 'Alert'))) THEN
-                v_log := v_log || 'S3 TRIP_MERGE~|~STOP~|~' || LEFT(v_status, 500) || '#ROW#';
+                v_log := v_log || 'S3 TRIP_MERGE~|~STOP~|~' || LEFT(v_status, 500)
+                               || '. Run B3c: if the merge committed and only its closing stream reset failed, run B3d,'
+                               || ' then this block again with v_start_at = 4#ROW#';
                 RAISE pilot_stop;
             END IF;
             v_log := v_log || 'S3 TRIP_MERGE~|~ok~|~' || LEFT(v_status, 200) || '#ROW#';
@@ -869,6 +871,57 @@ EXCEPTION
         RETURN TABLE(res);
 END;
 $$;
+
+-- B3c. (DAAS_TEAM, when a step stops with FAILURE) The pipeline's own error log for that step's batch. Written for
+--      the merge; for another step change the job name in the first query. ERROR_STEP ends in the procedure step that
+--      failed: for the merge, '..._Data_Process' means the merge rolled back, '..._Update_Metrics' means it had
+--      already committed (only what came after it failed).
+SELECT e.*
+FROM DAAS_UAT.DAAS_COMMON.BATCH_ERROR_LOG_S02 e
+WHERE e.batch_id = (SELECT MAX(b.batch_id)
+                    FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+                    JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+                    WHERE j.job_name = 'TRIP_MERGE');
+
+-- B3c (merge). What stayed. TRIP_MERGE_PROC commits the merge, then commits its metrics, and only then, as its last
+--      statement, recreates the merge-check stream (DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM) so the merge's own
+--      changes are not checked for merging again. In UAT that stream belongs to STREAM_OWNERS_UAT, not to the role the
+--      tasks run as, so that last statement is the likely failure. If so this shows: merge_processed > 0,
+--      pilot_masters_written_by_merge > 0, merge_queue_still_waiting 0, merge_check_stream_has_rows TRUE. Then run B3d.
+--      If instead merge_processed is 0 and the queue still holds its rows, the merge rolled back: send B3c's rows.
+WITH mb AS (
+    SELECT MAX(b.batch_id) AS batch_id
+    FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+    JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+    WHERE j.job_name = 'TRIP_MERGE'),
+mm AS (
+    SELECT COUNT(*) AS n, COUNT_IF(m.delete_ind = 'N') AS live
+    FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+    JOIN mb ON m.batch_id = mb.batch_id
+    WHERE m.guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_GUESTS))
+SELECT (SELECT batch_id FROM mb)                                                         AS merge_batch,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_PROCESSED p
+         WHERE p.batch_id = (SELECT batch_id FROM mb))                                   AS merge_processed,
+       (SELECT n FROM mm)                                                                AS pilot_masters_written_by_merge,
+       (SELECT live FROM mm)                                                             AS of_them_live,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM
+         WHERE METADATA$ACTION = 'INSERT')                                               AS merge_queue_still_waiting,
+       SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM')  AS merge_check_stream_has_rows;
+
+-- B3d. (DAAS_TEAM, only after B3c showed the merge committed) Do what the merge's last statement was for: move the
+--      merge-check stream past the merge's own changes. Snowflake documents two ways to move a stream on: recreate it,
+--      or read it in a DML statement. Reading it leaves the stream, its owner and its grants untouched, and here also
+--      keeps the merge's changes in a scratch table for review. Run the three statements in order; expect FALSE in the
+--      last column. Then run B3a again with v_start_at = 4.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_MERGE_CHANGES AS
+SELECT * FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM;
+
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_MERGE_CHANGES
+SELECT * FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM WHERE 0 = 1;
+
+SELECT COUNT(*)                                                                         AS merge_changes_kept,
+       SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM') AS stream_has_rows_expect_false
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_MERGE_CHANGES;
 
 -- ROUTE B only (not open to you, see B3): the session lines, the check, then the hand-run block. Set the role,
 -- warehouse DAAS_UAT_IT_WHSRCTORAW_COMPUTE and DAAS_UAT / DAAS_COMMON in this file's context picker first (the first
@@ -1481,39 +1534,4 @@ ORDER BY 1 DESC, 3 DESC, 2;
 
 -- C7. The three RCA trips: what replaced them, next to the property trips on the same days.
 SELECT q.trip_master_id AS old_trip, q.trip_start_dt AS old_start, q.trip_end_dt AS old_end, q.trip_days AS old_days,
-       n.trip_master_id AS new_trip, n.trip_start_dt AS new_start, n.trip_end_dt AS new_end,
-       DATEDIFF(day, n.trip_start_dt, n.trip_end_dt) + 1 AS new_days,
-       IFF(p.trip_master_id IS NOT NULL, 'yes: ' || p.trip_master_id, 'NO') AS has_property_twin
-FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_QUEUE q
-LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER n
-       ON n.guest_unique_id = q.guest_unique_id AND n.trip_type = 'MARKET' AND n.market_cd = q.market_cd AND n.delete_ind = 'N'
-      AND n.trip_start_dt <= q.trip_end_dt AND n.trip_end_dt >= q.trip_start_dt
-LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER p
-       ON p.guest_unique_id = n.guest_unique_id AND p.trip_type = 'PROPERTY' AND p.delete_ind = 'N'
-      AND p.trip_start_dt = n.trip_start_dt AND p.trip_end_dt = n.trip_end_dt
-WHERE q.trip_master_id IN (2895722234, 2895809361, 2895852622)
-ORDER BY 1, 6;
-
-INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_LOG VALUES ('C_DONE', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'checks run');
-
--- C8. (DAAS_TEAM) Ownership check: the owners of the recreated DAAS_TEMP objects now, against what B2d recorded.
---     No rows: nothing to do. Rows with owner_now APP_SERVICE_UAT after a route-A run: leave them, that is what
---     every UAT chain run does. Any other owner_now (route B under another role): UAT's own tasks may then fail to
---     recreate those objects, so run the GRANT statements printed, as the role shown in owner_now.
---     Run each SHOW, then the SELECT right after it.
-SHOW TABLES IN SCHEMA DAAS_UAT.DAAS_TEMP;
-SELECT o.object_name, o.owner_before, t."owner" AS owner_now, t."created_on" AS recreated_on,
-       'GRANT OWNERSHIP ON TABLE DAAS_UAT.DAAS_TEMP.' || o.object_name || ' TO ROLE ' || o.owner_before
-           || ' COPY CURRENT GRANTS;' AS run_this_as_owner_now
-FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_OWNERS o
-JOIN TABLE(RESULT_SCAN(LAST_QUERY_ID())) t ON t."name" = o.object_name
-WHERE o.object_kind = 'TABLE' AND t."owner" IS DISTINCT FROM o.owner_before
-ORDER BY 1;
-
-SHOW STREAMS LIKE 'TRIP_MASTER_TRIP_MERGE_CHECK_STREAM' IN SCHEMA DAAS_UAT.DAAS_TEMP;
-SELECT o.object_name, o.owner_before, t."owner" AS owner_now, t."created_on" AS recreated_on,
-       'GRANT OWNERSHIP ON STREAM DAAS_UAT.DAAS_TEMP.' || o.object_name || ' TO ROLE ' || o.owner_before
-           || ' COPY CURRENT GRANTS;' AS run_this_as_owner_now
-FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_OWNERS o
-JOIN TABLE(RESULT_SCAN(LAST_QUERY_ID())) t ON t."name" = o.object_name
-WHERE o.object_kind = 'STREAM' AND t."owner" IS DISTINCT FROM o.owner_before;
+       n.trip_master_id AS new_trip, n.trip_start_dt AS new_start,
