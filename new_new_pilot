@@ -1,200 +1,813 @@
+-- DAASI-3641: rehearsal of the comp-worth fix (the "replay" step) in UAT, plus the NG question part 5 left open.
+-- Kept apart from the pilot file and the diagnostics files. Run it top to bottom, one statement at a time; R3 is one block.
+--
+-- Why. Diagnostics part 5 cleared PROD for this step: recalculating PROD's trips today gives what PROD stores (H2), so
+-- the step will move almost nothing on PROD's property trips. What has not run anywhere yet is the step itself. The
+-- rebuilt market trips carry COMP_WORTH = 0 because the comp-worth step values a market trip only from property trips
+-- whose ratings come through the same run (pilot top note, scoreboard row 17). So each rebuilt market trip and its
+-- property twin have to go through one summary and comp-worth run together.
+--
+-- How, the narrow way. Not a REPLAY_COUNTER bump on the source tables: that re-runs the trip-building steps over every
+-- trip holding those transactions (property, market and enterprise), rewrites their end dates and sends them back
+-- through merge check. Instead, for each rebuilt market trip and its property twin, one rating they share is marked in
+-- TRIP_DETAIL, the way the ratings step marks a row during a replay (UPDATED_DTTM, UPDATED_BY, BATCH_ID, LAST_DML_CD 'U';
+-- TRIP_RATING_DOMAIN_PIPELINE_PROC, step 4). The summary step's stream sees the marked rows, and then:
+--   - the summary step re-reads every rating of each marked trip (one marked row is enough: the ratings sub-step reads
+--     the whole trip) and writes its rating figures again. Only the ratings and property-list sub-steps run, and the
+--     summary writes only the columns of the sub-steps that ran, so free play, offers, hotel, POS and markers stay put;
+--   - the comp-worth step values both twins (it takes theo and trip days from TRIP_SUMMARY).
+-- TRIP_MASTER is not touched, so nothing goes back through merge check and no trip changes shape.
+--
+-- The tripwire. UAT's free-play table was re-created on 17 Aug and holds none of these trips' free play (part 4, G1).
+-- If anything here recalculated free play, every property trip with free play would drop to 0. R5 row 12 counts them.
+--
+-- What changes in UAT: 4 bookkeeping columns on 2 TRIP_DETAIL rows per pair (about 8,100 rows), and the rating figures
+-- and comp worth of those trips in TRIP_SUMMARY and DAILY_ACTIVITY_SUMMARY. R1 keeps the before-picture.
+--
+--   R0   the code this runs, UAT against PROD (read-only)
+--   R1   before-picture of the five guests' trips (TRIP_MASTER, TRIP_DETAIL, TRIP_SUMMARY, DAILY_ACTIVITY_SUMMARY)
+--   R2   the pairs to mark, one shared rating each
+--   R3   one block: preflight, the marking, then UAT's on-demand summary and comp-worth tasks (as in the pilot's B3a)
+--   R4   after-picture, and every summary value that changed
+--   R5   scoreboard
+--   R6   TRIP_SUMMARY column by column: twins differing before and after, trips changed
+--   R7   DAILY_ACTIVITY_SUMMARY column by column: rows changed
+--   R8   most-played denomination picks that changed: ties?
+--   N1-N2  the NG question part 5 left open (read-only)
+--   Z1   PROD, read-only: the streams that read TRIP_DETAIL
+--
+-- Roles: DAAS_TEAM with secondary roles on. The marking needs UPDATE on DAAS_UAT.DAAS_CORE.TRIP_DETAIL through one of
+-- your roles; R3 checks that before it changes anything. The two steps run as their task owner, APP_SERVICE_UAT, as in
+-- the pilot. About 30 minutes in all. Screenshots are fine; N2's view text as a .txt, please.
+
 USE ROLE DAAS_TEAM;
 USE SECONDARY ROLES ALL;
 USE SCHEMA DAAS_UAT.DAAS_TEMP_WORK;
 
 
--- H0a. The five pilot guests' live PROD trips: market trips in their market, property trips at their property.
-CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_PROD_TRIPS AS
-SELECT m.trip_master_id, m.guest_unique_id, m.trip_type, m.market_cd, m.property_cd, m.trip_start_dt, m.trip_end_dt
-FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
-JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_GUESTS g ON g.guest_unique_id = m.guest_unique_id
-WHERE m.delete_ind = 'N'
-  AND ((m.trip_type = 'MARKET' AND m.market_cd = g.market_cd) OR (m.trip_type = 'PROPERTY' AND m.property_cd = g.property_cd));
-
--- H0b. Their free-play, offer and rating transactions (reads PROD's TRIP_DETAIL once: several minutes).
-CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_PROD_TD AS
-SELECT d.trip_master_id, d.transaction_type, d.transaction_table_sk, d.business_start_dt, d.delete_ind, d.transaction_sub_type
-FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
-WHERE d.trip_master_id IN (SELECT trip_master_id FROM DAASI_3641_PROD_TRIPS)
-  AND d.transaction_type IN ('FREEPLAY', 'OFFER', 'RATINGS');
-
-SELECT (SELECT COUNT(*) FROM DAASI_3641_PROD_TRIPS) AS prod_trips, (SELECT COUNT(*) FROM DAASI_3641_PROD_TD) AS prod_detail_rows;
-
-
--- H1. Every distinct free-play, offer and rating transaction on those PROD trips, by year, and how many the summary's
---     lookup finds in PROD today: COMP_FREE_PLAY_DETAIL_FACT for free play, the view OFFER_LEDGER_FACT_TRIP_VW for
---     offers (the same view text in UAT and PROD, per G6), RATINGS_FACT for ratings. Ratings also check the guest.
---     Expect 100% everywhere. A gap in older years would mean a PROD rebuild or replay loses those old figures.
-WITH t AS (SELECT trip_master_id, guest_unique_id FROM DAASI_3641_PROD_TRIPS),
-td AS (
-    SELECT DISTINCT d.transaction_type, d.transaction_table_sk AS sk, YEAR(d.business_start_dt) AS yr, t.guest_unique_id AS guest
-    FROM DAASI_3641_PROD_TD d
-    JOIN t ON t.trip_master_id = d.trip_master_id
-    WHERE d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
-),
-fp AS (SELECT DISTINCT comp_free_play_detail_fact_sk AS sk FROM DAAS_PROD.DAAS_CORE.COMP_FREE_PLAY_DETAIL_FACT
-       WHERE comp_free_play_detail_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'FREEPLAY')),
-ov AS (SELECT DISTINCT offer_ledger_fact_sk AS sk FROM DAAS_PROD.DAAS_CORE_MARKETING_VW.OFFER_LEDGER_FACT_TRIP_VW
-       WHERE offer_ledger_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'OFFER')),
-rf AS (SELECT ratings_fact_sk AS sk, guest_unique_id AS guest FROM DAAS_PROD.DAAS_CORE.RATINGS_FACT
-       WHERE ratings_fact_sk IN (SELECT sk FROM td WHERE transaction_type = 'RATINGS')
-       QUALIFY ROW_NUMBER() OVER (PARTITION BY ratings_fact_sk ORDER BY guest_unique_id) = 1)
-SELECT td.transaction_type,
-       td.yr                                                AS activity_year,
-       COUNT(*)                                             AS transactions,
-       COUNT_IF(COALESCE(fp.sk, ov.sk, rf.sk) IS NOT NULL)  AS found_where_the_summary_looks,
-       IFF(td.transaction_type = 'RATINGS', COUNT_IF(rf.guest = td.guest), NULL) AS ratings_same_guest
-FROM td
-LEFT JOIN fp ON td.transaction_type = 'FREEPLAY' AND fp.sk = td.sk
-LEFT JOIN ov ON td.transaction_type = 'OFFER'    AND ov.sk = td.sk
-LEFT JOIN rf ON td.transaction_type = 'RATINGS'  AND rf.sk = td.sk
-GROUP BY 1, 2
-ORDER BY 1, 2;
-
-
--- H2. PROD's stored figures against the same figures recomputed today with the summary steps' own lookups (as G2
---     did in UAT), for the five guests' live PROD trips that have a summary row, by trip type. Comp worth is
---     recomputed the way TRIP_COMP_WORTH_LOAD_PROC values a property trip: theo by game type x the multiplier band
---     for that theo (DAAS_COMMON.CMPCW_REFINED) / trip days. Expect stored_equals_today on (nearly) every trip: then
---     a replay leaves PROD's property figures as they are, and the rebuilt market trips will match them.
-WITH t AS (SELECT * FROM DAASI_3641_PROD_TRIPS),
-ts AS (
-    SELECT s.*
-    FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY s
-    WHERE s.trip_master_id IN (SELECT trip_master_id FROM t)
-),
-td AS (SELECT * FROM DAASI_3641_PROD_TD),
-fp AS (
-    SELECT td.trip_master_id, COALESCE(ABS(SUM(IFF(td.delete_ind = 'N', f.free_play_points, NULL))), 0) AS v
-    FROM td
-    JOIN DAAS_PROD.DAAS_CORE.COMP_FREE_PLAY_DETAIL_FACT f ON f.comp_free_play_detail_fact_sk = td.transaction_table_sk
-    WHERE td.transaction_type = 'FREEPLAY'
-    GROUP BY 1
-),
-ofr AS (
-    SELECT td.trip_master_id,
-           COUNT(DISTINCT IFF(td.delete_ind = 'N', o.offer_id, NULL)) AS nbr_offers,
-           SUM(CASE WHEN td.delete_ind = 'N' AND o.coupon_type = '0A' AND SUBSTRING(o.coupon_id, 1, 1) NOT IN ('V', 'Z', 'W', 'X')
-                     AND o.coupon_id NOT IN ('GR', 'GS', 'BJ', 'BA', 'BB', 'BC', 'BD', 'BE', 'BF') THEN o.redeem_amt_cost_adjusted ELSE 0 END)
-         + SUM(CASE WHEN td.delete_ind = 'N' AND o.coupon_type = '0H' THEN o.redeem_amt_cost_adjusted ELSE 0 END)
-         + SUM(CASE WHEN td.delete_ind = 'N' AND o.coupon_type NOT IN ('0H', '0A') THEN o.redeem_amt_cost_adjusted ELSE 0 END)
-         + SUM(CASE WHEN td.delete_ind = 'N' AND ((o.coupon_type = '0A' AND (SUBSTRING(o.coupon_id, 1, 1) IN ('V', 'Z', 'W', 'X')
-                     OR o.coupon_id IN ('GR', 'GS', 'BJ', 'BA', 'BB', 'BC', 'BD', 'BE', 'BF')))
-                     OR (o.coupon_type = '0L' AND o.coupon_id = 'FP')) THEN o.redeem_amt_cost_adjusted ELSE 0 END) AS total_cost
-    FROM td
-    JOIN DAAS_PROD.DAAS_CORE_MARKETING_VW.OFFER_LEDGER_FACT_TRIP_VW o ON o.offer_ledger_fact_sk = td.transaction_table_sk
-    WHERE td.transaction_type = 'OFFER'
-    GROUP BY 1
-),
-rated AS (   -- the comp-worth step values property trips that have live ratings
-    SELECT DISTINCT trip_master_id FROM td WHERE transaction_type = 'RATINGS' AND delete_ind = 'N'
-),
-band AS (
-    SELECT s.trip_master_id, m.cmp_pct_mult_type AS gt, MAX(m.pct_mult) AS mult
-    FROM ts s
-    JOIN t ON t.trip_master_id = s.trip_master_id AND t.trip_type = 'PROPERTY'
-    JOIN DAAS_PROD.DAAS_COMMON.CMPCW_REFINED m
-      ON m.property_cd = t.property_cd
-     AND ((m.cmp_pct_mult_type = 'S' AND ROUND(s.slot_theo_win_amt)  BETWEEN m.from_theo AND m.to_theo)
-       OR (m.cmp_pct_mult_type = 'T' AND ROUND(s.table_theo_win_amt) BETWEEN m.from_theo AND m.to_theo)
-       OR (m.cmp_pct_mult_type = 'O' AND ROUND(s.other_theo_win_amt) BETWEEN m.from_theo AND m.to_theo))
+-- R0. The procedures this rehearsal runs, UAT against PROD, from the definitions the readiness files collected
+--     (DAASI_3641_PROC_DDL). Expect 'same' for the comp-worth step and the ratings and property-list sub-steps, so what
+--     happens here is what PROD's hourly run will do. The summary wrapper differs (readiness E5b: UAT carries an extra
+--     branch for its older CMP_PCT_MULT column); it ran the pilot's step 5 without trouble.
+WITH d AS (
+    SELECT procedure_name, argument_signature,
+           MAX(IFF(env = 'DAAS_PROD', ddl, NULL)) AS pd,
+           MAX(IFF(env = 'DAAS_UAT',  ddl, NULL)) AS ud
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PROC_DDL
+    WHERE procedure_name IN ('TRIP_COMP_WORTH_LOAD_PROC', 'TRIP_RATING_SUMMARY_LOAD_PROC', 'TRIP_SUMMARY_PROPERTY_LIST_LOAD_PROC',
+                             'TRIP_SUMMARY_WRAPPER_PROC', 'TRIP_NG_REVENUE_SUMMARY_LOAD_PROC')
     GROUP BY 1, 2
-),
-cw AS (
-    SELECT s.trip_master_id,
-           (COALESCE(s.slot_theo_win_amt, 0)  * COALESCE(MAX(IFF(b.gt = 'S', b.mult, NULL)), 0)) / NULLIF(s.trip_days, 0)
-         + (COALESCE(s.table_theo_win_amt, 0) * COALESCE(MAX(IFF(b.gt = 'T', b.mult, NULL)), 0)) / NULLIF(s.trip_days, 0)
-         + (COALESCE(s.other_theo_win_amt, 0) * COALESCE(MAX(IFF(b.gt = 'O', b.mult, NULL)), 0)) / NULLIF(s.trip_days, 0) AS v
-    FROM ts s
-    JOIN t ON t.trip_master_id = s.trip_master_id AND t.trip_type = 'PROPERTY'
-    JOIN rated r ON r.trip_master_id = s.trip_master_id
-    LEFT JOIN band b ON b.trip_master_id = s.trip_master_id
-    GROUP BY s.trip_master_id, s.slot_theo_win_amt, s.table_theo_win_amt, s.other_theo_win_amt, s.trip_days
-),
-cmp AS (
-    SELECT t.trip_type, 'free play points (DLC_FSP_POINT_AMT)' AS measure,
-           COALESCE(fp.v, 0) AS today, COALESCE(s.dlc_fsp_point_amt, 0) AS stored
-    FROM t JOIN ts s ON s.trip_master_id = t.trip_master_id
-    LEFT JOIN fp ON fp.trip_master_id = t.trip_master_id
-    UNION ALL
-    SELECT t.trip_type, 'offers (OFFER_NBR_OFFERS)', COALESCE(o.nbr_offers, 0), COALESCE(s.offer_nbr_offers, 0)
-    FROM t JOIN ts s ON s.trip_master_id = t.trip_master_id
-    LEFT JOIN ofr o ON o.trip_master_id = t.trip_master_id
-    UNION ALL
-    SELECT t.trip_type, 'offer cost (OFFER_TOTAL_COST)', COALESCE(o.total_cost, 0), COALESCE(s.offer_total_cost, 0)
-    FROM t JOIN ts s ON s.trip_master_id = t.trip_master_id
-    LEFT JOIN ofr o ON o.trip_master_id = t.trip_master_id
-    UNION ALL
-    SELECT t.trip_type, 'comp worth (property trips with ratings)', c.v, COALESCE(s.comp_worth, 0)
-    FROM t JOIN ts s ON s.trip_master_id = t.trip_master_id
-    JOIN cw c ON c.trip_master_id = t.trip_master_id
 )
-SELECT measure,
-       trip_type,
-       COUNT(*)                                          AS trips_with_summary_row,
-       COUNT_IF(ROUND(today, 2) = ROUND(stored, 2))      AS stored_equals_today,
-       ROUND(SUM(stored), 2)                             AS stored_total,
-       ROUND(SUM(today), 2)                              AS today_total
-FROM cmp
-GROUP BY 1, 2
+SELECT procedure_name, argument_signature, LENGTH(pd) AS prod_chars, LENGTH(ud) AS uat_chars,
+       CASE WHEN pd IS NULL OR ud IS NULL THEN 'not collected in both'
+            WHEN REGEXP_REPLACE(REPLACE(REPLACE(UPPER(pd), 'VARCHAR(16777216)', 'VARCHAR'), 'DAAS_PROD', 'DAAS_X'), '\\s+', ' ')
+               = REGEXP_REPLACE(REPLACE(REPLACE(UPPER(ud), 'VARCHAR(16777216)', 'VARCHAR'), 'DAAS_UAT',  'DAAS_X'), '\\s+', ' ')
+            THEN 'same'
+            ELSE 'DIFFERENT' END AS verdict
+FROM d
 ORDER BY 1, 2;
 
 
--- H3. UAT: the 6 pairs whose most-played denomination differs. The summary picks the denomination with the most
---     ratings on the trip, then the latest day; when two denominations tie on both, the pick is arbitrary. For each
---     side of each pair: the stored pick, then today's top three denominations with their rating counts and last day
---     (counted the way the code counts them). Two rows tied at the top explain the difference.
+-- R1. Before-picture, taken now: every TRIP_MASTER row of the five guests in their market and at their property (live
+--     or not), every TRIP_DETAIL row of those masters, and their TRIP_SUMMARY and DAILY_ACTIVITY_SUMMARY rows. Same
+--     shape as the pilot's C1. The TRIP_DETAIL statement reads the whole table once: a few minutes.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_BEFORE AS
+SELECT m.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_GUESTS g ON g.guest_unique_id = m.guest_unique_id
+WHERE (m.trip_type = 'MARKET'   AND m.market_cd   = g.market_cd)
+   OR (m.trip_type = 'PROPERTY' AND m.property_cd = g.property_cd);
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TD_BEFORE AS
+SELECT d.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL d
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_BEFORE t ON t.trip_master_id = d.trip_master_id;
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_BEFORE AS
+SELECT s.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY s
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_BEFORE t ON t.trip_master_id = s.trip_master_id;
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_BEFORE AS
+SELECT s.*
+FROM DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY s
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_BEFORE t ON t.trip_master_id = s.trip_master_id;
+
+-- R1b. The summary columns this run may rewrite: the ratings sub-step's own column list (the list its code hands the
+--      summary, TRIP_RATING_SUMMARY_LOAD_PROC), the property list, comp worth, and the two the summary sets on every run.
+--      R5-R7 call any other changed column a LOOK.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_REFRESHED_COLS AS
+SELECT TRIM(s.value)::VARCHAR AS col, 'ratings step'::VARCHAR AS refreshed_by
+FROM TABLE(SPLIT_TO_TABLE('SLOT_TIME_PLAYED_IN_MIN,TABLE_TIME_PLAYED_IN_MIN,OTHER_TIME_PLAYED_IN_MIN,TOTAL_TIME_PLAYED_IN_MIN,'
+    || 'TABLE_BUY_IN_AMT,SLOT_COIN_IN_AMT,SLOT_COIN_OUT_AMT,TABLE_CASH_IN_AMT,SLOT_BILLS_IN_AMT,OTHER_CASH_IN_AMT,TABLE_COIN_OUT_AMT,'
+    || 'OTHER_COIN_IN_AMT,OTHER_COIN_OUT_AMT,TOTAL_COIN_IN_AMT,TOTAL_COIN_OUT_AMT,SLOT_JACKPOT_AMT,OTHER_JACKPOT_AMT,TOTAL_JACKPOT_AMT,'
+    || 'SLOT_WIN_LOSS_AMT,TABLE_WIN_LOSS_AMT,OTHER_WIN_LOSS_AMT,TOTAL_WIN_LOSS_AMT,SLOT_THEO_WIN_AMT,TABLE_THEO_WIN_AMT,'
+    || 'OTHER_THEO_WIN_AMT,TOTAL_THEO_WIN_AMT,SLOT_POINTS_EARNED_AMT,TABLE_POINTS_EARNED_AMT,OTHER_POINTS_EARNED_AMT,'
+    || 'TOTAL_POINTS_EARNED_AMT,MOST_PLAYED_DENOM_AMT,SLOT_HANDLE_PULLS,OTHER_HANDLE_PULLS,TOTAL_HANDLE_PULLS,'
+    || 'TABLE_TOTAL_HANDS_PLAYED,SLOT_COUPON_USED,TABLE_COUPON_USED,OTHER_COUPON_USED,TOTAL_COUPON_USED,SLOT_PROMO_CASHLESS,'
+    || 'TABLE_PROMO_CASHLESS,OTHER_PROMO_CASHLESS,TOTAL_PROMO_CASHLESS,NBR_PLAY_DAYS,NBR_NONPLAY_DAYS,GAMING_FLG', ',')) s
+UNION ALL SELECT 'PROPERTY_LST', 'property-list step'
+UNION ALL SELECT 'COMP_WORTH',   'comp-worth step'
+UNION ALL SELECT 'TRIP_DAYS',    'every summary run'
+UNION ALL SELECT 'DELETE_IND',   'every summary run';
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_MARKS (mark VARCHAR, value NUMBER(38,0));
+
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_LOG
+SELECT 'R1_BEFORE', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_BEFORE) || ' masters, ' ||
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TD_BEFORE) || ' details, ' ||
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_BEFORE) || ' summary rows snapshotted';
+
+
+-- R2. The pairs: every live rebuilt market trip (built by the pilot) with a property twin (same guest, same dates),
+--     both with a summary row, and one live rating they share. The rating is picked among those held by exactly these
+--     two trips, so no third trip comes through the run with it; R2b counts any pair that had no such rating.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS AS
 WITH mark AS (
     SELECT value AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_MARKS WHERE mark = 'max_trip_master_id_before'
 ),
-tma AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TM_AFTER),
-ts AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TS_AFTER),
-pairs AS (
-    SELECT mk.trip_master_id AS m_id, pr.trip_master_id AS p_id
-    FROM tma mk
-    JOIN tma pr
-      ON pr.guest_unique_id = mk.guest_unique_id AND pr.trip_type = 'PROPERTY' AND pr.delete_ind = 'N'
+tm AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_BEFORE WHERE delete_ind = 'N'),
+ts AS (SELECT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_BEFORE),
+twin AS (
+    SELECT mk.trip_master_id AS market_trip_id, pr.trip_master_id AS property_trip_id,
+           mk.guest_unique_id, mk.market_cd, mk.trip_start_dt, mk.trip_end_dt
+    FROM tm mk
+    JOIN tm pr
+      ON pr.guest_unique_id = mk.guest_unique_id AND pr.trip_type = 'PROPERTY'
      AND pr.property_cd = DECODE(mk.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
      AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt
-    WHERE mk.trip_type = 'MARKET' AND mk.delete_ind = 'N' AND mk.trip_master_id > (SELECT max_tm FROM mark)
+    WHERE mk.trip_type = 'MARKET' AND mk.trip_master_id > (SELECT max_tm FROM mark)
       AND mk.trip_master_id IN (SELECT trip_master_id FROM ts)
       AND pr.trip_master_id IN (SELECT trip_master_id FROM ts)
     QUALIFY ROW_NUMBER() OVER (PARTITION BY mk.trip_master_id ORDER BY pr.trip_master_id) = 1
 ),
-diff AS (
-    SELECT x.m_id, x.p_id, sm.most_played_denom_amt AS m_denom, sp.most_played_denom_amt AS p_denom
-    FROM pairs x
-    JOIN ts sm ON sm.trip_master_id = x.m_id
-    JOIN ts sp ON sp.trip_master_id = x.p_id
-    WHERE NOT EQUAL_NULL(sm.most_played_denom_amt, sp.most_played_denom_amt)
+r AS (
+    SELECT DISTINCT d.trip_master_id, d.transaction_table_sk AS sk
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TD_BEFORE d
+    JOIN tm ON tm.trip_master_id = d.trip_master_id
+    WHERE d.transaction_type = 'RATINGS' AND d.delete_ind = 'N'
 ),
-sides AS (
-    SELECT m_id AS pair_market_trip, 'market' AS side, m_id AS trip_master_id, m_denom AS stored_pick FROM diff
+holders AS (
+    SELECT r.sk,
+           COUNT(DISTINCT IFF(tm.trip_type = 'MARKET',   r.trip_master_id, NULL)) AS market_trips,
+           COUNT(DISTINCT IFF(tm.trip_type = 'PROPERTY', r.trip_master_id, NULL)) AS property_trips
+    FROM r JOIN tm ON tm.trip_master_id = r.trip_master_id
+    GROUP BY 1
+),
+shared AS (
+    SELECT t.*, rm.sk, (h.market_trips = 1 AND h.property_trips = 1) AS on_these_two_only
+    FROM twin t
+    JOIN r rm ON rm.trip_master_id = t.market_trip_id
+    JOIN r rp ON rp.trip_master_id = t.property_trip_id AND rp.sk = rm.sk
+    JOIN holders h ON h.sk = rm.sk
+)
+SELECT market_trip_id, property_trip_id, guest_unique_id, market_cd, trip_start_dt, trip_end_dt,
+       sk AS rating_sk, on_these_two_only AS rating_on_these_two_only
+FROM shared
+QUALIFY ROW_NUMBER() OVER (PARTITION BY market_trip_id ORDER BY on_these_two_only DESC, sk) = 1;
+
+-- R2b. What R3 will mark. Part 4 found 4,081 twin pairs with both summary rows, 18 of them trips with no ratings at all
+--      (comp worth is a ratings figure, so 0 is right for those). Expect pairs_to_mark near 4,063, rows_to_mark twice
+--      that, rating_elsewhere_too 0.
+WITH mark AS (
+    SELECT value AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_MARKS WHERE mark = 'max_trip_master_id_before'
+),
+tm AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_BEFORE WHERE delete_ind = 'N'),
+ts AS (SELECT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_BEFORE),
+twin AS (
+    SELECT mk.trip_master_id AS market_trip_id, pr.trip_master_id AS property_trip_id
+    FROM tm mk
+    JOIN tm pr
+      ON pr.guest_unique_id = mk.guest_unique_id AND pr.trip_type = 'PROPERTY'
+     AND pr.property_cd = DECODE(mk.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
+     AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt
+    WHERE mk.trip_type = 'MARKET' AND mk.trip_master_id > (SELECT max_tm FROM mark)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY mk.trip_master_id ORDER BY pr.trip_master_id) = 1
+),
+c AS (
+    SELECT (SELECT COUNT(*) FROM tm WHERE trip_type = 'MARKET' AND trip_master_id > (SELECT max_tm FROM mark)) AS rebuilt_market_trips,
+           (SELECT COUNT(*) FROM twin)                                                                        AS with_property_twin,
+           (SELECT COUNT(*) FROM twin WHERE market_trip_id IN (SELECT trip_master_id FROM ts)
+                                        AND property_trip_id IN (SELECT trip_master_id FROM ts))              AS both_with_summary_row,
+           (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS)                                AS pairs_to_mark,
+           (SELECT COUNT_IF(NOT rating_on_these_two_only) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS)  AS rating_elsewhere_too
+)
+SELECT rebuilt_market_trips, with_property_twin, both_with_summary_row, pairs_to_mark,
+       both_with_summary_row - pairs_to_mark AS pairs_without_a_shared_rating,
+       2 * pairs_to_mark                     AS rows_to_mark,
+       rating_elsewhere_too                  AS rating_elsewhere_too_expect_0
+FROM c;
+
+
+-- R3. The run, one block. Preflight (changes nothing): no trip job in progress, the pairs still live, the summary
+--     step's stream a standard one (an append-only stream would not show updated rows), current, and empty, the
+--     daily-summary stream empty, one suspended on-demand task each for the summary and comp-worth steps, and UPDATE
+--     on TRIP_DETAIL. Then it marks the rows, checks the summary stream shows exactly them, and starts the two tasks
+--     in turn, waiting for each to finish in the pipeline's batch log (BATCH_S02), as the pilot's B3a did. It stops at
+--     the first problem and says what to do. A stop before the marking has changed nothing. The NG step is not
+--     started: it reads hotel and POS rows only, and none are marked.
+--     Resuming after a stop: v_start_at = 5 when the marked rows are still waiting in the summary stream (the step-5
+--     run failed or never started), 6 when step 5 succeeded and only comp worth is left.
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_start_at INTEGER DEFAULT 0;      -- 0: a fresh run (mark, then steps 5 and 6); 5 or 6: resume (see above)
+    v_max_wait INTEGER DEFAULT 5400;   -- longest wait for one step, in seconds (90 minutes)
+    v_log      VARCHAR DEFAULT '';
+    v_txt      VARCHAR;
+    v_job      VARCHAR;
+    v_task     VARCHAR;
+    v_cmd      VARCHAR;
+    v_wait     VARCHAR;
+    v_status   VARCHAR;
+    v_mode     VARCHAR;
+    v_stale    VARCHAR;
+    v_has      BOOLEAN;
+    v_pairs    INTEGER;
+    v_marked   INTEGER;
+    v_n        INTEGER;
+    v_m        INTEGER;
+    v_step     INTEGER;
+    v_waited   INTEGER;
+    v_mark     NUMBER(38,0);
+    v_batch    NUMBER(38,0);
+    res        RESULTSET;
+    reh_stop   EXCEPTION (-20642, 'DAASI-3641 rehearsal stopped, see the rows');
+BEGIN
+    ---------------------------------------------------------------- preflight: nothing here changes anything
+    -- P0. No trip job under way.
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+            JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+            WHERE j.job_name LIKE 'TRIP%' AND b.batch_status = 'IN PROGRESS'
+              AND b.batch_start_date >= DATEADD(hour, -6, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ));
+    IF (v_n > 0) THEN
+        v_log := v_log || 'P0 runs~|~STOP~|~' || v_n || ' trip job(s) show IN PROGRESS in the last 6 hours: let them finish, then run this again#ROW#';
+        RAISE reh_stop;
+    END IF;
+    v_log := v_log || 'P0 runs~|~ok~|~no trip job in progress#ROW#';
+
+    -- P1. The session, for the record: the steps themselves run as the task owner.
+    v_txt := (SELECT COALESCE(TRY_PARSE_JSON(CURRENT_SECONDARY_ROLES()):roles::VARCHAR, ''));
+    v_log := v_log || 'P1 session~|~ok~|~role ' || CURRENT_ROLE()
+                   || IFF(v_txt = '', ', no secondary roles', ', secondary roles ' || v_txt)
+                   || ', warehouse ' || COALESCE(CURRENT_WAREHOUSE(), '(none)') || '#ROW#';
+
+    -- P2. The pairs from R2, both trips still live.
+    v_pairs := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS);
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS p
+            JOIN DAAS_UAT.DAAS_CORE.TRIP_MASTER mk ON mk.trip_master_id = p.market_trip_id   AND mk.delete_ind = 'N'
+            JOIN DAAS_UAT.DAAS_CORE.TRIP_MASTER pr ON pr.trip_master_id = p.property_trip_id AND pr.delete_ind = 'N');
+    IF (v_pairs = 0) THEN
+        v_log := v_log || 'P2 pairs~|~STOP~|~R2 found no pairs to mark: send R2b#ROW#';
+        RAISE reh_stop;
+    END IF;
+    IF (v_n < v_pairs) THEN
+        v_log := v_log || 'P2 pairs~|~STOP~|~' || (v_pairs - v_n) || ' of ' || v_pairs || ' pairs have a trip that is no longer live: run R1 and R2 again#ROW#';
+        RAISE reh_stop;
+    END IF;
+    v_log := v_log || 'P2 pairs~|~ok~|~' || v_pairs || ' pairs, every trip live#ROW#';
+
+    -- P3. The summary step's stream: what kind, whether current, what it holds. And the daily-summary stream.
+    SHOW STREAMS LIKE 'TRIP_DETAIL_SUMMARY_STREAM' IN SCHEMA DAAS_UAT.DAAS_CORE;
+    SELECT COUNT(*), MAX("mode"::VARCHAR), MAX("stale"::VARCHAR) INTO :v_n, :v_mode, :v_stale
+      FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    IF (v_n = 0) THEN
+        v_log := v_log || 'P3 summary stream~|~STOP~|~this session cannot see DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM#ROW#';
+        RAISE reh_stop;
+    END IF;
+    IF (UPPER(v_mode) <> 'DEFAULT') THEN
+        v_log := v_log || 'P3 summary stream~|~STOP~|~the summary stream is ' || v_mode || ', so it does not show updated rows and '
+                       || 'marking cannot reach the summary. Nothing was changed. Send this row#ROW#';
+        RAISE reh_stop;
+    END IF;
+    IF (LOWER(v_stale) = 'true') THEN
+        v_log := v_log || 'P3 summary stream~|~STOP~|~the summary stream is stale (unread for too long); DevOps must recreate it first#ROW#';
+        RAISE reh_stop;
+    END IF;
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM WHERE METADATA$ACTION = 'INSERT');
+    v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM
+            WHERE METADATA$ACTION = 'INSERT' AND batch_id = -3641 AND updated_by = 'DAASI-3641 rehearsal');
+    IF (v_start_at = 0 AND v_n > 0) THEN
+        v_log := v_log || 'P3 summary stream~|~STOP~|~it already holds ' || v_n || ' changed detail rows (' || v_m || ' of them ours), which '
+                       || 'would be summarised with ours. Ours from an earlier try: run again with v_start_at = 5. Otherwise send R3x#ROW#';
+        RAISE reh_stop;
+    END IF;
+    IF (v_start_at = 5 AND (v_m = 0 OR v_n > v_m)) THEN
+        v_log := v_log || 'P3 summary stream~|~STOP~|~resuming at step 5 needs our marked rows, and only those, waiting in the stream: '
+                       || v_m || ' ours, ' || (v_n - v_m) || ' others. Send R3x#ROW#';
+        RAISE reh_stop;
+    END IF;
+    v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM'));
+    IF (v_has AND v_start_at <= 5) THEN
+        v_log := v_log || 'P3 daily-summary stream~|~STOP~|~it holds TRIP_MASTER changes the summary step would apply to daily rows with ours. Send this row#ROW#';
+        RAISE reh_stop;
+    END IF;
+    v_log := v_log || 'P3 streams~|~ok~|~summary stream ' || v_mode || ', current, '
+                   || IFF(v_start_at = 0, 'empty', v_m || ' marked rows waiting') || '; daily-summary stream empty#ROW#';
+
+    -- P4. One suspended, standalone on-demand task each for the two steps, calling the same job as the chain task (the
+    --     pilot's B3a lookup).
+    SHOW TASKS IN SCHEMA DAAS_UAT.DAAS_COMMON;
+    CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TASKS AS
+    WITH steps AS (
+        SELECT column1 AS step_no, column2 AS job_name, column3 AS stream_name
+        FROM VALUES (5, 'TRIP_SUMMARY_WRAPPER', 'DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'),
+                    (6, 'TRIP_COMP_WORTH',      NULL)),
+    tasks AS (
+        SELECT "name"::VARCHAR AS task_name, "state"::VARCHAR AS task_state, "definition"::VARCHAR AS task_definition,
+               REPLACE(UPPER("definition"::VARCHAR), ' ', '') AS def_n,
+               COALESCE(ARRAY_SIZE("predecessors"), 0) AS predecessor_count
+        FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+        WHERE "name" ILIKE '%ONDEMAND%')
+    SELECT s.step_no, s.job_name, s.stream_name, t.task_name, t.task_state, t.task_definition, t.predecessor_count,
+           COUNT(t.task_name) OVER (PARTITION BY s.step_no) AS candidates,
+           (t.def_n ILIKE ('%BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC(''' || s.job_name || '''%')
+            AND (s.stream_name IS NULL
+                 OR REGEXP_COUNT(t.def_n, ',') = 2
+                 OR t.def_n ILIKE ('%' || s.stream_name || '''%'))) AS definition_ok
+    FROM steps s
+    LEFT JOIN tasks t ON t.task_definition ILIKE ('%''' || s.job_name || '''%')
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY s.step_no ORDER BY t.task_name) = 1;
+
+    v_txt := (SELECT COALESCE(LISTAGG('step ' || step_no || ' ' || job_name || ': '
+                                      || CASE WHEN task_name IS NULL THEN 'no on-demand task calls this job'
+                                              WHEN candidates > 1 THEN candidates || ' on-demand tasks call this job'
+                                              WHEN predecessor_count > 0 THEN task_name || ' runs after another task'
+                                              WHEN NOT definition_ok THEN task_name || ' calls something else: ' || task_definition
+                                              ELSE task_name || ' is ' || task_state || ', so it runs on its own schedule'
+                                         END, '; ') WITHIN GROUP (ORDER BY step_no), '')
+              FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TASKS
+              WHERE step_no >= :v_start_at
+                AND (task_name IS NULL OR candidates > 1 OR predecessor_count > 0 OR NOT definition_ok
+                     OR task_state <> 'suspended'));
+    IF (v_txt <> '') THEN
+        v_log := v_log || 'P4 tasks~|~STOP~|~' || REPLACE(REPLACE(v_txt, '#ROW#', ''), '~|~', '') || '#ROW#';
+        RAISE reh_stop;
+    END IF;
+    v_txt := (SELECT LISTAGG(step_no || ' ' || task_name, ', ') WITHIN GROUP (ORDER BY step_no)
+              FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TASKS WHERE step_no >= :v_start_at);
+    v_log := v_log || 'P4 tasks~|~ok~|~' || v_txt || '#ROW#';
+
+    -- P5. May this session mark rows? An UPDATE that matches nothing answers it.
+    IF (v_start_at = 0) THEN
+        BEGIN
+            UPDATE DAAS_UAT.DAAS_CORE.TRIP_DETAIL SET last_dml_cd = last_dml_cd WHERE 1 = 0;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || 'P5 permission~|~STOP~|~this session may not update DAAS_UAT.DAAS_CORE.TRIP_DETAIL: '
+                               || REPLACE(REPLACE(LEFT(SQLERRM, 200), '#ROW#', ''), '~|~', '')
+                               || '. Nothing was changed. The ask for DevOps: run R3 as it stands, or grant UPDATE on that table to a role you hold#ROW#';
+                RAISE reh_stop;
+        END;
+        v_log := v_log || 'P5 permission~|~ok~|~this session may update TRIP_DETAIL#ROW#';
+    END IF;
+
+    ---------------------------------------------------------------- the marking
+    IF (v_start_at = 0) THEN
+        UPDATE DAAS_UAT.DAAS_CORE.TRIP_DETAIL d
+           SET updated_dttm = CURRENT_TIMESTAMP(),
+               updated_by   = 'DAASI-3641 rehearsal',
+               batch_id     = -3641,
+               last_dml_cd  = 'U'
+          FROM (SELECT DISTINCT trip_master_id, rating_sk
+                FROM (SELECT market_trip_id AS trip_master_id, rating_sk FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS
+                      UNION ALL
+                      SELECT property_trip_id, rating_sk FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS)) x
+         WHERE d.trip_master_id = x.trip_master_id
+           AND d.transaction_table_sk = x.rating_sk
+           AND d.transaction_type = 'RATINGS'
+           AND d.delete_ind = 'N';
+        v_marked := SQLROWCOUNT;
+        v_txt := v_marked || ' TRIP_DETAIL rows marked for ' || v_pairs || ' pairs';
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_LOG VALUES ('R3_MARKED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_txt);
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM WHERE METADATA$ACTION = 'INSERT');
+        v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM
+                WHERE METADATA$ACTION = 'INSERT' AND batch_id = -3641 AND updated_by = 'DAASI-3641 rehearsal');
+        IF (v_m = 0) THEN
+            v_log := v_log || 'T marking~|~STOP~|~' || v_marked || ' rows marked, but the summary stream shows none of them, so no step '
+                           || 'was started. The marks changed bookkeeping columns only. Send this row#ROW#';
+            RAISE reh_stop;
+        END IF;
+        IF (v_n <> v_m) THEN
+            v_log := v_log || 'T marking~|~STOP~|~the summary stream shows our ' || v_m || ' rows plus ' || (v_n - v_m)
+                           || ' others that arrived meanwhile; no step was started. Send R3x#ROW#';
+            RAISE reh_stop;
+        END IF;
+        v_log := v_log || 'T marking~|~' || IFF(v_marked = 2 * v_pairs, 'ok', 'note') || '~|~' || v_marked || ' rows marked ('
+                       || (2 * v_pairs) || ' expected); the summary stream shows ' || v_m || ' of them and nothing else#ROW#';
+    END IF;
+
+    ---------------------------------------------------------------- the steps, each started as the task owner
+    LET rs_plan RESULTSET := (SELECT step_no, job_name, task_name FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TASKS
+                              WHERE step_no >= :v_start_at ORDER BY step_no);
+    LET c_plan CURSOR FOR rs_plan;
+    FOR r IN c_plan DO
+        v_step := r.step_no;
+        v_job  := r.job_name;
+        v_task := r.task_name;
+
+        v_mark := (SELECT COALESCE(MAX(batch_id), 0) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02);
+        BEGIN
+            v_cmd := 'EXECUTE TASK DAAS_UAT.DAAS_COMMON.' || v_task;
+            EXECUTE IMMEDIATE v_cmd;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~could not start ' || v_task || ': '
+                               || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '') || '#ROW#';
+                RAISE reh_stop;
+        END;
+
+        v_waited := 0;
+        v_status := NULL;
+        WHILE (v_waited < v_max_wait) DO
+            v_wait := (SELECT SYSTEM$WAIT(15));
+            v_waited := v_waited + 15;
+            v_status := (SELECT MAX_BY(b.batch_status, b.batch_id) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+                         JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+                         WHERE j.job_name = :v_job AND b.batch_id > :v_mark);
+            IF (v_status IS NOT NULL AND v_status <> 'IN PROGRESS') THEN
+                BREAK;
+            END IF;
+            IF (v_status IS NULL AND v_waited >= 900) THEN
+                BREAK;
+            END IF;
+        END WHILE;
+        IF (v_status IS NULL) THEN
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~' || v_task || ' was started but logged no run within 15 minutes; '
+                           || 'its TASK_HISTORY says why. Then rerun with v_start_at = ' || v_step || '#ROW#';
+            RAISE reh_stop;
+        END IF;
+        v_batch := (SELECT MAX(b.batch_id) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+                    JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+                    WHERE j.job_name = :v_job AND b.batch_id > :v_mark);
+        v_txt := IFF(v_step = 5, 'reh_summary_batch', 'reh_comp_worth_batch');
+        DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_MARKS WHERE mark = :v_txt;
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_MARKS VALUES (:v_txt, :v_batch);
+        IF (v_status = 'IN PROGRESS') THEN
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~still running after ' || (v_max_wait / 60)::INTEGER
+                           || ' minutes (batch ' || v_batch || '). Let it finish, then '
+                           || IFF(v_step = 5, 'rerun with v_start_at = 6', 'go on with R4') || '#ROW#';
+            RAISE reh_stop;
+        END IF;
+        IF (NOT STARTSWITH(v_status, 'SUCCESS')) THEN
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~' || LEFT(v_status, 400) || ' (batch ' || v_batch
+                           || '). Send R3c. ' || IFF(v_step = 5, 'A failed summary run rolls back and leaves the marked rows waiting: '
+                           || 'after the fix, rerun with v_start_at = 5', 'After the fix, rerun with v_start_at = 6') || '#ROW#';
+            RAISE reh_stop;
+        END IF;
+
+        IF (v_step = 5) THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'));
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY WHERE batch_id = :v_batch);
+            v_log := v_log || 'S5 TRIP_SUMMARY_WRAPPER~|~ok~|~' || LEFT(v_status, 200) || '; batch ' || v_batch || ' wrote '
+                           || v_n || ' summary rows (' || (2 * v_pairs) || ' expected)'
+                           || IFF(v_has, '; the summary stream still holds rows', '; summary stream consumed') || '#ROW#';
+        ELSE
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY s
+                    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS p ON p.market_trip_id = s.trip_master_id
+                    WHERE COALESCE(s.comp_worth, 0) <> 0);
+            v_log := v_log || 'S6 TRIP_COMP_WORTH~|~ok~|~' || LEFT(v_status, 200) || '; batch ' || v_batch || '; ' || v_n || ' of '
+                           || v_pairs || ' marked market trips now carry a comp worth (a trip whose theo earns no comps keeps 0)#ROW#';
+        END IF;
+    END FOR;
+
+    v_log := v_log || 'END~|~done~|~next: R4, then R5-R8#ROW#';
+    res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+            FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+    RETURN TABLE(res);
+EXCEPTION
+    WHEN reh_stop THEN
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+    WHEN OTHER THEN
+        v_log := v_log || 'error~|~STOP~|~' || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '') || '#ROW#';
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+END;
+$$;
+
+-- R3x. (Only if R3 says to.) What the summary stream holds, grouped.
+SELECT batch_id, updated_by, last_dml_cd, transaction_type,
+       COUNT(*) AS rows_waiting, COUNT(DISTINCT trip_master_id) AS trips, MIN(updated_dttm) AS first_change, MAX(updated_dttm) AS last_change
+FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM
+WHERE METADATA$ACTION = 'INSERT'
+GROUP BY ALL
+ORDER BY rows_waiting DESC
+LIMIT 25;
+
+-- R3c. (Only if a step stopped with FAILURE.) The pipeline's error log for the rehearsal's runs.
+SELECT j.job_name, e.*
+FROM DAAS_UAT.DAAS_COMMON.BATCH_ERROR_LOG_S02 e
+JOIN DAAS_UAT.DAAS_COMMON.BATCH_S02 b ON b.batch_id = e.batch_id
+JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+WHERE e.batch_id IN (SELECT value FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_MARKS)
+ORDER BY e.batch_id, e.created_dttm;
+
+
+-- R4. After-picture, same shape as R1, then every summary value that changed (one row per trip and column; per trip,
+--     day and column for daily rows), labelled by side: the market or property trip of a pair, or another trip of the
+--     five guests. Bookkeeping columns (ids, UPDATED_*/CREATED_*, BATCH_ID, LAST_DML_CD) are left out.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_AFTER AS
+SELECT m.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_GUESTS g ON g.guest_unique_id = m.guest_unique_id
+WHERE (m.trip_type = 'MARKET'   AND m.market_cd   = g.market_cd)
+   OR (m.trip_type = 'PROPERTY' AND m.property_cd = g.property_cd);
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TD_AFTER AS
+SELECT d.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL d
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_AFTER t ON t.trip_master_id = d.trip_master_id;
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_AFTER AS
+SELECT s.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY s
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_AFTER t ON t.trip_master_id = s.trip_master_id;
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_AFTER AS
+SELECT s.*
+FROM DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY s
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_AFTER t ON t.trip_master_id = s.trip_master_id;
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_CHANGES AS
+WITH sides AS (
+    SELECT market_trip_id AS trip_master_id, 'market' AS side FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS
     UNION ALL
-    SELECT m_id, 'property', p_id, p_denom FROM diff
+    SELECT property_trip_id, 'property' FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS
+),
+ob AS (
+    SELECT trip_master_id,
+           OBJECT_DELETE(OBJECT_CONSTRUCT(*), 'TRIP_SUMMARY_ID', 'TRIP_MASTER_ID', 'LAST_DML_CD', 'CREATED_DTTM', 'CREATED_BY',
+                         'UPDATED_DTTM', 'UPDATED_BY', 'BATCH_ID') AS o
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_BEFORE
+),
+oa AS (
+    SELECT trip_master_id,
+           OBJECT_DELETE(OBJECT_CONSTRUCT(*), 'TRIP_SUMMARY_ID', 'TRIP_MASTER_ID', 'LAST_DML_CD', 'CREATED_DTTM', 'CREATED_BY',
+                         'UPDATED_DTTM', 'UPDATED_BY', 'BATCH_ID') AS o
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_AFTER
+),
+fb AS (SELECT ob.trip_master_id, f.key AS col, f.value AS v FROM ob, LATERAL FLATTEN(input => ob.o) f),
+fa AS (SELECT oa.trip_master_id, f.key AS col, f.value AS v FROM oa, LATERAL FLATTEN(input => oa.o) f)
+SELECT COALESCE(x.side, 'other trip of the five guests') AS side,
+       COALESCE(fb.trip_master_id, fa.trip_master_id)    AS trip_master_id,
+       COALESCE(fb.col, fa.col)                           AS col,
+       fb.v                                               AS before_value,
+       fa.v                                               AS after_value
+FROM fb
+FULL OUTER JOIN fa ON fa.trip_master_id = fb.trip_master_id AND fa.col = fb.col
+LEFT JOIN sides x ON x.trip_master_id = COALESCE(fb.trip_master_id, fa.trip_master_id)
+WHERE NOT EQUAL_NULL(fb.v, fa.v);
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_CHANGES AS
+WITH sides AS (
+    SELECT market_trip_id AS trip_master_id, 'market' AS side FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS
+    UNION ALL
+    SELECT property_trip_id, 'property' FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS
+),
+ob AS (
+    SELECT trip_master_id, guest_activity_date,
+           OBJECT_DELETE(OBJECT_CONSTRUCT(*), 'DAILY_ACTIVITY_SUMMARY_ID', 'TRIP_MASTER_ID', 'GUEST_ACTIVITY_DATE', 'LAST_DML_CD',
+                         'CREATED_DTTM', 'CREATED_BY', 'UPDATED_DTTM', 'UPDATED_BY', 'BATCH_ID') AS o
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_BEFORE
+),
+oa AS (
+    SELECT trip_master_id, guest_activity_date,
+           OBJECT_DELETE(OBJECT_CONSTRUCT(*), 'DAILY_ACTIVITY_SUMMARY_ID', 'TRIP_MASTER_ID', 'GUEST_ACTIVITY_DATE', 'LAST_DML_CD',
+                         'CREATED_DTTM', 'CREATED_BY', 'UPDATED_DTTM', 'UPDATED_BY', 'BATCH_ID') AS o
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_AFTER
+),
+fb AS (SELECT ob.trip_master_id, ob.guest_activity_date, f.key AS col, f.value AS v FROM ob, LATERAL FLATTEN(input => ob.o) f),
+fa AS (SELECT oa.trip_master_id, oa.guest_activity_date, f.key AS col, f.value AS v FROM oa, LATERAL FLATTEN(input => oa.o) f)
+SELECT COALESCE(x.side, 'other trip of the five guests')         AS side,
+       COALESCE(fb.trip_master_id, fa.trip_master_id)            AS trip_master_id,
+       COALESCE(fb.guest_activity_date, fa.guest_activity_date)  AS guest_activity_date,
+       COALESCE(fb.col, fa.col)                                   AS col,
+       fb.v                                                       AS before_value,
+       fa.v                                                       AS after_value
+FROM fb
+FULL OUTER JOIN fa
+  ON fa.trip_master_id = fb.trip_master_id AND fa.guest_activity_date = fb.guest_activity_date AND fa.col = fb.col
+LEFT JOIN sides x ON x.trip_master_id = COALESCE(fb.trip_master_id, fa.trip_master_id)
+WHERE NOT EQUAL_NULL(fb.v, fa.v);
+
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_LOG
+SELECT 'R4_AFTER', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_CHANGES) || ' summary values and ' ||
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_CHANGES) || ' daily values changed';
+
+
+-- R5. Scoreboard: one row per check, the expected value next to the actual one; 'LOOK' is a row to explain, 'info' has
+--     no fixed expectation. Rows 7-8 read the whole summary tables (a minute or two). Row 12 is the tripwire.
+WITH p AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS),
+listed AS (
+    SELECT DISTINCT trip_master_id, rating_sk
+    FROM (SELECT market_trip_id AS trip_master_id, rating_sk FROM p
+          UNION ALL
+          SELECT property_trip_id, rating_sk FROM p)
+),
+runs AS (
+    SELECT value AS batch_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_MARKS
+    WHERE mark IN ('reh_summary_batch', 'reh_comp_worth_batch')
+),
+marked AS (
+    SELECT trip_master_id, transaction_table_sk
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TD_AFTER
+    WHERE batch_id = -3641 AND updated_by = 'DAASI-3641 rehearsal'
+),
+tmb AS (SELECT trip_master_id, HASH(*) AS h FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_BEFORE),
+tma AS (SELECT trip_master_id, HASH(*) AS h FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TM_AFTER),
+tdb AS (SELECT trip_detail_id, HASH(*) AS h
+        FROM (SELECT * EXCLUDE (updated_dttm, updated_by, batch_id, last_dml_cd) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TD_BEFORE)),
+tda AS (SELECT trip_detail_id, HASH(*) AS h
+        FROM (SELECT * EXCLUDE (updated_dttm, updated_by, batch_id, last_dml_cd) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TD_AFTER)),
+cw AS (
+    SELECT p.market_trip_id,
+           mb.comp_worth AS m_before, pb.comp_worth AS p_before, ma.comp_worth AS m_after, pa.comp_worth AS p_after
+    FROM p
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_BEFORE mb ON mb.trip_master_id = p.market_trip_id
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_BEFORE pb ON pb.trip_master_id = p.property_trip_id
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_AFTER  ma ON ma.trip_master_id = p.market_trip_id
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_AFTER  pa ON pa.trip_master_id = p.property_trip_id
+),
+dcw AS (
+    SELECT m.comp_worth AS m_cw, pr.comp_worth AS p_cw
+    FROM p
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_AFTER m
+      ON m.trip_master_id = p.market_trip_id AND m.delete_ind = 'N'
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_AFTER pr
+      ON pr.trip_master_id = p.property_trip_id AND pr.guest_activity_date = m.guest_activity_date AND pr.delete_ind = 'N'
+),
+tsc AS (
+    SELECT c.*, r.refreshed_by
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_CHANGES c
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_REFRESHED_COLS r ON r.col = c.col
+),
+dasc AS (
+    SELECT c.*, r.refreshed_by
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_CHANGES c
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_REFRESHED_COLS r ON r.col = c.col
+),
+board AS (
+    SELECT 1 AS n, 'Pairs marked (rebuilt market trip + property twin, one shared rating)' AS check_name,
+           NULL AS expected, (SELECT COUNT(*) FROM p) AS actual
+    UNION ALL SELECT 2, 'TRIP_DETAIL rows carrying the mark', (SELECT 2 * COUNT(*) FROM p), (SELECT COUNT(*) FROM marked)
+    UNION ALL SELECT 3, 'Marked rows not on the list', 0,
+           (SELECT COUNT(*) FROM marked m
+            WHERE NOT EXISTS (SELECT 1 FROM listed l WHERE l.trip_master_id = m.trip_master_id AND l.rating_sk = m.transaction_table_sk))
+    UNION ALL SELECT 4, 'Runs recorded (summary, comp worth)', 2, (SELECT COUNT(DISTINCT batch_id) FROM runs)
+    UNION ALL SELECT 5, 'Trip masters changed (five guests)', 0,
+           (SELECT COUNT(*) FROM tmb FULL OUTER JOIN tma ON tma.trip_master_id = tmb.trip_master_id WHERE NOT EQUAL_NULL(tmb.h, tma.h))
+    UNION ALL SELECT 6, 'Trip detail rows changed beyond the four marking columns (five guests)', 0,
+           (SELECT COUNT(*) FROM tdb FULL OUTER JOIN tda ON tda.trip_detail_id = tdb.trip_detail_id WHERE NOT EQUAL_NULL(tdb.h, tda.h))
+    UNION ALL SELECT 7, 'Summary rows the two runs wrote for trips outside the pairs (whole table)', 0,
+           (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY s
+            WHERE s.batch_id IN (SELECT batch_id FROM runs) AND s.trip_master_id NOT IN (SELECT trip_master_id FROM listed))
+    UNION ALL SELECT 8, 'Daily rows the two runs wrote for trips outside the pairs (whole table)', 0,
+           (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY s
+            WHERE s.batch_id IN (SELECT batch_id FROM runs) AND s.trip_master_id NOT IN (SELECT trip_master_id FROM listed))
+    UNION ALL SELECT 9, 'Pairs whose market comp worth equals the property comp worth, before', NULL,
+           (SELECT COUNT_IF(ROUND(COALESCE(m_before, 0), 2) = ROUND(COALESCE(p_before, 0), 2)) FROM cw)
+    UNION ALL SELECT 10, '... after', (SELECT COUNT(*) FROM cw),
+           (SELECT COUNT_IF(ROUND(COALESCE(m_after, 0), 2) = ROUND(COALESCE(p_after, 0), 2)) FROM cw)
+    UNION ALL SELECT 11, 'Pairs with market comp worth 0 while the property trip has one, after', 0,
+           (SELECT COUNT_IF(COALESCE(m_after, 0) = 0 AND COALESCE(p_after, 0) <> 0) FROM cw)
+    UNION ALL SELECT 12, 'Property trips whose free play changed (DLC_FSP_*): the tripwire', 0,
+           (SELECT COUNT(DISTINCT trip_master_id) FROM tsc WHERE side = 'property' AND col LIKE 'DLC_FSP%')
+    UNION ALL SELECT 13, 'Property trips with a change this run does not recalculate', 0,
+           (SELECT COUNT(DISTINCT trip_master_id) FROM tsc WHERE side = 'property' AND refreshed_by IS NULL)
+    UNION ALL SELECT 14, 'Market trips with a change this run does not recalculate', 0,
+           (SELECT COUNT(DISTINCT trip_master_id) FROM tsc WHERE side = 'market' AND refreshed_by IS NULL)
+    UNION ALL SELECT 15, 'Other trips of the five guests whose summary changed', 0,
+           (SELECT COUNT(DISTINCT trip_master_id) FROM tsc WHERE side = 'other trip of the five guests')
+    UNION ALL SELECT 16, 'Property trips whose comp worth changed (valued with UAT''s multiplier bands today)', NULL,
+           (SELECT COUNT(DISTINCT trip_master_id) FROM tsc WHERE side = 'property' AND col = 'COMP_WORTH')
+    UNION ALL SELECT 17, 'Trips whose rating figures changed (R6 and R8 say which)', NULL,
+           (SELECT COUNT(DISTINCT trip_master_id) FROM tsc WHERE refreshed_by = 'ratings step')
+    UNION ALL SELECT 18, 'Pair days whose market comp worth equals the property comp worth, after', (SELECT COUNT(*) FROM dcw),
+           (SELECT COUNT_IF(ROUND(COALESCE(m_cw, 0), 2) = ROUND(COALESCE(p_cw, 0), 2)) FROM dcw)
+    UNION ALL SELECT 19, 'Daily rows with a change this run does not recalculate', 0,
+           (SELECT COUNT(*) FROM (SELECT DISTINCT trip_master_id, guest_activity_date FROM dasc WHERE refreshed_by IS NULL))
+)
+SELECT n, check_name, expected, actual,
+       CASE WHEN expected IS NULL THEN 'info' WHEN actual = expected THEN 'ok' ELSE 'LOOK' END AS verdict
+FROM board
+ORDER BY n;
+
+
+-- R6. TRIP_SUMMARY column by column, for the marked pairs: how many twins differed before and after, and how many
+--     market and property trips changed. Expect COMP_WORTH to go from many differing pairs to 0, a few rating fields
+--     to change (non-play days on property rows that were stale, most-played denomination where the vote ties, R8),
+--     and every column the run does not recalculate unchanged (verdict 'ok'). Twins still differing in such a column
+--     differ for the reasons part 4 found (UAT's source tables), untouched by this run. POS columns are listed only if
+--     something changed in them (the pilot's step 5 ran without the POS sub-step, so twins differ there by design).
+WITH p AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_PAIRS),
+ob AS (
+    SELECT trip_master_id,
+           OBJECT_DELETE(OBJECT_CONSTRUCT(*), 'TRIP_SUMMARY_ID', 'TRIP_MASTER_ID', 'LAST_DML_CD', 'CREATED_DTTM', 'CREATED_BY',
+                         'UPDATED_DTTM', 'UPDATED_BY', 'BATCH_ID') AS o
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_BEFORE
+    WHERE trip_master_id IN (SELECT market_trip_id FROM p UNION SELECT property_trip_id FROM p)
+),
+oa AS (
+    SELECT trip_master_id,
+           OBJECT_DELETE(OBJECT_CONSTRUCT(*), 'TRIP_SUMMARY_ID', 'TRIP_MASTER_ID', 'LAST_DML_CD', 'CREATED_DTTM', 'CREATED_BY',
+                         'UPDATED_DTTM', 'UPDATED_BY', 'BATCH_ID') AS o
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_AFTER
+    WHERE trip_master_id IN (SELECT market_trip_id FROM p UNION SELECT property_trip_id FROM p)
+),
+fb AS (SELECT ob.trip_master_id, f.key AS col, f.value AS v FROM ob, LATERAL FLATTEN(input => ob.o) f),
+fa AS (SELECT oa.trip_master_id, f.key AS col, f.value AS v FROM oa, LATERAL FLATTEN(input => oa.o) f),
+cols AS (SELECT col FROM fb UNION SELECT col FROM fa),
+v AS (
+    SELECT c.col, mb.v AS m_before, pb.v AS p_before, ma.v AS m_after, pa.v AS p_after
+    FROM p
+    CROSS JOIN cols c
+    LEFT JOIN fb mb ON mb.trip_master_id = p.market_trip_id   AND mb.col = c.col
+    LEFT JOIN fb pb ON pb.trip_master_id = p.property_trip_id AND pb.col = c.col
+    LEFT JOIN fa ma ON ma.trip_master_id = p.market_trip_id   AND ma.col = c.col
+    LEFT JOIN fa pa ON pa.trip_master_id = p.property_trip_id AND pa.col = c.col
+),
+agg AS (
+    SELECT v.col,
+           COUNT_IF(NOT EQUAL_NULL(v.m_before, v.p_before)) AS twins_differing_before,
+           COUNT_IF(NOT EQUAL_NULL(v.m_after,  v.p_after))  AS twins_differing_after,
+           COUNT_IF(NOT EQUAL_NULL(v.m_before, v.m_after))  AS market_trips_changed,
+           COUNT_IF(NOT EQUAL_NULL(v.p_before, v.p_after))  AS property_trips_changed
+    FROM v
+    GROUP BY v.col
+)
+SELECT a.col AS summary_column,
+       COALESCE(r.refreshed_by, 'not recalculated by this run') AS recalculated_by,
+       a.twins_differing_before, a.twins_differing_after, a.market_trips_changed, a.property_trips_changed,
+       IFF(r.refreshed_by IS NULL AND a.market_trips_changed + a.property_trips_changed > 0, 'LOOK', 'ok') AS verdict
+FROM agg a
+LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_REFRESHED_COLS r ON r.col = a.col
+WHERE a.twins_differing_before + a.twins_differing_after + a.market_trips_changed + a.property_trips_changed > 0
+  AND NOT (REGEXP_LIKE(a.col, '(NBR_)?POS_.*') AND a.market_trips_changed + a.property_trips_changed = 0)
+ORDER BY verdict = 'LOOK' DESC, a.market_trips_changed + a.property_trips_changed DESC, a.twins_differing_after DESC, summary_column;
+
+
+-- R7. DAILY_ACTIVITY_SUMMARY: every changed daily value, by column and side. Expect COMP_WORTH, and the same few rating
+--     fields as R6; verdict 'ok' everywhere.
+SELECT c.col AS daily_column,
+       COALESCE(r.refreshed_by, 'not recalculated by this run') AS recalculated_by,
+       COUNT_IF(c.side = 'market')                          AS market_rows_changed,
+       COUNT_IF(c.side = 'property')                        AS property_rows_changed,
+       COUNT_IF(c.side = 'other trip of the five guests')   AS other_rows_changed,
+       IFF(MAX(r.refreshed_by) IS NULL, 'LOOK', 'ok')       AS verdict
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_DAS_CHANGES c
+LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_REFRESHED_COLS r ON r.col = c.col
+GROUP BY c.col, r.refreshed_by
+ORDER BY verdict = 'LOOK' DESC, COUNT(*) DESC, daily_column;
+
+
+-- R8. Most-played denomination picks that changed: was the vote tied at the top? The summary picks the denomination
+--     with the most ratings on the trip, then the latest day; when two tie on both (part 5, H3: all six differing
+--     pairs), the pick is arbitrary and can flip on any recalculation. Expect of_them_tied_at_the_top = trips.
+WITH ch AS (
+    SELECT DISTINCT side, trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TS_CHANGES WHERE col = 'MOST_PLAYED_DENOM_AMT'
 ),
 votes AS (
-    SELECT s.pair_market_trip, s.side, s.stored_pick, r.denom_amt,
-           COUNT(r.denom_amt) AS ratings, MAX(r.business_dt) AS last_day,
-           ROW_NUMBER() OVER (PARTITION BY s.pair_market_trip, s.side
-                              ORDER BY COUNT(r.denom_amt) DESC, MAX(r.business_dt) DESC) AS place
-    FROM sides s
-    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_TD_AFTER d
-      ON d.trip_master_id = s.trip_master_id AND d.transaction_type = 'RATINGS'
+    SELECT d.trip_master_id, r.denom_amt, COUNT(r.denom_amt) AS ratings, MAX(r.business_dt) AS last_day
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_REH_TD_AFTER d
     JOIN DAAS_UAT.DAAS_CORE.RATINGS_FACT r ON r.ratings_fact_sk = d.transaction_table_sk
-    GROUP BY s.pair_market_trip, s.side, s.stored_pick, r.denom_amt
+    WHERE d.transaction_type = 'RATINGS' AND d.trip_master_id IN (SELECT trip_master_id FROM ch)
+    GROUP BY 1, 2
+),
+ranked AS (
+    SELECT v.*, ROW_NUMBER() OVER (PARTITION BY trip_master_id ORDER BY ratings DESC, last_day DESC, denom_amt) AS place
+    FROM votes v
+),
+top2 AS (
+    SELECT trip_master_id,
+           MAX(IFF(place = 1, ratings, NULL)) AS r1, MAX(IFF(place = 2, ratings, NULL)) AS r2,
+           MAX(IFF(place = 1, last_day, NULL)) AS d1, MAX(IFF(place = 2, last_day, NULL)) AS d2
+    FROM ranked
+    GROUP BY 1
 )
-SELECT pair_market_trip, side, stored_pick, place, denom_amt, ratings, last_day
-FROM votes
-WHERE place <= 3
-ORDER BY pair_market_trip, side, place;
+SELECT ch.side, COUNT(*) AS trips, COUNT_IF(t.r1 = t.r2 AND t.d1 = t.d2) AS of_them_tied_at_the_top
+FROM ch
+LEFT JOIN top2 t ON t.trip_master_id = ch.trip_master_id
+GROUP BY 1
+ORDER BY 1;
+
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_LOG VALUES ('R_DONE', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'rehearsal checks run');
 
 
--- H4. UAT, TRIP_NG_REVENUE_SUMMARY: the rebuilt market trips that got no NG rows at all although their property twin
---     has some (G4's "other twin has no NG rows at all" on the missing side: 47 hotel rows, 9 POS rows). The NG step
---     finds a trip's spend by looking up each check in CHECK_SALES_FACT and each stay in HOTEL_GUEST_RESERVATIONS_FACT,
---     then its folio lines in HOTEL_FOLIO_DETAIL_FACT. If those rows are gone from UAT today, these are the free-play
---     pattern again (the property rows were written before the change); if they are all there, the cause is elsewhere.
+-- ===================================================================================================
+-- N. The NG question part 5 left open (read-only; independent of the rehearsal above)
+-- ===================================================================================================
+-- N1. Part 5, H4: 56 NG rows (47 hotel, 9 POS) sit on property twins whose rebuilt market twin got no NG rows at all,
+--     and the stays, folio lines and checks behind them all still exist in UAT. One row per transaction, walking the
+--     NG step's own path (TRIP_NG_REVENUE_SUMMARY_LOAD_PROC) for the market twin:
+--       on_property_twin_now 0 -> the property NG row is a leftover (the NG step never deletes rows): nothing to fix;
+--       on_market_twin_now 1 and in_ng_view_for_market_twin 1 -> the step had the transaction; the columns after that
+--         are its joins, today, and the first 0 is where it lost the row (stay_live, folio_lines_on_this_stay,
+--         folio_header_ok, ticket_type_ok, folio_line_filters_ok for hotel; check_attribute_ok for POS).
+--     A lost row with every join passing would point at the run itself rather than UAT's tables.
 WITH mark AS (
     SELECT value AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_MARKS WHERE mark = 'max_trip_master_id_before'
 ),
@@ -210,38 +823,110 @@ twin AS (
     QUALIFY ROW_NUMBER() OVER (PARTITION BY mk.trip_master_id ORDER BY pr.trip_master_id) = 1
 ),
 ng AS (
-    SELECT trip_master_id, transaction_type, transaction_table_sk, transaction_secondary_table_sk, f_cash_spnd_amt
+    SELECT trip_master_id, transaction_type, transaction_table_sk, transaction_secondary_table_sk, business_start_dt, f_cash_spnd_amt
     FROM DAAS_UAT.DAAS_CORE.TRIP_NG_REVENUE_SUMMARY
     WHERE delete_ind = 'N'
       AND trip_master_id IN (SELECT market_trip_id FROM twin UNION SELECT property_trip_id FROM twin)
 ),
-bare AS (   -- rebuilt market trip with no NG rows, property twin with some
+bare AS (
     SELECT t.*
     FROM twin t
     WHERE t.market_trip_id NOT IN (SELECT trip_master_id FROM ng)
       AND t.property_trip_id IN (SELECT trip_master_id FROM ng)
 ),
 probe AS (
-    SELECT n.transaction_type, n.transaction_table_sk AS sk, n.transaction_secondary_table_sk AS sk2, n.f_cash_spnd_amt
+    SELECT b.market_trip_id, b.property_trip_id, n.transaction_type, n.transaction_table_sk AS sk,
+           n.transaction_secondary_table_sk AS sk2, n.business_start_dt, n.f_cash_spnd_amt
     FROM bare b
     JOIN ng n ON n.trip_master_id = b.property_trip_id
 ),
-csf AS (SELECT DISTINCT check_sales_sk AS sk FROM DAAS_UAT.DAAS_CORE.CHECK_SALES_FACT
-        WHERE check_sales_sk IN (SELECT sk FROM probe WHERE transaction_type = 'POS')),
-hgrf AS (SELECT DISTINCT hotel_guest_reservations_fact_sk AS sk FROM DAAS_UAT.DAAS_CORE.HOTEL_GUEST_RESERVATIONS_FACT
-         WHERE hotel_guest_reservations_fact_sk IN (SELECT sk FROM probe WHERE transaction_type = 'HOTEL')),
-hfd AS (SELECT DISTINCT hotel_folio_detail_fact_sk AS sk FROM DAAS_UAT.DAAS_CORE.HOTEL_FOLIO_DETAIL_FACT
-        WHERE hotel_folio_detail_fact_sk IN (SELECT sk2 FROM probe WHERE transaction_type = 'HOTEL'))
+held AS (
+    SELECT DISTINCT trip_master_id, transaction_table_sk
+    FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL
+    WHERE delete_ind = 'N'
+      AND trip_master_id IN (SELECT market_trip_id FROM bare UNION SELECT property_trip_id FROM bare)
+),
+ngv AS (
+    SELECT DISTINCT trip_master_id, transaction_table_sk
+    FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_NG_VW
+    WHERE trip_master_id IN (SELECT market_trip_id FROM bare)
+),
+hg AS (
+    SELECT hotel_guest_reservations_fact_sk AS sk, MAX(reservation_id) AS reservation_id, MAX(property_cd) AS property_cd,
+           MAX(IFF(delete_ind = 'N', 1, 0)) AS live
+    FROM DAAS_UAT.DAAS_CORE.HOTEL_GUEST_RESERVATIONS_FACT
+    WHERE hotel_guest_reservations_fact_sk IN (SELECT sk FROM probe WHERE transaction_type = 'HOTEL')
+    GROUP BY 1
+),
+fl AS (
+    SELECT hotel_folio_detail_fact_sk AS sk2, reservation_id, property_cd, folio_id, ticket_type, folio_transfer_status, revenue_center_cd
+    FROM DAAS_UAT.DAAS_CORE.HOTEL_FOLIO_DETAIL_FACT
+    WHERE hotel_folio_detail_fact_sk IN (SELECT sk2 FROM probe WHERE transaction_type = 'HOTEL')
+),
+fh AS (
+    SELECT folio_id, property_cd, MAX(IFF(delete_ind = 'N' AND folio_type IN ('1', '5'), 1, 0)) AS ok
+    FROM DAAS_UAT.DAAS_CORE.HOTEL_FOLIO_HEADER_FACT
+    WHERE folio_id IN (SELECT folio_id FROM fl)
+    GROUP BY 1, 2
+),
+tt AS (SELECT DISTINCT folio_ticket_type FROM DAAS_UAT.DAAS_CORE.FOLIO_TICKET_TYPE_LKP WHERE type_nm = 'TICKET'),
+cs AS (
+    SELECT check_sales_sk AS sk, MAX(check_attribute_id) AS check_attribute_id, MAX(property_cd) AS property_cd,
+           MAX(src_property_cd) AS src_property_cd
+    FROM DAAS_UAT.DAAS_CORE.CHECK_SALES_FACT
+    WHERE check_sales_sk IN (SELECT sk FROM probe WHERE transaction_type = 'POS')
+    GROUP BY 1
+),
+ca AS (
+    SELECT check_attribute_id, property_cd, src_property_cd, MAX(IFF(delete_ind = 'N', 1, 0)) AS ok
+    FROM DAAS_UAT.DAAS_CORE.CHECK_ATTRIBUTE_DIM
+    WHERE check_attribute_id IN (SELECT check_attribute_id FROM cs)
+    GROUP BY 1, 2, 3
+)
 SELECT p.transaction_type,
-       COUNT(*)                                            AS property_ng_rows,
-       COUNT(DISTINCT p.sk)                                AS transactions,
-       COUNT_IF(c.sk IS NOT NULL)                          AS pos_check_in_uat_today,
-       COUNT_IF(h.sk IS NOT NULL)                          AS hotel_stay_in_uat_today,
-       COUNT_IF(f.sk IS NOT NULL)                          AS folio_line_in_uat_today,
-       ROUND(SUM(p.f_cash_spnd_amt), 2)                    AS spend
+       p.sk                                                         AS transaction_sk,
+       MIN(p.business_start_dt)                                     AS first_ng_day,
+       COUNT(*)                                                     AS property_ng_rows,
+       ROUND(SUM(p.f_cash_spnd_amt), 2)                             AS spend,
+       MAX(IFF(hp.trip_master_id IS NOT NULL, 1, 0))                AS on_property_twin_now,
+       MAX(IFF(hm.trip_master_id IS NOT NULL, 1, 0))                AS on_market_twin_now,
+       MAX(IFF(v.trip_master_id IS NOT NULL, 1, 0))                 AS in_ng_view_for_market_twin,
+       MAX(IFF(p.transaction_type = 'HOTEL', hg.live, NULL))        AS stay_live,
+       IFF(p.transaction_type = 'HOTEL', COUNT_IF(fl.reservation_id = hg.reservation_id AND fl.property_cd = hg.property_cd), NULL) AS folio_lines_on_this_stay,
+       IFF(p.transaction_type = 'HOTEL', COUNT_IF(fh.ok = 1), NULL) AS folio_header_ok,
+       IFF(p.transaction_type = 'HOTEL', COUNT_IF(t.folio_ticket_type IS NOT NULL), NULL) AS ticket_type_ok,
+       IFF(p.transaction_type = 'HOTEL', COUNT_IF(fl.ticket_type NOT IN ('D', 'A') AND COALESCE(fl.folio_transfer_status, '') <> 'T'
+                                                  AND fl.revenue_center_cd IS NOT NULL), NULL) AS folio_line_filters_ok,
+       MAX(IFF(p.transaction_type = 'POS', COALESCE(c.ok, 0), NULL)) AS check_attribute_ok
 FROM probe p
-LEFT JOIN csf  c ON p.transaction_type = 'POS'   AND c.sk = p.sk
-LEFT JOIN hgrf h ON p.transaction_type = 'HOTEL' AND h.sk = p.sk
-LEFT JOIN hfd  f ON p.transaction_type = 'HOTEL' AND f.sk = p.sk2
-GROUP BY 1
-ORDER BY 1;
+LEFT JOIN held hp ON hp.trip_master_id = p.property_trip_id AND hp.transaction_table_sk = p.sk
+LEFT JOIN held hm ON hm.trip_master_id = p.market_trip_id   AND hm.transaction_table_sk = p.sk
+LEFT JOIN ngv v   ON v.trip_master_id  = p.market_trip_id   AND v.transaction_table_sk  = p.sk
+LEFT JOIN hg      ON p.transaction_type = 'HOTEL' AND hg.sk = p.sk
+LEFT JOIN fl      ON p.transaction_type = 'HOTEL' AND fl.sk2 = p.sk2
+LEFT JOIN fh      ON fh.folio_id = fl.folio_id AND fh.property_cd = fl.property_cd
+LEFT JOIN tt t    ON t.folio_ticket_type = fl.ticket_type
+LEFT JOIN cs      ON p.transaction_type = 'POS' AND cs.sk = p.sk
+LEFT JOIN ca c    ON c.check_attribute_id = cs.check_attribute_id AND c.property_cd = cs.property_cd AND c.src_property_cd = cs.src_property_cd
+GROUP BY p.transaction_type, p.sk
+ORDER BY 1, 3;
+
+-- N2. The view the NG step's stream reads, in both environments (as a .txt, please, like part 4's G6). A filter in it
+--     (a date range, a trip type) would decide which transactions a rebuilt trip can ever get NG rows for.
+SELECT 'UAT' AS env, GET_DDL('VIEW', 'DAAS_UAT.DAAS_CORE.TRIP_DETAIL_NG_VW') AS view_definition
+UNION ALL
+SELECT 'PROD', GET_DDL('VIEW', 'DAAS_PROD.DAAS_CORE.TRIP_DETAIL_NG_VW');
+
+
+-- ===================================================================================================
+-- Z. PROD, read-only
+-- ===================================================================================================
+-- Z1. Every stream in PROD that reads TRIP_DETAIL, directly or through a view. Run the SHOW, then the SELECT right
+--     after it. The rehearsal's marking depends on TRIP_DETAIL_SUMMARY_STREAM being a standard stream: expect mode
+--     DEFAULT on that row. Every other row is a reader that will also see the marked rows in PROD, for the runbook.
+--     (SHOW lists only the streams your role may see; DevOps can run it for the full list.)
+SHOW STREAMS IN DATABASE DAAS_PROD;
+SELECT "schema_name", "name", "table_name", "source_type", "base_tables", "mode", "stale", "owner"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "table_name"::VARCHAR ILIKE '%TRIP_DETAIL%' OR "base_tables"::VARCHAR ILIKE '%TRIP_DETAIL%'
+ORDER BY 1, 2;
