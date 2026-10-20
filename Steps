@@ -1,0 +1,213 @@
+-- DAASI-3641 · PROD · RUN as plain steps, everything at once (Pete). The same change as DAASI_3641_PROD_2_RUN_STEPS.sql
+-- without the canary: one run queues every broken BEM/WLM market trip (about 399,400) for the pipeline's own rebuild
+-- and marks one rating on each matching property trip (about 923,500), and the next hourly run rebuilds them all.
+-- Laid out like Marcin's April runbook: pause, back up, change, resume. Run one section at a time, in order; nothing to
+-- edit. Start soon after the TIBCO tasks' 7:00 Pacific run: the hourly run after the change is the long one (hours),
+-- the trip runs after it wait for it, and what reads the trip tables stays paused until it is done (step 11).
+-- Chris's post-check, fix-up and undo work with it as with the RUN file (tag 'DAASI-3641 run 1 all', backups *_RUN1).
+
+
+-- 1. Session
+USE ROLE APP_SERVICE_PROD;                              -- owns the trip tasks, holds both writes
+USE WAREHOUSE DAAS_PROD_ADHOC_BULK_LOAD_COMPUTE_XL;
+USE SCHEMA DAAS_PROD.DAAS_BACKUP;                        -- where the temporary tables below go
+ALTER SESSION SET TIMEZONE = 'America/Los_Angeles';    -- the trip tables' time zone
+
+-- 2. Pause the trip chain and what reads it, as in April: the TIBCO tasks, then the dynamic tables, readers first.
+--    Best a few minutes after an hourly run has finished (they end around :55 Pacific).
+ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK SUSPEND;
+ALTER TASK DAAS_PROD.DAAS_TIBCO_SMART.DT_AP_12_MONTH_PLUS SUSPEND;
+ALTER TASK DAAS_PROD.DAAS_TIBCO_SMART.DT_AP_ACTIVITY_FTD SUSPEND;
+ALTER TASK DAAS_PROD.DAAS_TIBCO_SMART.DT_AP_TRIP_DTL SUSPEND;
+ALTER TASK DAAS_PROD.DAAS_TIBCO_SMART.DT_GST_TRIP_DTL SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.GST_12_MONTH_PLUS SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.GST_24_MONTH_PLUS SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.GST_ACTIVITY_FTD SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.GST_PDB_TRIP SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.RMS_TRIPS SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.NG_SPEND_BY_CATG SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.TRIP_NG_REVENUE_SUMMARY SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY_18MO SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.DAILY_SUMMARY_YEAR_MONTH_METRICS SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.DAILY_SUMMARY_DT SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_GAMING_DT SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_COMP_DT SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_POS_DT SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_FREEPLAY_DT SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_OFFER_DT SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_MARKERS_DT SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_HOTEL_RESERVATIONS_DT SUSPEND;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_HOTEL_FOLIOS_DT SUSPEND;
+
+-- 3. Room for the long run (the chain has to be paused to change these). The rebuild's date-cutting loop may need
+--    hundreds of passes (pre-check K2c), and the summary step re-reads about 26 million ratings (K2).
+ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_RECALCULATION_TASK SET USER_TASK_TIMEOUT_MS = 21600000;   -- 6 h
+ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_SUMMARY_LOAD_TASK SET USER_TASK_TIMEOUT_MS = 28800000;     -- 8 h (4 h now)
+ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK SET USER_TASK_TIMEOUT_MS = 14400000;  -- 4 h of its own
+
+-- 4. Is a trip run still going? Pausing does not stop one already under way. Expect no row with state EXECUTING;
+--    if there is one, wait a few minutes and run this again.
+SELECT state, scheduled_time
+FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.CURRENT_TASK_GRAPHS(ROOT_TASK_NAME => 'TRIP_ROOT_TASK'))
+WHERE database_name = 'DAAS_PROD' AND schema_name = 'DAAS_COMMON';
+
+-- 5. Backups: zero-copy clones, the before-picture for the post-check and the undo.
+CREATE TABLE DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3641_RUN1 CLONE DAAS_PROD.DAAS_CORE.TRIP_MASTER;
+CREATE TABLE DAAS_PROD.DAAS_BACKUP.TRIP_DETAIL_DAASI_3641_RUN1 CLONE DAAS_PROD.DAAS_CORE.TRIP_DETAIL;
+CREATE TABLE DAAS_PROD.DAAS_BACKUP.TRIP_SUMMARY_DAASI_3641_RUN1 CLONE DAAS_PROD.DAAS_CORE.TRIP_SUMMARY;
+CREATE TABLE DAAS_PROD.DAAS_BACKUP.DAILY_ACTIVITY_SUMMARY_DAASI_3641_RUN1 CLONE DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY;
+ALTER TABLE DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3641_RUN1 SET DATA_RETENTION_TIME_IN_DAYS = 0;
+ALTER TABLE DAAS_PROD.DAAS_BACKUP.TRIP_DETAIL_DAASI_3641_RUN1 SET DATA_RETENTION_TIME_IN_DAYS = 0;
+ALTER TABLE DAAS_PROD.DAAS_BACKUP.TRIP_SUMMARY_DAASI_3641_RUN1 SET DATA_RETENTION_TIME_IN_DAYS = 0;
+ALTER TABLE DAAS_PROD.DAAS_BACKUP.DAILY_ACTIVITY_SUMMARY_DAASI_3641_RUN1 SET DATA_RETENTION_TIME_IN_DAYS = 0;
+GRANT SELECT ON TABLE DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3641_RUN1 TO ROLE DAAS_TEAM;
+GRANT SELECT ON TABLE DAAS_PROD.DAAS_BACKUP.TRIP_DETAIL_DAASI_3641_RUN1 TO ROLE DAAS_TEAM;
+GRANT SELECT ON TABLE DAAS_PROD.DAAS_BACKUP.TRIP_SUMMARY_DAASI_3641_RUN1 TO ROLE DAAS_TEAM;
+GRANT SELECT ON TABLE DAAS_PROD.DAAS_BACKUP.DAILY_ACTIVITY_SUMMARY_DAASI_3641_RUN1 TO ROLE DAAS_TEAM;
+
+-- 6. The trips to queue: every live BEM/WLM market trip with no property trip of the same guest and dates at IBE/IWA
+--    (real guest ids only). Then, for each property trip holding a rating of one of those trips, the one rating to
+--    mark (preferably one no other property trip holds). Expect about 399,406 trips and 923,534 property trips
+--    (pre-check K1, K2; a little more with play since).
+CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_CANDIDATES AS
+WITH pr AS (
+    SELECT DISTINCT guest_unique_id, DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd, trip_start_dt, trip_end_dt
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+    WHERE trip_type = 'PROPERTY' AND delete_ind = 'N' AND property_cd IN ('IBE', 'IWA')
+)
+SELECT m.trip_master_id, m.guest_unique_id, m.market_cd, m.trip_start_dt, m.trip_end_dt
+FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+LEFT JOIN pr
+       ON pr.guest_unique_id = m.guest_unique_id AND pr.market_cd = m.market_cd
+      AND pr.trip_start_dt = m.trip_start_dt AND pr.trip_end_dt = m.trip_end_dt
+WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND m.market_cd IN ('BEM', 'WLM')
+  AND m.guest_unique_id > 0
+  AND pr.guest_unique_id IS NULL;
+
+CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_TOUCH AS
+WITH q AS (SELECT trip_master_id, guest_unique_id, market_cd FROM DAASI_3641_CANDIDATES),
+qr AS (
+    SELECT DISTINCT q.guest_unique_id, q.market_cd, d.transaction_table_sk AS sk
+    FROM q
+    JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL d ON d.trip_master_id = q.trip_master_id
+    WHERE d.transaction_type = 'RATINGS' AND d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+),
+pt AS (
+    SELECT m.trip_master_id, m.guest_unique_id, DECODE(m.property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+    WHERE m.trip_type = 'PROPERTY' AND m.delete_ind = 'N' AND m.property_cd IN ('IBE', 'IWA')
+      AND m.guest_unique_id IN (SELECT guest_unique_id FROM q)
+),
+pd AS (
+    SELECT pt.trip_master_id, pt.guest_unique_id, pt.market_cd, d.transaction_table_sk AS sk
+    FROM pt
+    JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL d ON d.trip_master_id = pt.trip_master_id
+    WHERE d.transaction_type = 'RATINGS' AND d.delete_ind = 'N'
+),
+holders AS (SELECT sk, COUNT(DISTINCT trip_master_id) AS property_trips FROM pd GROUP BY sk),
+shared AS (
+    SELECT DISTINCT pd.trip_master_id AS property_trip_id, pd.sk
+    FROM pd
+    JOIN qr ON qr.guest_unique_id = pd.guest_unique_id AND qr.market_cd = pd.market_cd AND qr.sk = pd.sk
+),
+ts AS (
+    SELECT DISTINCT trip_master_id FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY
+    WHERE trip_master_id IN (SELECT trip_master_id FROM pt)
+)
+SELECT s.property_trip_id, s.sk AS rating_sk,
+       (h.property_trips = 1)         AS rating_on_this_trip_only,
+       (ts.trip_master_id IS NOT NULL) AS has_summary_row
+FROM shared s
+JOIN holders h ON h.sk = s.sk
+LEFT JOIN ts ON ts.trip_master_id = s.property_trip_id
+QUALIFY ROW_NUMBER() OVER (PARTITION BY s.property_trip_id ORDER BY (h.property_trips = 1) DESC, s.sk) = 1;
+
+SELECT (SELECT COUNT(*) FROM DAASI_3641_CANDIDATES)                  AS trips_to_queue,
+       (SELECT COUNT(*) FROM DAASI_3641_TOUCH WHERE has_summary_row) AS property_trips_to_mark;
+
+-- 7. The change, in one transaction. Run these four one at a time. The INSERT should report trips_to_queue rows, the
+--    UPDATE about property_trips_to_mark (a few more where a rating sits twice on one trip). If either is off, run
+--    ROLLBACK; instead of COMMIT;, then steps 9 and 11: nothing will have changed.
+BEGIN TRANSACTION;
+INSERT INTO DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE (TRIP_MASTER_ID, STATUS, BATCH_ID, CREATED_DTTM, CREATED_BY, UPDATED_DTTM, UPDATED_BY)
+SELECT c.trip_master_id, 'PENDING', -3641, CURRENT_TIMESTAMP(), CURRENT_USER(), CURRENT_TIMESTAMP(), 'DAASI-3641 run 1 all'
+FROM DAASI_3641_CANDIDATES c
+JOIN DAAS_PROD.DAAS_CORE.TRIP_MASTER m ON m.trip_master_id = c.trip_master_id AND m.delete_ind = 'N';
+UPDATE DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+   SET updated_dttm = CURRENT_TIMESTAMP(),
+       updated_by   = 'DAASI-3641 run 1 all',
+       batch_id     = -3641,
+       last_dml_cd  = 'U'
+  FROM DAASI_3641_TOUCH t
+ WHERE t.has_summary_row
+   AND d.trip_master_id = t.property_trip_id
+   AND d.transaction_table_sk = t.rating_sk
+   AND d.transaction_type = 'RATINGS'
+   AND d.delete_ind = 'N';
+COMMIT;
+
+-- 8. The heavy steps on the X-Large warehouse, as April did for its trip jobs. Expect 6 rows.
+UPDATE DAAS_PROD.DAAS_COMMON.JOB
+   SET warehouse_name = 'DAAS_PROD_ADHOC_BULK_LOAD_COMPUTE_XL'
+ WHERE job_name IN ('TRIP_RECALCULATION', 'TRIP_MERGE_CHECK', 'TRIP_MERGE', 'TRIP_SUMMARY_WRAPPER', 'TRIP_COMP_WORTH',
+                    'TRIP_NG_REVENUE_SUMMARY');
+
+-- 9. Resume the trip chain. Its next run (:15 Pacific) is the long one.
+ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
+
+-- 10. Is that run done? It is when all three steps show a finished_at (no rows yet: the rebuild has not taken the
+--     trips). Expect hours.
+WITH rc AS (
+    SELECT MIN(r.batch_id) AS recalc_batch
+    FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_PROCESSED r
+    JOIN DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE q ON q.trip_master_id = r.trip_master_id
+    WHERE q.batch_id = -3641 AND q.updated_by = 'DAASI-3641 run 1 all'
+      AND r.created_dttm >= DATEADD(hour, -12, q.created_dttm)
+)
+SELECT j.job_name, MIN(b.updated_dttm) AS finished_at
+FROM rc
+JOIN DAAS_PROD.DAAS_COMMON.BATCH_S02 b ON b.batch_id > rc.recalc_batch AND STARTSWITH(b.batch_status, 'SUCCESS')
+JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+WHERE j.job_name IN ('TRIP_SUMMARY_WRAPPER', 'TRIP_COMP_WORTH', 'TRIP_NG_REVENUE_SUMMARY')
+GROUP BY j.job_name
+ORDER BY 2;
+
+-- 11. Once it is: what reads the trip tables back on (the tables they read first), the trip jobs back on their own
+--     warehouse (expect 6 rows). Then Chris runs DAASI_3641_PROD_3_POSTCHECK.sql.
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.DAILY_SUMMARY_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.DAILY_SUMMARY_YEAR_MONTH_METRICS RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_GAMING_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_COMP_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_POS_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_FREEPLAY_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_OFFER_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_MARKERS_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_HOTEL_RESERVATIONS_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_CORE.TRIP_DETAILS_HOTEL_FOLIOS_DT RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY_18MO RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.TRIP_SUMMARY RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.TRIP_NG_REVENUE_SUMMARY RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.NG_SPEND_BY_CATG RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.RMS_TRIPS RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.GST_PDB_TRIP RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.GST_ACTIVITY_FTD RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.GST_24_MONTH_PLUS RESUME;
+ALTER DYNAMIC TABLE DAAS_PROD.DAAS_TIBCO_DWS.GST_12_MONTH_PLUS RESUME;
+ALTER TASK DAAS_PROD.DAAS_TIBCO_SMART.DT_AP_12_MONTH_PLUS RESUME;
+ALTER TASK DAAS_PROD.DAAS_TIBCO_SMART.DT_AP_ACTIVITY_FTD RESUME;
+ALTER TASK DAAS_PROD.DAAS_TIBCO_SMART.DT_AP_TRIP_DTL RESUME;
+ALTER TASK DAAS_PROD.DAAS_TIBCO_SMART.DT_GST_TRIP_DTL RESUME;
+UPDATE DAAS_PROD.DAAS_COMMON.JOB
+   SET warehouse_name = 'DAAS_PROD_IT_WHSRCTORAW_COMPUTE'
+ WHERE job_name IN ('TRIP_RECALCULATION', 'TRIP_MERGE_CHECK', 'TRIP_MERGE', 'TRIP_SUMMARY_WRAPPER', 'TRIP_COMP_WORTH',
+                    'TRIP_NG_REVENUE_SUMMARY');
+
+-- 12. Later, if the old time limits should come back (the chain has to be paused for it, between hourly runs).
+ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK SUSPEND;
+ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_RECALCULATION_TASK SET USER_TASK_TIMEOUT_MS = 7200000;
+ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_SUMMARY_LOAD_TASK SET USER_TASK_TIMEOUT_MS = 14400000;
+ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK UNSET USER_TASK_TIMEOUT_MS;
+ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
