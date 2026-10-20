@@ -1,0 +1,1116 @@
+-- DAASI-3641 · PROD · 2 · RUN (Pete). Paste the whole file into a worksheet and run all of it (Run All): four short
+-- session lines, then one block.
+--
+-- What it does. Puts the broken BEM and WLM market trips into the trip pipeline's own rebuild queue
+-- (DAAS_CORE.TRIP_RECALC_QUEUE), and in the same transaction marks one rating on each property trip that will
+-- match a rebuilt market trip. The next hourly trip run (:15 Pacific) then does all the work, through its normal
+-- steps: the recalculation step retires each queued trip and re-cuts its transactions under today's caps (BEM 1
+-- day, WLM 3), merge check and merge tidy up, and the summary and comp-worth steps value the new trips. The marked
+-- property ratings are what let the comp-worth step value a rebuilt market trip in that same run (it takes a market
+-- trip's comp worth from the property rows that come through with it).
+-- A side effect, by design: the summary step re-summarises the marked property trips (rating figures, property
+-- list, trip days, comp worth) with today's code and comp-worth bands. Part 6's P5 bounds the comp-worth change at
+-- 989 of 4.47 million property trips, -$15,385 of $36.6 million; the post-check reports the actual figures.
+--
+-- Which trips: every live BEM or WLM market trip with no property trip of the same guest and the same dates at IBE
+-- or IWA (the UAT pilot's rule). Placeholder guest ids (0 or below) are left out, as in the pilot.
+--
+-- Run it more than once, the same file each time, nothing to edit:
+--   run 1, the canary: the five UAT pilot guests (WLM 17600543027, 19606195360, 15903662806; BEM 13101515746,
+--          14100446118) plus a fixed 1% of the other affected guests. About 5,000 trips.
+--   run 2: everything that is left, about 394,000 trips. Before it queues anything it checks run 1's result
+--          itself, in both markets: its hourly run finished, its trips retired and their daily rows retired, none of
+--          its guests' trips left without a matching property trip, every new market trip summarised with all its
+--          daily rows, comp worth equal to the matching property trip's, and theo, free play and offer cost totals
+--          equal within 1% (over the pairs that hold the same transactions). Trips next to two property trips that
+--          overlap, an old leftover the market side cannot copy, are counted apart.
+--   run 3 and later, only if a post-check shows stragglers: whatever is left.
+-- Between runs Chris runs DAASI_3641_PROD_3_POSTCHECK.sql.
+--
+-- Settings at the top of the block; the normal path needs none of them:
+--   v_skip_canary       TRUE before the first run: everything in run 1, no canary.
+--   v_market_only       'BEM' or 'WLM': this run takes that market only (if the pre-check says run 2 is too big).
+--   v_pause_downstream  FALSE: leave the TIBCO tasks and dynamic tables alone (step 4 below), e.g. to pause them by hand.
+--   v_accept_unmatched, v_accept_totals: only if run 2's canary check stops and Chris's post-check explains why.
+--   v_wh_limit_ok       only if C1b stops because this role cannot read the warehouse's statement limit.
+--
+-- Checks before it changes anything (a STOP row says what is wrong, and nothing has been changed): a clean
+-- session and a long enough statement limit, the caps the pipeline will actually cut with (its own TRIP_CONFIG
+-- functions) on every date the live BEM/WLM market trips span, every task of the trip chain started, before the
+-- bulk run the two task limits below, the three streams it relies on current, the permissions it needs, the
+-- previous run processed.
+--
+-- Then:
+--   1. it waits for a quiet moment: no trip run under way and at least 10 minutes (run 1) or 30 (later runs) to
+--      the next, at most v_max_wait_minutes
+--   2. pauses the trip chain (ALTER TASK TRIP_ROOT_TASK SUSPEND), so nothing moves while it selects and writes
+--   3. selects the trips and the ratings; for run 2 it checks run 1's result first
+--   4. for the bulk run (20,000 trips or more): pauses the 4 DAAS_TIBCO_SMART tasks and the 20 dynamic tables
+--      August's runbook paused (readers first), so nothing downstream reads market trips between the rebuild and their
+--      summaries. It records what it paused in DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED, the list
+--      DAASI_3641_PROD_6_RESUME_DOWNSTREAM.sql resumes; anything paused before it ran is left alone and not listed
+--   5. takes zero-copy clones of TRIP_MASTER, TRIP_DETAIL, TRIP_SUMMARY and DAILY_ACTIVITY_SUMMARY in DAAS_BACKUP
+--      (<table>_DAASI_3641_RUN<n>: the post-check's before-picture and the undo's source), and writes one
+--      transaction:
+--        TRIP_RECALC_QUEUE: one row per trip, STATUS 'PENDING', BATCH_ID -3641, UPDATED_BY 'DAASI-3641 run <n>'
+--        TRIP_DETAIL: one rating row per property trip: UPDATED_DTTM, UPDATED_BY 'DAASI-3641 run <n>',
+--                     BATCH_ID -3641, LAST_DML_CD 'U' (what the ratings step writes when it re-reads a rating)
+--      Property trips with no TRIP_SUMMARY row are not marked (marking one would create a partial summary row).
+--   6. resumes the trip chain. If the gap ran out meanwhile, that hour's run is skipped and the next one takes it.
+-- If anything fails between 2 and 6, the transaction is rolled back and whatever it paused is resumed.
+-- If the file is cancelled or cut off midway (rare): in that worksheet run ROLLBACK; then
+-- ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME; then DAASI_3641_PROD_6_RESUME_DOWNSTREAM.sql (it resumes only
+-- what a DAASI-3641 run recorded as paused, once no queued trip is still waiting for its hourly run).
+--
+-- Before the bulk run, the trip tasks' owner gives its long hourly run room; the file checks this and stops if not:
+--   ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK SUSPEND;
+--   ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_SUMMARY_LOAD_TASK SET USER_TASK_TIMEOUT_MS = 28800000;    -- 8 h (4 h now)
+--   ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK SET USER_TASK_TIMEOUT_MS = 14400000; -- 4 h (none now)
+--   ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
+-- Why: the comp-worth task has no limit of its own, so it falls under the root task's 2-hour limit, which Snowflake
+-- applies to the whole task graph, and the bulk run's hourly run will likely last longer than that. A summary step cut
+-- off by its limit can also leave half-written summaries behind, because that step commits partway through.
+-- After the last run (the bulk run, and any run for stragglers after it: every run after the canary checks them),
+-- the owner keeps them or puts them back (a follow-up), between the same SUSPEND and RESUME:
+--   ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_SUMMARY_LOAD_TASK SET USER_TASK_TIMEOUT_MS = 14400000;
+--   ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK UNSET USER_TASK_TIMEOUT_MS;
+--
+-- What to expect after it. Run 1: the next hourly run takes a few minutes longer than usual. Run 2: that run will
+-- likely take 1 to 2.5 hours, most of it in the summary step, and the hourly runs after it start once it is done.
+-- Run 2, the bulk run: right after this file, Pete runs DAASI_3641_PROD_6_RESUME_DOWNSTREAM.sql. It waits for that
+-- hourly run to finish, then resumes what this file paused. Do not leave them paused for a day: a dynamic table
+-- paused for longer than its base tables keep their change history (1 day by default) cannot resume normally and has
+-- to be recreated. Once BATCH_S02 shows TRIP_COMP_WORTH and TRIP_NG_REVENUE_SUMMARY finished for it, Chris runs the
+-- post-check (it does not need anything paused).
+--
+-- Role (the same one for every run: run 2 reads run 1's clones): INSERT on DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE and
+-- UPDATE on DAAS_PROD.DAAS_CORE.TRIP_DETAIL (granted to APP_SERVICE_PROD, "AUTH SNOWFLAKE APP PROD", "AUTH SNOWFLAKE
+-- APP PROD BKP" and the owner DEVOPS_SERVICE_PROD), CREATE TABLE in DAAS_PROD.DAAS_BACKUP, OPERATE on
+-- DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK, for the bulk run OPERATE on the 24 downstream objects, and sight of the trip
+-- tasks (SHOW TASKS, GET_DDL). Warehouse: Large for run 1; X-Large for run 2, such as August's
+-- DAAS_PROD_ADHOC_BULK_LOAD_COMPUTE_XL, which reads TRIP_DETAIL a few times and rewrites much of it in the one write.
+-- The warehouse's own statement limit must allow 6 hours (C1b checks it).
+--
+-- Output: one row per check or step: n, step, verdict (ok / note / STOP / done), detail.
+-- The clones and the pause record stay until dropped, after the undo window and Tracy's sign-off:
+--   DROP TABLE DAAS_PROD.DAAS_BACKUP.<TRIP_MASTER | TRIP_DETAIL | TRIP_SUMMARY | DAILY_ACTIVITY_SUMMARY>_DAASI_3641_RUN<n>;
+--   DROP TABLE DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED;
+
+USE SCHEMA DAAS_PROD.DAAS_BACKUP;
+ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 28800;   -- 8 h: the wait and the write must not be cut short
+ALTER SESSION SET TIMEZONE = 'America/Los_Angeles';      -- the time zone the trip tables are written in
+ALTER SESSION SET LOCK_TIMEOUT = 900;                    -- give up after 15 minutes rather than queue behind a lock
+
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_skip_canary      BOOLEAN DEFAULT FALSE;  -- TRUE before run 1: queue every trip at once (no canary)
+    v_market_only      VARCHAR DEFAULT '';     -- 'BEM' or 'WLM': this run takes that market only
+    v_pause_downstream BOOLEAN DEFAULT TRUE;   -- FALSE: do not pause the TIBCO tasks and dynamic tables
+    v_accept_unmatched INTEGER DEFAULT 0;      -- run 2 only, and only if its canary check asks for it (see G)
+    v_accept_totals    BOOLEAN DEFAULT FALSE;  -- run 2 only, and only if its canary check asks for it (see G)
+    v_wh_limit_ok      BOOLEAN DEFAULT FALSE;  -- only if C1b asks for it
+    v_max_wait_minutes INTEGER DEFAULT 180;    -- longest wait for a quiet moment
+    v_log        VARCHAR DEFAULT '';
+    v_txt        VARCHAR;
+    v_cmd        VARCHAR;
+    v_wait       VARCHAR;
+    v_tag        VARCHAR;
+    v_sfx        VARCHAR;
+    v_prev_tag   VARCHAR;
+    v_mode       VARCHAR;
+    v_auto       VARCHAR;
+    v_tz         VARCHAR;
+    v_paused     VARCHAR DEFAULT '';       -- RESUME statements for what this run paused downstream, producers first
+    v_pause_cmds VARCHAR;
+    v_already    VARCHAR;
+    v_ours       VARCHAR;
+    v_err        VARCHAR DEFAULT '';
+    v_run        INTEGER;
+    v_last       INTEGER;
+    v_need       INTEGER;
+    v_waited     INTEGER DEFAULT 0;
+    v_gap        INTEGER;
+    v_exec       INTEGER;
+    v_n          INTEGER;
+    v_m          INTEGER;
+    v_k          INTEGER;
+    v_q          INTEGER;
+    v_t          INTEGER;
+    v_x          INTEGER;
+    v_y          INTEGER;
+    v_z          INTEGER;
+    v_d          INTEGER;
+    v_i          INTEGER;
+    v_empty      INTEGER DEFAULT 0;
+    v_rc         INTEGER;
+    v_sto        INTEGER;
+    v_wh_sto     INTEGER;
+    v_secs       INTEGER;
+    v_trips      INTEGER;
+    v_touch      INTEGER;
+    v_suspended  BOOLEAN DEFAULT FALSE;
+    v_committed  BOOLEAN DEFAULT FALSE;
+    v_bulk       BOOLEAN DEFAULT FALSE;
+    v_in_txn     BOOLEAN DEFAULT FALSE;
+    v_seen       BOOLEAN DEFAULT FALSE;
+    v_err_logged BOOLEAN DEFAULT FALSE;
+    v_recorded   BOOLEAN DEFAULT FALSE;
+    v_grant_ok   BOOLEAN DEFAULT TRUE;
+    v_fail       VARCHAR DEFAULT ',';
+    v_todo       VARCHAR;
+    v_left       VARCHAR;
+    v_pfail      VARCHAR DEFAULT '';
+    v_pass       INTEGER;
+    v_cover      INTEGER;
+    v_first      DATE;
+    v_last_dt    DATE;
+    v_p2_at      TIMESTAMP_LTZ;
+    v_next       TIMESTAMP_LTZ;
+    v_t0         TIMESTAMP_LTZ;
+    res          RESULTSET;
+    run_stop     EXCEPTION (-20641, 'DAASI-3641 PROD run stopped, see the rows');
+BEGIN
+    ---------------------------------------------------------------- checks: nothing here changes anything
+    -- C0. A clean session: no transaction left open (the clones below are DDL and would commit it), AUTOCOMMIT on,
+    --     and the trip tables' time zone.
+    IF (CURRENT_TRANSACTION() IS NOT NULL) THEN
+        v_log := v_log || 'C0 session~|~STOP~|~this worksheet has a transaction open (a cancelled statement?). Run ROLLBACK; or open a new worksheet, then run the file again#ROW#';
+        RAISE run_stop;
+    END IF;
+    SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION;
+    SELECT MAX("value") INTO :v_auto FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    IF (LOWER(COALESCE(v_auto, 'true')) <> 'true') THEN
+        v_log := v_log || 'C0 session~|~STOP~|~AUTOCOMMIT is off in this session. Run ALTER SESSION SET AUTOCOMMIT = TRUE; then this file again#ROW#';
+        RAISE run_stop;
+    END IF;
+    EXECUTE IMMEDIATE 'ALTER SESSION SET TIMEZONE = ''America/Los_Angeles''';
+    EXECUTE IMMEDIATE 'ALTER SESSION SET LOCK_TIMEOUT = 900';
+    SHOW PARAMETERS LIKE 'TIMEZONE' IN SESSION;
+    SELECT MAX("value") INTO :v_tz FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    v_log := v_log || 'C0 session~|~ok~|~role ' || CURRENT_ROLE() || ', warehouse ' || COALESCE(CURRENT_WAREHOUSE(), '(none)')
+                   || ', user ' || CURRENT_USER() || ', time zone ' || COALESCE(v_tz, '?') || '#ROW#';
+
+    -- C1. Which run is this? The queue rows of earlier runs carry their tag.
+    v_last := (SELECT COALESCE(MAX(TRY_TO_NUMBER(SPLIT_PART(updated_by, ' ', 3))), 0)
+               FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE
+               WHERE batch_id = -3641 AND updated_by LIKE 'DAASI-3641 run %');
+    v_run  := v_last + 1;
+    v_sfx  := 'RUN' || v_run;
+    v_tag  := 'DAASI-3641 run ' || v_run || IFF(v_run = 1 AND v_skip_canary, ' all', '');
+    v_need := IFF(v_run = 1 AND NOT v_skip_canary, 10, 30);
+    v_market_only := UPPER(TRIM(COALESCE(v_market_only, '')));
+    IF (v_market_only NOT IN ('', 'BEM', 'WLM')) THEN
+        v_log := v_log || 'C1 run~|~STOP~|~v_market_only must be empty, BEM or WLM#ROW#';
+        RAISE run_stop;
+    END IF;
+    IF (v_last > 0) THEN
+        v_prev_tag := (SELECT MAX(updated_by) FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE
+                       WHERE batch_id = -3641 AND updated_by LIKE ('DAASI-3641 run ' || :v_last || '%'));
+    END IF;
+    v_log := v_log || 'C1 run~|~ok~|~this is run ' || v_run
+                   || CASE WHEN v_run = 1 AND v_skip_canary THEN ' (every trip, no canary)'
+                           WHEN v_run = 1 THEN ' (the canary)'
+                           ELSE ' (everything left; previous: ' || COALESCE(v_prev_tag, '?') || ')' END
+                   || IFF(v_market_only <> '', ', ' || v_market_only || ' only', '') || '#ROW#';
+
+    -- C1b. A statement limit long enough for the wait, the pause and the write: the lower of the session's (the first
+    --      lines set 8 hours) and the warehouse's own. The bulk run stops if it cannot read the warehouse's.
+    SHOW PARAMETERS LIKE 'STATEMENT_TIMEOUT_IN_SECONDS' IN SESSION;
+    SELECT MAX("value") INTO :v_txt FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    v_sto := COALESCE(TRY_TO_NUMBER(v_txt), 0);
+    BEGIN
+        v_cmd := 'SHOW PARAMETERS LIKE ''STATEMENT_TIMEOUT_IN_SECONDS'' IN WAREHOUSE "' || CURRENT_WAREHOUSE() || '"';
+        EXECUTE IMMEDIATE v_cmd;
+        SELECT MAX("value") INTO :v_txt FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+        v_wh_sto := COALESCE(TRY_TO_NUMBER(v_txt), -1);
+    EXCEPTION
+        WHEN OTHER THEN
+            v_wh_sto := -1;
+    END;
+    IF (v_wh_sto < 0 AND (v_run > 1 OR v_skip_canary) AND NOT v_wh_limit_ok) THEN
+        v_log := v_log || 'C1b limit~|~STOP~|~this role cannot read the statement limit of warehouse ' || COALESCE(CURRENT_WAREHOUSE(), '(none)')
+                       || ', and the bulk run can need ' || (v_max_wait_minutes + 180) || ' minutes. Use a warehouse whose limit this role can '
+                       || 'read, or ask its owner (SHOW PARAMETERS LIKE ''STATEMENT_TIMEOUT_IN_SECONDS'' IN WAREHOUSE ...) and, if it is unset or at '
+                       || 'least that long, set v_wh_limit_ok to TRUE at the top. Nothing was changed#ROW#';
+        RAISE run_stop;
+    END IF;
+    v_k := LEAST(IFF(v_sto > 0, v_sto, 604800), IFF(v_wh_sto > 0, v_wh_sto, 604800));
+    IF (v_k < (v_max_wait_minutes + 180) * 60) THEN
+        v_log := v_log || 'C1b limit~|~STOP~|~statements here are stopped after ' || ROUND(v_k / 60) || ' minutes (session '
+                       || v_sto || ' s, warehouse ' || IFF(v_wh_sto < 0, 'not readable', v_wh_sto || ' s') || '); this file can need '
+                       || (v_max_wait_minutes + 180) || '. Run the whole file (its first lines allow 8 hours), on a warehouse that '
+                       || 'allows that, or lower v_max_wait_minutes. Nothing was changed#ROW#';
+        RAISE run_stop;
+    END IF;
+    v_log := v_log || 'C1b limit~|~' || IFF(v_wh_sto < 0, 'note', 'ok') || '~|~statements may run ' || ROUND(v_k / 60) || ' minutes'
+                   || IFF(v_wh_sto < 0, ' (the warehouse''s own limit is not readable' || IFF(v_wh_limit_ok, '; confirmed by v_wh_limit_ok', '') || ')', '')
+                   || '; this file can need about ' || (v_max_wait_minutes + 180) || '#ROW#';
+
+    -- C2. The caps the rebuild will cut with, read the way the pipeline reads them (its TRIP_CONFIG functions), on
+    --     every date the live BEM/WLM market trips span (from the earliest start to the latest end, or today if later):
+    --     MAX_TRIP_DAYS market BEM 1, WLM 3, property IBE 1, IWA 3, and TRIP_GAP_DAYS 1 for all four. (A date no config
+    --     row covers reads as empty, and the date-cutting loop would then never finish that trip: the recalculation
+    --     step would run into its limit.)
+    SELECT MIN(trip_start_dt), GREATEST(COALESCE(MAX(trip_end_dt), CURRENT_DATE()), CURRENT_DATE())
+      INTO :v_first, :v_last_dt
+      FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+     WHERE trip_type = 'MARKET' AND delete_ind = 'N' AND market_cd IN ('BEM', 'WLM');
+    v_first := COALESCE(v_first, CURRENT_DATE());
+    CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_CAPS (d VARCHAR, bem_days NUMBER, wlm_days NUMBER, ibe_days NUMBER,
+        iwa_days NUMBER, bem_gap NUMBER, wlm_gap NUMBER, ibe_gap NUMBER, iwa_gap NUMBER);
+    INSERT INTO DAASI_3641_RUN_CAPS
+    SELECT x.d,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', 'BEM', x.d)), -1)   AS bem_days,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', 'WLM', x.d)), -1)   AS wlm_days,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', 'IBE', x.d)), -1) AS ibe_days,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', 'IWA', x.d)), -1) AS iwa_days,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', 'BEM', x.d)), -1)   AS bem_gap,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', 'WLM', x.d)), -1)   AS wlm_gap,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('TRIP_GAP_DAYS', 'IBE', x.d)), -1) AS ibe_gap,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('TRIP_GAP_DAYS', 'IWA', x.d)), -1) AS iwa_gap
+    FROM (SELECT TO_VARCHAR(DATEADD(day, g.n, :v_first), 'YYYY-MM-DD') AS d
+          FROM (SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1 AS n FROM TABLE(GENERATOR(ROWCOUNT => 40000))) g
+          WHERE DATEADD(day, g.n, :v_first) <= :v_last_dt) x;
+    v_n := (SELECT COUNT(*) FROM DAASI_3641_RUN_CAPS
+            WHERE NOT (bem_days = 1 AND wlm_days = 3 AND ibe_days = 1 AND iwa_days = 3
+                       AND bem_gap = 1 AND wlm_gap = 1 AND ibe_gap = 1 AND iwa_gap = 1));
+    IF (v_n > 0) THEN
+        v_txt := (SELECT MIN(d) || ' to ' || MAX(d) FROM DAASI_3641_RUN_CAPS
+                  WHERE NOT (bem_days = 1 AND wlm_days = 3 AND ibe_days = 1 AND iwa_days = 3
+                             AND bem_gap = 1 AND wlm_gap = 1 AND ibe_gap = 1 AND iwa_gap = 1));
+        v_log := v_log || 'C2 caps~|~STOP~|~on ' || v_n || ' dates between ' || v_txt || ' the pipeline''s TRIP_CONFIG functions do '
+                       || 'not return MAX_TRIP_DAYS BEM 1, WLM 3, IBE 1, IWA 3 and TRIP_GAP_DAYS 1 (-1 = no config row covers the date), '
+                       || 'so the rebuild would cut those trips with other caps or not at all. The pre-check''s K9 lists them. Nothing was changed; send this row#ROW#';
+        RAISE run_stop;
+    END IF;
+    v_log := v_log || 'C2 caps~|~ok~|~the pipeline reads BEM 1, WLM 3, IBE 1, IWA 3 days and a 1-day gap on every date from '
+                   || TO_VARCHAR(v_first, 'YYYY-MM-DD') || ' to ' || TO_VARCHAR(v_last_dt, 'YYYY-MM-DD') || '#ROW#';
+
+    -- C3. The hourly chain: every one of its 20 tasks started (one suspended step stops the chain before the rebuild or
+    --     the summaries; the nightly archival step only affects the undo window, so it is a note).
+    SHOW TASKS IN SCHEMA DAAS_PROD.DAAS_COMMON;
+    CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_TASKS AS
+    SELECT "name"::VARCHAR AS task_name, "state"::VARCHAR AS task_state FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    v_txt := (SELECT LISTAGG(w.column1 || ' ' || COALESCE(t.task_state, 'not visible'), ', ')
+              FROM (VALUES ('TRIP_ROOT_TASK'), ('CORE2CORE_TRIP_FILTERED_TXNS_TASK'), ('CORE2CORE_TRIP_RATING_DOMAIN_PIPELINE_TASK'),
+                           ('CORE2CORE_TRIP_HOTEL_DOMAIN_PIPELINE_TASK'), ('CORE2CORE_TRIP_POS_DOMAIN_PIPELINE_TASK'),
+                           ('CORE2CORE_TRIP_OFFER_DOMAIN_PIPELINE_TASK'), ('CORE2CORE_TRIP_COMP_DOMAIN_PIPELINE_TASK'),
+                           ('CORE2CORE_TRIP_MARKERS_DOMAIN_PIPELINE_TASK'), ('CORE2CORE_TRIP_FREEPLAY_DOMAIN_PIPELINE_TASK'),
+                           ('CORE2CORE_TRIP_RECALCULATION_TASK'), ('CORE2CORE_TRIP_MERGE_CHECK_TASK'), ('CORE2CORE_TRIP_MERGE_TASK'),
+                           ('CORE2CORE_TRIP_CUSTOMER_MERGE_CHECK_GUEST_GUESTXREF_TASK'),
+                           ('CORE2CORE_TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER_TASK'), ('CORE2CORE_TRIP_CUSTOMER_MERGE_TASK'),
+                           ('CORE2CORE_TRIP_SUMMARY_POS_TENDER_LOAD_TASK'), ('CORE2CORE_TRIP_SUMMARY_LOAD_TASK'),
+                           ('CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK'), ('CORE2CORE_TRIP_NG_REVENUE_SUMMARY_LOAD_TASK')) w
+              LEFT JOIN DAASI_3641_RUN_TASKS t ON t.task_name = w.column1
+              WHERE COALESCE(t.task_state, '') <> 'started');
+    IF (COALESCE(v_txt, '') <> '') THEN
+        v_log := v_log || 'C3 chain~|~STOP~|~not started (or not visible to this role): ' || v_txt
+                       || '. If a DAASI-3641 file was cut off and left TRIP_ROOT_TASK paused: ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;'
+                       || ' Nothing was changed#ROW#';
+        RAISE run_stop;
+    END IF;
+    v_txt := (SELECT MAX(task_state) FROM DAASI_3641_RUN_TASKS WHERE task_name = 'CORE2CORE_TRIP_INACTIVE_TXNS_ARCHIVAL_TASK');
+    v_log := v_log || 'C3 chain~|~ok~|~TRIP_ROOT_TASK and its 18 steps up to comp worth and NG are started'
+                   || IFF(COALESCE(v_txt, '') = 'started', '', '; note: the archival step is ' || COALESCE(v_txt, 'not visible')
+                          || ' (that only lengthens the undo window)') || '#ROW#';
+
+    -- C3b. Room for the bulk run's long hourly run (every run after the canary): the summary task's own limit at least
+    --      6 hours, and the comp-worth task with a limit of its own of at least 3 hours. Without one it falls under the
+    --      root task's 2-hour limit, which Snowflake applies to the whole task graph.
+    IF (v_run > 1 OR v_skip_canary) THEN
+        BEGIN
+            v_txt := (SELECT GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_SUMMARY_LOAD_TASK'));
+            v_n := COALESCE(TRY_TO_NUMBER(REGEXP_SUBSTR(REPLACE(UPPER(v_txt), ' ', ''), 'USER_TASK_TIMEOUT_MS=([0-9]+)', 1, 1, 'e', 1)), 0);
+            v_txt := (SELECT GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK'));
+            v_m := COALESCE(TRY_TO_NUMBER(REGEXP_SUBSTR(REPLACE(UPPER(v_txt), ' ', ''), 'USER_TASK_TIMEOUT_MS=([0-9]+)', 1, 1, 'e', 1)), 0);
+        EXCEPTION
+            WHEN OTHER THEN
+                v_n := -1;
+                v_m := -1;
+        END;
+        IF (v_n < 21600000 OR v_m < 10800000) THEN
+            v_log := v_log || 'C3b limits~|~STOP~|~' || IFF(v_n < 0, 'this role cannot read the trip tasks'' definitions (GET_DDL). ',
+                                  'the summary task''s limit is ' || ROUND(v_n / 3600000, 1) || ' h (needs 6 or more) and the comp-worth task''s own limit '
+                                  || IFF(v_m = 0, 'is not set', 'is ' || ROUND(v_m / 3600000, 1) || ' h') || ' (needs 3 or more). ')
+                           || 'The trip tasks'' owner runs: ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK SUSPEND; '
+                           || 'ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_SUMMARY_LOAD_TASK SET USER_TASK_TIMEOUT_MS = 28800000; '
+                           || 'ALTER TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK SET USER_TASK_TIMEOUT_MS = 14400000; '
+                           || 'ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME; then this file again. Nothing was changed#ROW#';
+            RAISE run_stop;
+        END IF;
+        v_log := v_log || 'C3b limits~|~ok~|~summary task ' || ROUND(v_n / 3600000, 1) || ' h, comp-worth task '
+                       || ROUND(v_m / 3600000, 1) || ' h of its own#ROW#';
+    END IF;
+
+    -- C4. The three streams this relies on: the queue's (read by the recalculation step), the summary step's, and the
+    --     daily-summary stream on TRIP_MASTER (it retires the daily rows of retired trips). All current; the summary
+    --     stream a standard one, since the marked ratings are updates, which an append-only stream would not show.
+    --     None of this file's queue rows may be waiting already.
+    SHOW STREAMS IN SCHEMA DAAS_PROD.DAAS_CORE;
+    CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_STREAMS AS
+    SELECT "name"::VARCHAR AS stream_name, "mode"::VARCHAR AS stream_mode, "stale"::VARCHAR AS stale
+    FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+    WHERE "name" IN ('TRIP_RECALC_QUEUE_STREAM', 'TRIP_DETAIL_SUMMARY_STREAM', 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM');
+    v_n := (SELECT COUNT(*) FROM DAASI_3641_RUN_STREAMS WHERE LOWER(stale) = 'false');
+    v_mode := (SELECT MAX(stream_mode) FROM DAASI_3641_RUN_STREAMS WHERE stream_name = 'TRIP_DETAIL_SUMMARY_STREAM');
+    IF (v_n <> 3 OR UPPER(COALESCE(v_mode, '')) <> 'DEFAULT') THEN
+        v_txt := (SELECT COALESCE(LISTAGG(stream_name || ' ' || stream_mode || ' stale=' || stale, ', '), 'none is visible to this role')
+                  FROM DAASI_3641_RUN_STREAMS);
+        v_log := v_log || 'C4 streams~|~STOP~|~expected all three current and the summary stream DEFAULT: ' || v_txt || '. Nothing was changed#ROW#';
+        RAISE run_stop;
+    END IF;
+    v_n := (SELECT COUNT(*) FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM
+            WHERE METADATA$ACTION = 'INSERT' AND batch_id = -3641);
+    IF (v_n > 0) THEN
+        v_log := v_log || 'C4 streams~|~STOP~|~' || v_n || ' of our queue rows are still waiting for the recalculation step: '
+                       || 'the previous run has not been processed yet. Run this again after the next hourly run#ROW#';
+        RAISE run_stop;
+    END IF;
+    v_log := v_log || 'C4 streams~|~ok~|~queue, summary and daily-summary streams current, summary stream DEFAULT, none of ours waiting#ROW#';
+
+    -- C5. May this role write what the run writes? Statements that match nothing answer it.
+    BEGIN
+        INSERT INTO DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE (TRIP_MASTER_ID, STATUS, BATCH_ID, CREATED_DTTM, CREATED_BY, UPDATED_DTTM, UPDATED_BY)
+        SELECT trip_master_id, status, batch_id, created_dttm, created_by, updated_dttm, updated_by
+        FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE WHERE 1 = 0;
+        UPDATE DAAS_PROD.DAAS_CORE.TRIP_DETAIL SET last_dml_cd = last_dml_cd WHERE 1 = 0;
+        CREATE OR REPLACE TRANSIENT TABLE DAAS_PROD.DAAS_BACKUP.DAASI_3641_RUN_PERMISSION_TEST (x INTEGER);
+        DROP TABLE IF EXISTS DAAS_PROD.DAAS_BACKUP.DAASI_3641_RUN_PERMISSION_TEST;
+    EXCEPTION
+        WHEN OTHER THEN
+            v_log := v_log || 'C5 permissions~|~STOP~|~' || REPLACE(REPLACE(LEFT(SQLERRM, 300), '#ROW#', ''), '~|~', '')
+                           || '. This role needs INSERT on TRIP_RECALC_QUEUE, UPDATE on TRIP_DETAIL and CREATE TABLE in DAAS_BACKUP. Nothing was changed#ROW#';
+            RAISE run_stop;
+    END;
+    v_log := v_log || 'C5 permissions~|~ok~|~may queue trips, mark ratings and create the backup copies#ROW#';
+
+    -- C6. The previous run, if any: every trip it queued has been processed (no longer live).
+    IF (v_last > 0) THEN
+        v_n := (SELECT COUNT(*) FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE q
+                JOIN DAAS_PROD.DAAS_CORE.TRIP_MASTER m ON m.trip_master_id = q.trip_master_id
+                WHERE q.batch_id = -3641 AND q.updated_by = :v_prev_tag AND m.delete_ind = 'N');
+        IF (v_n > 0) THEN
+            v_log := v_log || 'C6 previous run~|~STOP~|~' || v_n || ' trips that ' || v_prev_tag || ' queued are still live: '
+                           || 'the hourly run has not processed them yet (or that run was undone). Run this again after the hourly '
+                           || 'run and the post-check; after an undo, check with Chris first#ROW#';
+            RAISE run_stop;
+        END IF;
+        v_log := v_log || 'C6 previous run~|~ok~|~every trip ' || v_prev_tag || ' queued has been retired by the pipeline#ROW#';
+    END IF;
+
+    -- C7. Downstream: the 4 DAAS_TIBCO_SMART tasks and 20 dynamic tables August's runbook paused, and their state now.
+    --     The bulk run pauses the ones running (step 4); one that is already paused is left as it is.
+    CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_DOWNSTREAM AS
+    SELECT v.column1 AS ord, v.column2 AS kind, v.column3 AS schema_name, v.column4 AS object_name,
+           'DAAS_PROD.' || v.column3 || '.' || v.column4 AS full_name, CAST(NULL AS VARCHAR) AS state_now,
+           CAST(NULL AS NUMBER(38,0)) AS paused_by_run
+    FROM (VALUES (1, 'DYNAMIC TABLE', 'DAAS_CORE', 'TRIP_SUMMARY_DT'), (2, 'DYNAMIC TABLE', 'DAAS_CORE', 'DAILY_SUMMARY_DT'),
+                 (3, 'DYNAMIC TABLE', 'DAAS_CORE', 'TRIP_DETAILS_GAMING_DT'), (4, 'DYNAMIC TABLE', 'DAAS_CORE', 'TRIP_DETAILS_COMP_DT'),
+                 (5, 'DYNAMIC TABLE', 'DAAS_CORE', 'TRIP_DETAILS_POS_DT'), (6, 'DYNAMIC TABLE', 'DAAS_CORE', 'TRIP_DETAILS_FREEPLAY_DT'),
+                 (7, 'DYNAMIC TABLE', 'DAAS_CORE', 'TRIP_DETAILS_OFFER_DT'), (8, 'DYNAMIC TABLE', 'DAAS_CORE', 'TRIP_DETAILS_MARKERS_DT'),
+                 (9, 'DYNAMIC TABLE', 'DAAS_CORE', 'TRIP_DETAILS_HOTEL_RESERVATIONS_DT'),
+                 (10, 'DYNAMIC TABLE', 'DAAS_CORE', 'TRIP_DETAILS_HOTEL_FOLIOS_DT'),
+                 (11, 'DYNAMIC TABLE', 'DAAS_CORE', 'DAILY_SUMMARY_YEAR_MONTH_METRICS'),
+                 (12, 'DYNAMIC TABLE', 'DAAS_TIBCO_DWS', 'TRIP_SUMMARY_18MO'), (13, 'DYNAMIC TABLE', 'DAAS_TIBCO_DWS', 'GST_12_MONTH_PLUS'),
+                 (14, 'DYNAMIC TABLE', 'DAAS_TIBCO_DWS', 'GST_24_MONTH_PLUS'), (15, 'DYNAMIC TABLE', 'DAAS_TIBCO_DWS', 'GST_ACTIVITY_FTD'),
+                 (16, 'DYNAMIC TABLE', 'DAAS_TIBCO_DWS', 'GST_PDB_TRIP'), (17, 'DYNAMIC TABLE', 'DAAS_TIBCO_DWS', 'NG_SPEND_BY_CATG'),
+                 (18, 'DYNAMIC TABLE', 'DAAS_TIBCO_DWS', 'RMS_TRIPS'), (19, 'DYNAMIC TABLE', 'DAAS_TIBCO_DWS', 'TRIP_NG_REVENUE_SUMMARY'),
+                 (20, 'DYNAMIC TABLE', 'DAAS_TIBCO_DWS', 'TRIP_SUMMARY'),
+                 (21, 'TASK', 'DAAS_TIBCO_SMART', 'DT_AP_12_MONTH_PLUS'), (22, 'TASK', 'DAAS_TIBCO_SMART', 'DT_AP_ACTIVITY_FTD'),
+                 (23, 'TASK', 'DAAS_TIBCO_SMART', 'DT_AP_TRIP_DTL'), (24, 'TASK', 'DAAS_TIBCO_SMART', 'DT_GST_TRIP_DTL')) v;
+    IF (v_pause_downstream) THEN
+        BEGIN
+            SHOW DYNAMIC TABLES IN SCHEMA DAAS_PROD.DAAS_CORE;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET state_now = IFF(UPPER(r."scheduling_state"::VARCHAR) = 'SUSPENDED', 'suspended', 'running')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+             WHERE d.kind = 'DYNAMIC TABLE' AND d.schema_name = 'DAAS_CORE' AND r."name"::VARCHAR = d.object_name;
+            SHOW DYNAMIC TABLES IN SCHEMA DAAS_PROD.DAAS_TIBCO_DWS;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET state_now = IFF(UPPER(r."scheduling_state"::VARCHAR) = 'SUSPENDED', 'suspended', 'running')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+             WHERE d.kind = 'DYNAMIC TABLE' AND d.schema_name = 'DAAS_TIBCO_DWS' AND r."name"::VARCHAR = d.object_name;
+            SHOW TASKS IN SCHEMA DAAS_PROD.DAAS_TIBCO_SMART;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET state_now = IFF(r."state"::VARCHAR = 'suspended', 'suspended', 'running')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+             WHERE d.kind = 'TASK' AND r."name"::VARCHAR = d.object_name;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_err := REPLACE(REPLACE(LEFT(SQLERRM, 200), '#ROW#', ''), '~|~', '');
+        END;
+        v_n := (SELECT COUNT(*) FROM DAASI_3641_RUN_DOWNSTREAM WHERE state_now IS NULL);
+        -- the ones an earlier DAASI-3641 run paused and nobody has resumed yet: the resume file covers those as well
+        v_k := (SELECT COUNT(*) FROM DAAS_PROD.INFORMATION_SCHEMA.TABLES
+                WHERE table_schema = 'DAAS_BACKUP' AND table_name = 'DAASI_3641_PAUSED');
+        IF (v_k > 0) THEN
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET paused_by_run = p.run_no
+              FROM (SELECT full_name, MAX(run_no) AS run_no FROM DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED
+                    WHERE resumed_at IS NULL GROUP BY full_name) p
+             WHERE p.full_name = d.full_name AND d.state_now = 'suspended';
+        END IF;
+        v_already := (SELECT LISTAGG(full_name, ', ') WITHIN GROUP (ORDER BY ord) FROM DAASI_3641_RUN_DOWNSTREAM
+                      WHERE state_now = 'suspended' AND paused_by_run IS NULL);
+        v_ours := (SELECT LISTAGG(full_name || ' (run ' || paused_by_run || ')', ', ') WITHIN GROUP (ORDER BY ord)
+                   FROM DAASI_3641_RUN_DOWNSTREAM WHERE state_now = 'suspended' AND paused_by_run IS NOT NULL);
+        IF (v_n > 0 AND (v_run > 1 OR v_skip_canary)) THEN
+            v_txt := (SELECT LISTAGG(full_name, ', ') WITHIN GROUP (ORDER BY ord) FROM DAASI_3641_RUN_DOWNSTREAM WHERE state_now IS NULL);
+            v_log := v_log || 'C7 downstream~|~STOP~|~cannot see ' || v_n || ' of the 24 downstream objects: ' || v_txt
+                           || IFF(v_err <> '', ' (' || v_err || ')', '') || '. Use a role that can (it also needs OPERATE on them), or set v_pause_downstream to FALSE and pause them by hand. Nothing was changed#ROW#';
+            RAISE run_stop;
+        END IF;
+        v_log := v_log || 'C7 downstream~|~' || IFF(COALESCE(v_already, '') = '' AND COALESCE(v_ours, '') = '', 'ok', 'note') || '~|~'
+                       || (24 - v_n) || ' of the 24 TIBCO tasks and dynamic tables seen'
+                       || IFF(COALESCE(v_already, '') = '', '', '; paused before DAASI-3641, so left as they are and NOT resumed by the resume file: ' || v_already)
+                       || IFF(COALESCE(v_ours, '') = '', '', '; still paused by an earlier DAASI-3641 run (the resume file resumes them): ' || v_ours)
+                       || '. The bulk run pauses the rest#ROW#';
+    END IF;
+
+    ---------------------------------------------------------------- W. wait for a quiet moment
+    -- No trip run under way, and enough minutes to the next one that the pause below is unlikely to skip it.
+    LOOP
+        BEGIN
+            SELECT COUNT(*), COUNT_IF(state = 'EXECUTING'), MIN(IFF(state = 'SCHEDULED', scheduled_time, NULL))
+              INTO :v_k, :v_exec, :v_next
+              FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.CURRENT_TASK_GRAPHS(ROOT_TASK_NAME => 'TRIP_ROOT_TASK'))
+             WHERE database_name = 'DAAS_PROD' AND schema_name = 'DAAS_COMMON';
+        EXCEPTION
+            WHEN OTHER THEN
+                v_k := -1;
+        END;
+        IF (v_k > 0) THEN
+            v_seen := TRUE;
+            v_gap := IFF(v_next IS NULL, 999, DATEDIFF(minute, CURRENT_TIMESTAMP(), v_next));
+        ELSE
+            -- Nothing listed: no sight of the chain, or a moment between a run ending and the next being scheduled.
+            v_empty := v_empty + 1;
+            IF (v_k < 0 OR (NOT v_seen AND v_empty >= 3)) THEN
+                v_log := v_log || 'W wait~|~STOP~|~this role cannot see the trip chain''s runs (CURRENT_TASK_GRAPHS shows nothing for '
+                               || 'TRIP_ROOT_TASK). It needs OPERATE on DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK, which pausing the chain needs '
+                               || 'anyway. Nothing was changed#ROW#';
+                RAISE run_stop;
+            END IF;
+            v_exec := 1;      -- not quiet yet: look again in a minute
+            v_gap := 0;
+        END IF;
+        IF (v_exec = 0 AND v_gap >= v_need) THEN
+            BREAK;
+        END IF;
+        IF (v_waited >= v_max_wait_minutes * 60) THEN
+            v_log := v_log || 'W wait~|~STOP~|~no quiet moment within ' || v_max_wait_minutes || ' minutes ('
+                           || IFF(v_k = 0, 'the trip chain has not been listed lately: is TRIP_ROOT_TASK paused?',
+                                  'a trip run under way: ' || v_exec || ', minutes to the next: ' || v_gap)
+                           || '). Nothing was changed; run this again later#ROW#';
+            RAISE run_stop;
+        END IF;
+        v_wait := (SELECT SYSTEM$WAIT(60));
+        v_waited := v_waited + 60;
+    END LOOP;
+    v_log := v_log || 'W wait~|~ok~|~quiet after ' || (v_waited / 60)::INTEGER || ' minutes of waiting; next trip run in ' || v_gap || ' minutes#ROW#';
+
+    ---------------------------------------------------------------- from the pause to the resume
+    BEGIN
+        -- P1. Pause the trip chain, then make sure no run is still going (one could have started a moment ago).
+        BEGIN
+            ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK SUSPEND;
+            v_suspended := TRUE;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || 'P1 pause~|~STOP~|~could not pause TRIP_ROOT_TASK: ' || REPLACE(REPLACE(LEFT(SQLERRM, 200), '#ROW#', ''), '~|~', '')
+                               || '. This role needs OPERATE on it. Nothing was changed#ROW#';
+                RAISE run_stop;
+        END;
+        v_i := 0;
+        LOOP
+            v_exec := (SELECT COUNT_IF(state = 'EXECUTING')
+                       FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.CURRENT_TASK_GRAPHS(ROOT_TASK_NAME => 'TRIP_ROOT_TASK'))
+                       WHERE database_name = 'DAAS_PROD' AND schema_name = 'DAAS_COMMON');
+            IF (v_exec = 0) THEN
+                BREAK;
+            END IF;
+            IF (v_i >= LEAST(v_max_wait_minutes, 60)) THEN
+                v_log := v_log || 'P1 pause~|~STOP~|~a trip run that started just before the pause is still going after ' || v_i
+                               || ' minutes. Nothing was changed; the chain is resumed#ROW#';
+                RAISE run_stop;
+            END IF;
+            v_wait := (SELECT SYSTEM$WAIT(60));
+            v_i := v_i + 1;
+        END LOOP;
+        v_log := v_log || 'P1 pause~|~ok~|~TRIP_ROOT_TASK paused at ' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'HH24:MI')
+                       || ' Pacific' || IFF(v_i > 0, ', after a run that had just started finished (' || v_i || ' min)', '')
+                       || '; nothing in the trip chain moves until this file resumes it#ROW#';
+
+        ------------------------------------------------------------ S1. the trips to queue
+        CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_CANDIDATES AS
+        WITH pr AS (
+            SELECT DISTINCT guest_unique_id, DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd, trip_start_dt, trip_end_dt
+            FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+            WHERE trip_type = 'PROPERTY' AND delete_ind = 'N' AND property_cd IN ('IBE', 'IWA')
+        ),
+        tw AS (
+            SELECT m.trip_master_id, m.guest_unique_id, m.market_cd, m.trip_start_dt, m.trip_end_dt, m.created_dttm
+            FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+            LEFT JOIN pr
+                   ON pr.guest_unique_id = m.guest_unique_id AND pr.market_cd = m.market_cd
+                  AND pr.trip_start_dt = m.trip_start_dt AND pr.trip_end_dt = m.trip_end_dt
+            WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND m.market_cd IN ('BEM', 'WLM')
+              AND m.guest_unique_id > 0
+              AND pr.guest_unique_id IS NULL
+        )
+        SELECT tw.*,
+               (tw.guest_unique_id IN (17600543027, 19606195360, 15903662806, 13101515746, 14100446118)) AS pilot_guest,
+               (MOD(ABS(HASH(tw.guest_unique_id)), 100) = 0)                                             AS sample_guest
+        FROM tw;
+
+        v_n := (SELECT COUNT(*) FROM DAASI_3641_RUN_CANDIDATES);
+        v_m := (SELECT COUNT(DISTINCT guest_unique_id) FROM DAASI_3641_RUN_CANDIDATES);
+        v_log := v_log || 'S1 scope~|~ok~|~' || v_n || ' live BEM/WLM market trips of ' || v_m
+                       || ' guests have no matching IBE/IWA property trip (placeholder guest ids left out)#ROW#';
+        -- every market, before the filters below: run 2's check on run 1 (G) looks at both markets whatever this run takes
+        CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_CANDIDATES_ALL AS SELECT * FROM DAASI_3641_RUN_CANDIDATES;
+        IF (v_market_only <> '') THEN
+            DELETE FROM DAASI_3641_RUN_CANDIDATES WHERE market_cd <> :v_market_only;
+        END IF;
+        IF (v_run = 1 AND NOT v_skip_canary) THEN
+            DELETE FROM DAASI_3641_RUN_CANDIDATES WHERE NOT (pilot_guest OR sample_guest);
+        END IF;
+        v_trips := (SELECT COUNT(*) FROM DAASI_3641_RUN_CANDIDATES);
+        IF (v_trips = 0) THEN
+            v_log := v_log || 'S1 scope~|~done~|~nothing left to rebuild. Nothing was changed#ROW#';
+            RAISE run_stop;
+        END IF;
+
+        ------------------------------------------------------------ G. run 2: run 1, the canary, came out clean
+        IF (v_last = 1 AND v_prev_tag = 'DAASI-3641 run 1') THEN
+            -- run 1's hourly run has finished: a successful summary, comp-worth and NG step after the recalculation batch
+            -- that took its trips (an attempt that failed or hung is passed over; the checks below see what it left)
+            v_rc := (SELECT MIN(r.batch_id)
+                     FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_PROCESSED r
+                     JOIN DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE q ON q.trip_master_id = r.trip_master_id
+                     WHERE q.batch_id = -3641 AND q.updated_by = 'DAASI-3641 run 1'
+                       AND r.created_dttm >= DATEADD(hour, -12, q.created_dttm));
+            v_k := (SELECT COUNT(DISTINCT j.job_name)
+                    FROM DAAS_PROD.DAAS_COMMON.BATCH_S02 b
+                    JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+                    WHERE j.job_name IN ('TRIP_SUMMARY_WRAPPER', 'TRIP_COMP_WORTH', 'TRIP_NG_REVENUE_SUMMARY')
+                      AND b.batch_id > :v_rc AND STARTSWITH(b.batch_status, 'SUCCESS'));
+            IF (v_rc IS NULL OR v_k < 3) THEN
+                v_log := v_log || 'G canary~|~STOP~|~run 1''s hourly run has not finished yet (a successful summary, comp-worth and NG step '
+                               || 'after the recalculation batch that took its trips). Nothing was changed; run this again once BATCH_S02 shows '
+                               || 'them and Chris''s post-check is clean#ROW#';
+                RAISE run_stop;
+            END IF;
+
+            CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_PREV AS
+            SELECT DISTINCT c.guest_unique_id, c.market_cd
+            FROM DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3641_RUN1 c
+            JOIN DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE q ON q.trip_master_id = c.trip_master_id
+            WHERE q.batch_id = -3641 AND q.updated_by = 'DAASI-3641 run 1';
+
+            CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_PREV_PAIRS AS
+            WITH mx AS (SELECT MAX(trip_master_id) AS max_tm FROM DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3641_RUN1),
+            mk AS (
+                SELECT m.trip_master_id, m.guest_unique_id, m.market_cd, m.trip_start_dt, m.trip_end_dt
+                FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+                JOIN DAASI_3641_RUN_PREV g ON g.guest_unique_id = m.guest_unique_id AND g.market_cd = m.market_cd
+                WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND m.trip_master_id > (SELECT max_tm FROM mx)
+            ),
+            pr AS (
+                SELECT m.trip_master_id, m.guest_unique_id, DECODE(m.property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd,
+                       m.trip_start_dt, m.trip_end_dt
+                FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+                WHERE m.trip_type = 'PROPERTY' AND m.delete_ind = 'N' AND m.property_cd IN ('IBE', 'IWA')
+                  AND m.guest_unique_id IN (SELECT guest_unique_id FROM DAASI_3641_RUN_PREV)
+            )
+            SELECT mk.trip_master_id AS market_trip_id, pr.trip_master_id AS property_trip_id,
+                   (sm.trip_master_id IS NOT NULL) AS market_has_summary,
+                   (sp.trip_master_id IS NOT NULL) AS property_has_summary,
+                   COALESCE(sm.comp_worth, 0)      AS market_cw,
+                   COALESCE(sp.comp_worth, 0)      AS property_cw
+            FROM mk
+            LEFT JOIN pr ON pr.guest_unique_id = mk.guest_unique_id AND pr.market_cd = mk.market_cd
+                        AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt
+            LEFT JOIN DAAS_PROD.DAAS_CORE.TRIP_SUMMARY sm ON sm.trip_master_id = mk.trip_master_id
+            LEFT JOIN DAAS_PROD.DAAS_CORE.TRIP_SUMMARY sp ON sp.trip_master_id = pr.trip_master_id
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY mk.trip_master_id ORDER BY pr.trip_master_id) = 1;
+
+            -- Property trips of those guests that share a day with another live property trip of theirs (an old leftover:
+            -- two live trips on one day). Rebuilt market trips never overlap, so a market trip next to such a pair can stay
+            -- without an identical property trip; those are counted apart, not as a failure.
+            CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_PREV_OVERLAP AS
+            SELECT DISTINCT p1.guest_unique_id, DECODE(p1.property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd,
+                   p1.trip_start_dt, p1.trip_end_dt
+            FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER p1
+            JOIN DAAS_PROD.DAAS_CORE.TRIP_MASTER p2
+              ON p2.guest_unique_id = p1.guest_unique_id AND p2.property_cd = p1.property_cd
+             AND p2.trip_type = 'PROPERTY' AND p2.delete_ind = 'N' AND p2.trip_master_id <> p1.trip_master_id
+             AND p2.trip_start_dt <= p1.trip_end_dt AND p2.trip_end_dt >= p1.trip_start_dt
+            WHERE p1.trip_type = 'PROPERTY' AND p1.delete_ind = 'N' AND p1.property_cd IN ('IBE', 'IWA')
+              AND p1.guest_unique_id IN (SELECT guest_unique_id FROM DAASI_3641_RUN_PREV);
+
+            CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_PREV_LEFT AS   -- run 1's guests' market trips still unmatched
+            SELECT c.trip_master_id, MAX(IFF(o.guest_unique_id IS NULL, 0, 1)) AS next_to_overlap
+            FROM DAASI_3641_RUN_CANDIDATES_ALL c
+            JOIN DAASI_3641_RUN_PREV g ON g.guest_unique_id = c.guest_unique_id AND g.market_cd = c.market_cd
+            LEFT JOIN DAASI_3641_RUN_PREV_OVERLAP o
+                   ON o.guest_unique_id = c.guest_unique_id AND o.market_cd = c.market_cd
+                  AND o.trip_start_dt <= c.trip_end_dt AND o.trip_end_dt >= c.trip_start_dt
+            GROUP BY c.trip_master_id;
+
+            -- Which transactions each trip of a pair holds (live, OPENED), as one fingerprint per trip: the checks
+            -- below compare like with like, so an old difference between the two sides (a transaction the property
+            -- trip had and the market side never got) cannot stop the run.
+            CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_PREV_FP AS
+            SELECT d.trip_master_id, HASH_AGG(DISTINCT d.transaction_table, d.transaction_table_sk) AS fp
+            FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+            WHERE d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+              AND d.trip_master_id IN (SELECT market_trip_id FROM DAASI_3641_RUN_PREV_PAIRS
+                                       UNION ALL SELECT property_trip_id FROM DAASI_3641_RUN_PREV_PAIRS)
+            GROUP BY d.trip_master_id;
+
+            -- Totals over the pairs that hold the same transactions and both have a summary row: theo, free play and
+            -- offer cost, market against property. Each should be equal; a systematic loss in any summary step would
+            -- show here.
+            CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_PREV_SUMS AS
+            SELECT COUNT(*) AS pairs,
+                   COUNT_IF(fm.fp = fq.fp) AS same_tx_pairs,
+                   COUNT_IF(fm.fp = fq.fp AND ABS(COALESCE(sm.total_theo_win_amt, 0) - COALESCE(sp.total_theo_win_amt, 0)) >= 0.01) AS theo_pairs_differ,
+                   SUM(IFF(fm.fp = fq.fp, COALESCE(sm.total_theo_win_amt, 0), 0)) AS m_theo,
+                   SUM(IFF(fm.fp = fq.fp, COALESCE(sp.total_theo_win_amt, 0), 0)) AS p_theo,
+                   SUM(IFF(fm.fp = fq.fp, COALESCE(sm.dlc_fsp_dollar_amt, 0), 0)) AS m_fp,
+                   SUM(IFF(fm.fp = fq.fp, COALESCE(sp.dlc_fsp_dollar_amt, 0), 0)) AS p_fp,
+                   SUM(IFF(fm.fp = fq.fp, COALESCE(sm.offer_total_cost, 0), 0))   AS m_offer,
+                   SUM(IFF(fm.fp = fq.fp, COALESCE(sp.offer_total_cost, 0), 0))   AS p_offer
+            FROM DAASI_3641_RUN_PREV_PAIRS p
+            JOIN DAAS_PROD.DAAS_CORE.TRIP_SUMMARY sm ON sm.trip_master_id = p.market_trip_id
+            JOIN DAAS_PROD.DAAS_CORE.TRIP_SUMMARY sp ON sp.trip_master_id = p.property_trip_id
+            LEFT JOIN DAASI_3641_RUN_PREV_FP fm ON fm.trip_master_id = p.market_trip_id
+            LEFT JOIN DAASI_3641_RUN_PREV_FP fq ON fq.trip_master_id = p.property_trip_id;
+
+            v_n := (SELECT COUNT(*) FROM DAASI_3641_RUN_PREV_LEFT WHERE next_to_overlap = 0);
+            v_x := (SELECT COUNT(*) FROM DAASI_3641_RUN_PREV_LEFT WHERE next_to_overlap = 1);
+            v_m := (SELECT COUNT(*) FROM DAASI_3641_RUN_PREV_PAIRS WHERE NOT market_has_summary);
+            v_k := (SELECT COUNT(*) FROM DAASI_3641_RUN_PREV_PAIRS
+                    WHERE market_has_summary AND property_trip_id IS NOT NULL AND property_has_summary
+                      AND ABS(market_cw - property_cw) >= 0.01);
+            v_q := (SELECT COUNT(*) FROM DAASI_3641_RUN_PREV_PAIRS);
+            v_y := (SELECT COUNT_IF(ABS(m - p) > GREATEST(1, 0.01 * ABS(p)))
+                    FROM (SELECT m_theo AS m, p_theo AS p FROM DAASI_3641_RUN_PREV_SUMS
+                          UNION ALL SELECT m_fp, p_fp FROM DAASI_3641_RUN_PREV_SUMS
+                          UNION ALL SELECT m_offer, p_offer FROM DAASI_3641_RUN_PREV_SUMS));
+            v_z := (SELECT COUNT(*) FROM DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY s
+                    JOIN DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE q ON q.trip_master_id = s.trip_master_id
+                    WHERE q.batch_id = -3641 AND q.updated_by = 'DAASI-3641 run 1' AND s.delete_ind = 'N');
+            -- new market trips missing a daily row their twin has, where the two hold the same transactions and a live
+            -- transaction of the twin covers that day (a twin can keep a daily row for a day nothing covers any more)
+            v_d := (SELECT COUNT(DISTINCT p.market_trip_id)
+                    FROM DAASI_3641_RUN_PREV_PAIRS p
+                    JOIN DAASI_3641_RUN_PREV_FP fm ON fm.trip_master_id = p.market_trip_id
+                    JOIN DAASI_3641_RUN_PREV_FP fq ON fq.trip_master_id = p.property_trip_id AND fq.fp = fm.fp
+                    JOIN DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY dp ON dp.trip_master_id = p.property_trip_id AND dp.delete_ind = 'N'
+                    JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL t
+                      ON t.trip_master_id = p.property_trip_id AND t.delete_ind = 'N' AND t.transaction_sub_type = 'OPENED'
+                     AND dp.guest_activity_date BETWEEN t.business_start_dt AND COALESCE(t.business_end_dt, t.business_start_dt)
+                    LEFT JOIN DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY dm
+                           ON dm.trip_master_id = p.market_trip_id AND dm.guest_activity_date = dp.guest_activity_date
+                          AND dm.delete_ind = 'N'
+                    WHERE p.market_has_summary AND dm.trip_master_id IS NULL);
+            -- how many of the summarised pairs hold the same transactions: the totals and the day check compare those
+            v_cover := (SELECT IFF(pairs = 0, 100, FLOOR(100 * same_tx_pairs / pairs)) FROM DAASI_3641_RUN_PREV_SUMS);
+            v_txt := (SELECT 'theo ' || TO_VARCHAR(ROUND(m_theo, 2)) || ' against ' || TO_VARCHAR(ROUND(p_theo, 2))
+                             || ', free play $' || TO_VARCHAR(ROUND(m_fp, 2)) || ' against $' || TO_VARCHAR(ROUND(p_fp, 2))
+                             || ', offer cost $' || TO_VARCHAR(ROUND(m_offer, 2)) || ' against $' || TO_VARCHAR(ROUND(p_offer, 2))
+                             || ' (market against property, over the ' || same_tx_pairs || ' of ' || pairs
+                             || ' summarised pairs that hold the same transactions; ' || theo_pairs_differ || ' of them with different theo)'
+                      FROM DAASI_3641_RUN_PREV_SUMS);
+            IF (v_n > v_accept_unmatched OR v_m > 0 OR v_k > 0 OR v_q = 0 OR v_z > 0
+                OR ((v_d > 0 OR v_y > 0 OR v_cover < 50) AND NOT v_accept_totals)) THEN
+                v_log := v_log || 'G canary~|~STOP~|~run 1 did not come out clean: ' || v_q || ' new market trips for its guests; '
+                               || v_n || ' trips of its guests still have no matching property trip (expect 0'
+                               || IFF(v_accept_unmatched > 0, '; accepted: up to ' || v_accept_unmatched, '') || '); '
+                               || v_m || ' new market trips without a summary row (expect 0); '
+                               || v_k || ' whose comp worth differs from the matching property trip (expect 0); '
+                               || v_z || ' daily rows of its retired trips still live (expect 0); '
+                               || v_d || ' missing daily rows their twin has (expect 0); '
+                               || v_y || ' of the three totals off by more than 1% (expect 0); '
+                               || v_cover || '% of the summarised pairs hold the same transactions (expect 50% or more, or the totals '
+                               || 'and the day check compare too little)'
+                               || IFF(v_accept_totals, ' (days, totals and that share accepted)', '') || ': ' || COALESCE(v_txt, 'no pairs')
+                               || IFF(v_x > 0, '; not counted: ' || v_x || ' trips next to two overlapping property trips, which the market side cannot copy', '')
+                               || '. Nothing was changed. Chris: the post-check shows which. A summary row, comp worth or daily rows: the '
+                               || 'fix-up file, then this file again. Unmatched trips, or days, totals or a share the post-check explains: '
+                               || 'Pete sets v_accept_unmatched (to that number) or v_accept_totals (to TRUE) at the top, then runs this file again#ROW#';
+                RAISE run_stop;
+            END IF;
+            v_log := v_log || 'G canary~|~ok~|~run 1: ' || v_q || ' new market trips for its guests, every one summarised, comp worth '
+                           || 'equal to the matching property trip on all of them, '
+                           || IFF(v_d = 0, 'no daily row missing', v_d || ' with a daily row missing (accepted)') || ', its retired trips'' daily rows retired; '
+                           || IFF(v_n = 0, 'none left unmatched', v_n || ' left unmatched, accepted (v_accept_unmatched ' || v_accept_unmatched || ')')
+                           || IFF(v_x > 0, '; ' || v_x || ' next to two overlapping property trips, as the pre-check''s K2b expects', '')
+                           || '; ' || COALESCE(v_txt, '') || IFF(v_y > 0 OR v_d > 0 OR v_cover < 50, ' (accepted)', '') || '#ROW#';
+            -- the canary's guests are done; whatever they have left would only be new activity
+            DELETE FROM DAASI_3641_RUN_CANDIDATES c
+            USING DAASI_3641_RUN_PREV g
+            WHERE c.guest_unique_id = g.guest_unique_id AND c.market_cd = g.market_cd;
+            v_trips := (SELECT COUNT(*) FROM DAASI_3641_RUN_CANDIDATES);
+            IF (v_trips = 0) THEN
+                v_log := v_log || 'S1 scope~|~done~|~nothing left to rebuild after run 1''s guests. Nothing was changed#ROW#';
+                RAISE run_stop;
+            END IF;
+        END IF;
+        v_txt := (SELECT 'BEM ' || COUNT_IF(market_cd = 'BEM') || ', WLM ' || COUNT_IF(market_cd = 'WLM') || '; '
+                         || COUNT(DISTINCT guest_unique_id) || ' guests, '
+                         || COUNT(DISTINCT IFF(pilot_guest, guest_unique_id, NULL)) || ' of them UAT pilot guests'
+                  FROM DAASI_3641_RUN_CANDIDATES);
+        v_log := v_log || 'S1 scope~|~ok~|~this run queues ' || v_trips || ' trips: ' || v_txt || '#ROW#';
+        v_bulk := (v_trips >= 20000);
+
+        ------------------------------------------------------------ S2. the property ratings to mark
+        -- For every live IBE/IWA property trip that holds a live rating also on a queued trip: one such rating, preferably
+        -- one no other live property trip holds. Only trips that have a TRIP_SUMMARY row are marked.
+        CREATE OR REPLACE TEMPORARY TABLE DAASI_3641_RUN_TOUCH AS
+        WITH q AS (SELECT trip_master_id, guest_unique_id, market_cd FROM DAASI_3641_RUN_CANDIDATES),
+        qr AS (
+            SELECT DISTINCT q.guest_unique_id, q.market_cd, d.transaction_table_sk AS sk
+            FROM q
+            JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL d ON d.trip_master_id = q.trip_master_id
+            WHERE d.transaction_type = 'RATINGS' AND d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+        ),
+        pt AS (
+            SELECT m.trip_master_id, m.guest_unique_id, DECODE(m.property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd
+            FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+            WHERE m.trip_type = 'PROPERTY' AND m.delete_ind = 'N' AND m.property_cd IN ('IBE', 'IWA')
+              AND m.guest_unique_id IN (SELECT guest_unique_id FROM q)
+        ),
+        pd AS (
+            SELECT pt.trip_master_id, pt.guest_unique_id, pt.market_cd, d.transaction_table_sk AS sk
+            FROM pt
+            JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL d ON d.trip_master_id = pt.trip_master_id
+            WHERE d.transaction_type = 'RATINGS' AND d.delete_ind = 'N'
+        ),
+        holders AS (SELECT sk, COUNT(DISTINCT trip_master_id) AS property_trips FROM pd GROUP BY sk),
+        shared AS (
+            SELECT DISTINCT pd.trip_master_id AS property_trip_id, pd.sk
+            FROM pd
+            JOIN qr ON qr.guest_unique_id = pd.guest_unique_id AND qr.market_cd = pd.market_cd AND qr.sk = pd.sk
+        ),
+        ts AS (
+            SELECT DISTINCT trip_master_id FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY
+            WHERE trip_master_id IN (SELECT trip_master_id FROM pt)
+        )
+        SELECT s.property_trip_id, s.sk AS rating_sk,
+               (h.property_trips = 1)         AS rating_on_this_trip_only,
+               (ts.trip_master_id IS NOT NULL) AS has_summary_row
+        FROM shared s
+        JOIN holders h ON h.sk = s.sk
+        LEFT JOIN ts ON ts.trip_master_id = s.property_trip_id
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY s.property_trip_id ORDER BY (h.property_trips = 1) DESC, s.sk) = 1;
+
+        v_touch := (SELECT COUNT(*) FROM DAASI_3641_RUN_TOUCH WHERE has_summary_row);
+        v_n := (SELECT COUNT(*) FROM DAASI_3641_RUN_TOUCH WHERE NOT has_summary_row);
+        v_m := (SELECT COUNT(*) FROM DAASI_3641_RUN_TOUCH WHERE has_summary_row AND NOT rating_on_this_trip_only);
+        v_log := v_log || 'S2 ratings~|~ok~|~' || v_touch || ' property trips get one rating marked'
+                       || IFF(v_m > 0, ' (' || v_m || ' of those ratings also sit on a second live property trip)', '')
+                       || IFF(v_n > 0, '; ' || v_n || ' property trips without a summary row are left alone', '') || '#ROW#';
+
+        ------------------------------------------------------------ P2. pause downstream (bulk run only)
+        IF (v_bulk AND v_pause_downstream) THEN
+            -- Their state now (C7 read it before the wait): what runs now gets paused; what is paused stays as it is.
+            UPDATE DAASI_3641_RUN_DOWNSTREAM SET state_now = NULL, paused_by_run = NULL;
+            SHOW DYNAMIC TABLES IN SCHEMA DAAS_PROD.DAAS_CORE;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET state_now = IFF(UPPER(r."scheduling_state"::VARCHAR) = 'SUSPENDED', 'suspended', 'running')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+             WHERE d.kind = 'DYNAMIC TABLE' AND d.schema_name = 'DAAS_CORE' AND r."name"::VARCHAR = d.object_name;
+            SHOW DYNAMIC TABLES IN SCHEMA DAAS_PROD.DAAS_TIBCO_DWS;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET state_now = IFF(UPPER(r."scheduling_state"::VARCHAR) = 'SUSPENDED', 'suspended', 'running')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+             WHERE d.kind = 'DYNAMIC TABLE' AND d.schema_name = 'DAAS_TIBCO_DWS' AND r."name"::VARCHAR = d.object_name;
+            SHOW TASKS IN SCHEMA DAAS_PROD.DAAS_TIBCO_SMART;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET state_now = IFF(r."state"::VARCHAR = 'suspended', 'suspended', 'running')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+             WHERE d.kind = 'TASK' AND r."name"::VARCHAR = d.object_name;
+            -- The record the resume file works from: what this run pauses, and when.
+            CREATE TABLE IF NOT EXISTS DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED (run_no NUMBER(38,0), ord NUMBER(38,0), kind VARCHAR,
+                full_name VARCHAR, paused_at TIMESTAMP_LTZ, resumed_at TIMESTAMP_LTZ, resumed_by VARCHAR);
+            BEGIN
+                GRANT SELECT ON TABLE DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED TO ROLE DAAS_TEAM;   -- the post-check's reminder reads it
+            EXCEPTION
+                WHEN OTHER THEN
+                    v_grant_ok := FALSE;
+            END;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET paused_by_run = p.run_no
+              FROM (SELECT full_name, MAX(run_no) AS run_no FROM DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED
+                    WHERE resumed_at IS NULL GROUP BY full_name) p
+             WHERE p.full_name = d.full_name AND d.state_now = 'suspended';
+            v_ours := (SELECT LISTAGG(full_name || ' (run ' || paused_by_run || ')', ', ') WITHIN GROUP (ORDER BY ord)
+                       FROM DAASI_3641_RUN_DOWNSTREAM WHERE state_now = 'suspended' AND paused_by_run IS NOT NULL);
+            v_p2_at := CURRENT_TIMESTAMP();
+            INSERT INTO DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED (run_no, ord, kind, full_name, paused_at)
+            SELECT :v_run, ord, kind, full_name, :v_p2_at FROM DAASI_3641_RUN_DOWNSTREAM WHERE state_now = 'running';
+            v_recorded := TRUE;
+            -- Their RESUME statements, producers first: the order the rollback below and the resume file use.
+            v_paused := COALESCE((SELECT LISTAGG('ALTER ' || kind || ' ' || full_name || ' RESUME', ';') WITHIN GROUP (ORDER BY ord)
+                                  FROM DAASI_3641_RUN_DOWNSTREAM WHERE state_now = 'running'), '');
+            -- Pause them, readers first (the TIBCO tasks, then DAAS_TIBCO_DWS, then DAAS_CORE). Pausing a dynamic table also
+            -- pauses the ones built on it, so a SUSPEND can find its table paused already, or fail on it; what counts is
+            -- that every one is paused afterwards, which the check below makes sure of.
+            v_pause_cmds := (SELECT LISTAGG('ALTER ' || kind || ' ' || full_name || ' SUSPEND', ';') WITHIN GROUP (ORDER BY ord DESC)
+                             FROM DAASI_3641_RUN_DOWNSTREAM WHERE state_now = 'running');
+            v_i := 1;
+            WHILE (SPLIT_PART(COALESCE(v_pause_cmds, ''), ';', v_i) <> '') DO
+                v_cmd := SPLIT_PART(v_pause_cmds, ';', v_i);
+                BEGIN
+                    EXECUTE IMMEDIATE v_cmd;
+                EXCEPTION
+                    WHEN OTHER THEN
+                        v_pfail := v_pfail || v_cmd || ' (' || REPLACE(REPLACE(LEFT(SQLERRM, 120), '#ROW#', ''), '~|~', '') || '); ';
+                END;
+                v_i := v_i + 1;
+            END WHILE;
+            SHOW DYNAMIC TABLES IN SCHEMA DAAS_PROD.DAAS_CORE;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET state_now = IFF(UPPER(r."scheduling_state"::VARCHAR) = 'SUSPENDED', 'suspended', 'running')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+             WHERE d.kind = 'DYNAMIC TABLE' AND d.schema_name = 'DAAS_CORE' AND r."name"::VARCHAR = d.object_name;
+            SHOW DYNAMIC TABLES IN SCHEMA DAAS_PROD.DAAS_TIBCO_DWS;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET state_now = IFF(UPPER(r."scheduling_state"::VARCHAR) = 'SUSPENDED', 'suspended', 'running')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+             WHERE d.kind = 'DYNAMIC TABLE' AND d.schema_name = 'DAAS_TIBCO_DWS' AND r."name"::VARCHAR = d.object_name;
+            SHOW TASKS IN SCHEMA DAAS_PROD.DAAS_TIBCO_SMART;
+            UPDATE DAASI_3641_RUN_DOWNSTREAM d
+               SET state_now = IFF(r."state"::VARCHAR = 'suspended', 'suspended', 'running')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+             WHERE d.kind = 'TASK' AND r."name"::VARCHAR = d.object_name;
+            v_txt := (SELECT LISTAGG(d.full_name, ', ') WITHIN GROUP (ORDER BY d.ord)
+                      FROM DAASI_3641_RUN_DOWNSTREAM d
+                      JOIN DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED p
+                        ON p.full_name = d.full_name AND p.run_no = :v_run AND p.paused_at = :v_p2_at
+                      WHERE COALESCE(d.state_now, '') <> 'suspended');
+            IF (COALESCE(v_txt, '') <> '') THEN
+                v_log := v_log || 'P2 downstream~|~STOP~|~could not pause ' || v_txt || ': ' || v_pfail || 'Nothing was changed; what '
+                               || 'was paused is resumed. Use a role with OPERATE on them, or set v_pause_downstream to FALSE#ROW#';
+                RAISE run_stop;
+            END IF;
+            v_i := (SELECT COUNT(*) FROM DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED WHERE run_no = :v_run AND paused_at = :v_p2_at);
+            v_log := v_log || 'P2 downstream~|~ok~|~paused ' || v_i || ' TIBCO tasks and dynamic tables, recorded in DAAS_BACKUP.DAASI_3641_PAUSED'
+                           || IFF(v_pfail <> '', ' (some were paused already, with a table they read)', '')
+                           || IFF(COALESCE(v_ours, '') <> '', '; still paused by an earlier DAASI-3641 run: ' || v_ours, '')
+                           || IFF(v_grant_ok, '', '; note: could not grant DAAS_TEAM SELECT on that record, so the post-check cannot '
+                                  || 'remind anyone that they are paused')
+                           || '. DAASI_3641_PROD_6_RESUME_DOWNSTREAM.sql resumes them once this run''s hourly run has finished: run it '
+                           || 'right after this file (it waits), within the day#ROW#';
+        END IF;
+
+        ------------------------------------------------------------ B. the backup copies (zero-copy clones)
+        FOR i IN 1 TO 4 DO
+            v_txt := DECODE(i, 1, 'TRIP_MASTER', 2, 'TRIP_DETAIL', 3, 'TRIP_SUMMARY', 4, 'DAILY_ACTIVITY_SUMMARY');
+            v_cmd := 'CREATE OR REPLACE TABLE DAAS_PROD.DAAS_BACKUP.' || v_txt || '_DAASI_3641_' || v_sfx
+                  || ' CLONE DAAS_PROD.DAAS_CORE.' || v_txt;
+            EXECUTE IMMEDIATE v_cmd;
+        END FOR;
+        v_txt := 'ok';
+        BEGIN
+            FOR i IN 1 TO 4 DO
+                v_cmd := 'GRANT SELECT ON TABLE DAAS_PROD.DAAS_BACKUP.'
+                      || DECODE(i, 1, 'TRIP_MASTER', 2, 'TRIP_DETAIL', 3, 'TRIP_SUMMARY', 4, 'DAILY_ACTIVITY_SUMMARY')
+                      || '_DAASI_3641_' || v_sfx || ' TO ROLE DAAS_TEAM';
+                EXECUTE IMMEDIATE v_cmd;
+            END FOR;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_txt := 'note';
+        END;
+        v_log := v_log || 'B backups~|~ok~|~DAAS_BACKUP.TRIP_MASTER / TRIP_DETAIL / TRIP_SUMMARY / DAILY_ACTIVITY_SUMMARY _DAASI_3641_' || v_sfx
+                       || IFF(v_txt = 'ok', ', readable by DAAS_TEAM for the post-check',
+                              '; could not grant SELECT to DAAS_TEAM: whoever owns them, please grant it for the post-check') || '#ROW#';
+
+        ------------------------------------------------------------ T. the change, one transaction
+        v_t0 := CURRENT_TIMESTAMP();
+        BEGIN TRANSACTION;
+        v_in_txn := TRUE;
+        INSERT INTO DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE (TRIP_MASTER_ID, STATUS, BATCH_ID, CREATED_DTTM, CREATED_BY, UPDATED_DTTM, UPDATED_BY)
+        SELECT c.trip_master_id, 'PENDING', -3641, CURRENT_TIMESTAMP(), CURRENT_USER(), CURRENT_TIMESTAMP(), :v_tag
+        FROM DAASI_3641_RUN_CANDIDATES c
+        JOIN DAAS_PROD.DAAS_CORE.TRIP_MASTER m ON m.trip_master_id = c.trip_master_id AND m.delete_ind = 'N';
+        v_q := SQLROWCOUNT;
+        UPDATE DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+           SET updated_dttm = CURRENT_TIMESTAMP(),
+               updated_by   = :v_tag,
+               batch_id     = -3641,
+               last_dml_cd  = 'U'
+          FROM DAASI_3641_RUN_TOUCH t
+         WHERE t.has_summary_row
+           AND d.trip_master_id = t.property_trip_id
+           AND d.transaction_table_sk = t.rating_sk
+           AND d.transaction_type = 'RATINGS'
+           AND d.delete_ind = 'N';
+        v_t := SQLROWCOUNT;
+        IF (v_q = 0 OR v_q > v_trips OR v_t > v_touch * 2) THEN
+            ROLLBACK;
+            v_in_txn := FALSE;
+            v_log := v_log || 'T change~|~STOP~|~unexpected counts (queued ' || v_q || ' of ' || v_trips || ', ratings marked ' || v_t
+                           || ' for ' || v_touch || ' trips), so the transaction was rolled back. Nothing was changed; send these rows#ROW#';
+            RAISE run_stop;
+        END IF;
+        COMMIT;
+        v_in_txn := FALSE;
+        v_committed := TRUE;
+        v_secs := DATEDIFF(second, v_t0, CURRENT_TIMESTAMP());
+        v_log := v_log || 'T change~|~ok~|~committed at ' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYY-MM-DD HH24:MI') || ' Pacific after '
+                       || ROUND(v_secs / 60, 1) || ' min: ' || v_q || ' trips queued'
+                       || IFF(v_q < v_trips, ' (' || (v_trips - v_q) || ' had changed meanwhile and were skipped)', '')
+                       || ', ' || v_t || ' property ratings marked, tagged ''' || v_tag || '''#ROW#';
+
+        ------------------------------------------------------------ R. resume the trip chain
+        BEGIN
+            ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
+            v_suspended := FALSE;
+            v_log := v_log || 'R resume~|~ok~|~TRIP_ROOT_TASK resumed; its next run at :15 Pacific takes the queued trips#ROW#';
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || 'R resume~|~STOP~|~the change is in, but TRIP_ROOT_TASK could not be resumed: '
+                               || REPLACE(REPLACE(LEFT(SQLERRM, 200), '#ROW#', ''), '~|~', '')
+                               || '. Resume it now: ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;#ROW#';
+        END;
+    EXCEPTION
+        WHEN OTHER THEN
+            -- Anything that failed between the pause and the resume: say what, roll back, put back what this run paused,
+            -- resume the chain, then hand the error on to the rows below.
+            IF (SQLCODE <> -20641) THEN
+                v_log := v_log || 'error~|~STOP~|~' || REPLACE(REPLACE(LEFT(SQLERRM, 400), '#ROW#', ''), '~|~', '') || '#ROW#';
+                v_err_logged := TRUE;
+            END IF;
+            IF (v_in_txn) THEN
+                ROLLBACK;
+                v_in_txn := FALSE;
+                v_log := v_log || 'T change~|~STOP~|~the transaction was rolled back, so nothing was changed#ROW#';
+            END IF;
+            IF (NOT v_committed AND v_recorded) THEN
+                -- Resume what this run paused, producers first, in passes: a reader cannot resume before what it reads.
+                v_todo := v_paused;
+                v_pass := 0;
+                WHILE (v_todo <> '' AND v_pass < 5) DO
+                    v_pass := v_pass + 1;
+                    v_left := '';
+                    v_i := 1;
+                    WHILE (SPLIT_PART(v_todo, ';', v_i) <> '') DO
+                        v_cmd := SPLIT_PART(v_todo, ';', v_i);
+                        BEGIN
+                            EXECUTE IMMEDIATE v_cmd;
+                        EXCEPTION
+                            WHEN OTHER THEN
+                                v_left := v_left || v_cmd || ';';
+                        END;
+                        v_i := v_i + 1;
+                    END WHILE;
+                    IF (v_left = v_todo) THEN
+                        BREAK;
+                    END IF;
+                    v_todo := v_left;
+                END WHILE;
+                -- Which of them are still paused (a RESUME can fail on one that came back with the table it reads), and the
+                -- record: this attempt's rows only.
+                BEGIN
+                    SHOW DYNAMIC TABLES IN SCHEMA DAAS_PROD.DAAS_CORE;
+                    UPDATE DAASI_3641_RUN_DOWNSTREAM d
+                       SET state_now = IFF(UPPER(r."scheduling_state"::VARCHAR) = 'SUSPENDED', 'suspended', 'running')
+                      FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+                     WHERE d.kind = 'DYNAMIC TABLE' AND d.schema_name = 'DAAS_CORE' AND r."name"::VARCHAR = d.object_name;
+                    SHOW DYNAMIC TABLES IN SCHEMA DAAS_PROD.DAAS_TIBCO_DWS;
+                    UPDATE DAASI_3641_RUN_DOWNSTREAM d
+                       SET state_now = IFF(UPPER(r."scheduling_state"::VARCHAR) = 'SUSPENDED', 'suspended', 'running')
+                      FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+                     WHERE d.kind = 'DYNAMIC TABLE' AND d.schema_name = 'DAAS_TIBCO_DWS' AND r."name"::VARCHAR = d.object_name;
+                    SHOW TASKS IN SCHEMA DAAS_PROD.DAAS_TIBCO_SMART;
+                    UPDATE DAASI_3641_RUN_DOWNSTREAM d
+                       SET state_now = IFF(r."state"::VARCHAR = 'suspended', 'suspended', 'running')
+                      FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) r
+                     WHERE d.kind = 'TASK' AND r."name"::VARCHAR = d.object_name;
+                    v_fail := (SELECT IFF(COUNT(*) = 0, ',', ',' || LISTAGG(d.full_name, ',') || ',')
+                               FROM DAASI_3641_RUN_DOWNSTREAM d
+                               JOIN DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED p
+                                 ON p.full_name = d.full_name AND p.run_no = :v_run AND p.paused_at = :v_p2_at
+                               WHERE d.state_now = 'suspended');
+                    UPDATE DAAS_PROD.DAAS_BACKUP.DAASI_3641_PAUSED
+                       SET resumed_at = CURRENT_TIMESTAMP(), resumed_by = 'DAASI-3641 run ' || :v_run || ', rolled back'
+                     WHERE run_no = :v_run AND paused_at = :v_p2_at AND resumed_at IS NULL
+                       AND NOT CONTAINS(:v_fail, ',' || full_name || ',');
+                EXCEPTION
+                    WHEN OTHER THEN
+                        v_fail := ',(could not check: ' || REPLACE(REPLACE(LEFT(SQLERRM, 120), '#ROW#', ''), '~|~', '') || '),';
+                END;
+                v_log := v_log || 'P2 downstream~|~' || IFF(v_fail = ',', 'ok', 'STOP') || '~|~'
+                               || IFF(v_fail = ',', 'the TIBCO tasks and dynamic tables this run paused are resumed',
+                                      'still paused: ' || TRIM(REPLACE(v_fail, ',', ' ')) || '. Run DAASI_3641_PROD_6_RESUME_DOWNSTREAM.sql now')
+                               || '#ROW#';
+            END IF;
+            IF (v_suspended) THEN
+                BEGIN
+                    ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;
+                    v_suspended := FALSE;
+                    v_log := v_log || 'R resume~|~ok~|~TRIP_ROOT_TASK resumed#ROW#';
+                EXCEPTION
+                    WHEN OTHER THEN
+                        v_log := v_log || 'R resume~|~STOP~|~TRIP_ROOT_TASK is still paused. Resume it now: ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME;#ROW#';
+                END;
+            END IF;
+            RAISE;
+    END;
+
+    -- What the pipeline will see. (The summary stream is counted for small runs only: after the bulk run's write it
+    -- would have to compare most of TRIP_DETAIL.)
+    v_n := (SELECT COUNT(*) FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM
+            WHERE METADATA$ACTION = 'INSERT' AND batch_id = -3641 AND updated_by = :v_tag);
+    IF (v_t <= 100000) THEN
+        v_m := (SELECT COUNT(*) FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM
+                WHERE METADATA$ACTION = 'INSERT' AND batch_id = -3641 AND updated_by = :v_tag);
+        v_log := v_log || 'T streams~|~' || IFF(v_n = v_q AND v_m = v_t, 'ok', 'note') || '~|~the queue stream shows ' || v_n
+                       || ' of the queued trips, the summary stream ' || v_m || ' of the marked ratings#ROW#';
+    ELSE
+        v_log := v_log || 'T streams~|~' || IFF(v_n = v_q, 'ok', 'note') || '~|~the queue stream shows ' || v_n || ' of the queued trips#ROW#';
+    END IF;
+    v_log := v_log || 'END~|~' || IFF(v_suspended, 'STOP', 'done') || '~|~'
+                   || IFF(v_suspended, 'the change is in, but the trip chain is still paused: run ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME; now. Then ', '')
+                   || 'the trip run at :15 Pacific does the rest'
+                   || IFF(v_bulk, ' (expect 1 to 2.5 hours; later runs wait for it)', ' (a few minutes longer than usual)')
+                   || IFF(v_paused <> '' OR COALESCE(v_ours, '') <> '', '. Pete: run DAASI_3641_PROD_6_RESUME_DOWNSTREAM.sql now; it waits for that '
+                          || 'run to finish, then resumes what DAASI-3641 paused', '')
+                   || '. When BATCH_S02 shows TRIP_COMP_WORTH and TRIP_NG_REVENUE_SUMMARY finished for it, Chris runs DAASI_3641_PROD_3_POSTCHECK.sql'
+                   || IFF(v_run = 1 AND NOT v_skip_canary, '; then this same file again for everything else', '') || '#ROW#';
+
+    res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict,
+                   SPLIT_PART(t.value, '~|~', 3) AS detail
+            FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+    RETURN TABLE(res);
+EXCEPTION
+    WHEN run_stop THEN
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict,
+                       SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+    WHEN OTHER THEN
+        IF (v_in_txn) THEN
+            ROLLBACK;
+            v_log := v_log || 'error~|~STOP~|~the transaction was rolled back, so nothing was changed#ROW#';
+        END IF;
+        IF (NOT v_err_logged) THEN
+            v_log := v_log || 'error~|~STOP~|~' || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '') || '#ROW#';
+        END IF;
+        IF (v_committed) THEN
+            v_log := v_log || 'error~|~note~|~the change itself was committed; the post-check tells the rest'
+                           || IFF(COALESCE(v_paused, '') <> '' OR COALESCE(v_ours, '') <> '',
+                                  '. Pete: run DAASI_3641_PROD_6_RESUME_DOWNSTREAM.sql now; it waits for this run''s hourly run, then '
+                                  || 'resumes what DAASI-3641 paused', '') || '#ROW#';
+        END IF;
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict,
+                       SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+END;
+$$;
