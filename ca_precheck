@@ -1,0 +1,516 @@
+-- DAASI-3641 · PROD · 1 · PRE-CHECK (Chris). Read-only on PROD: the only things it writes are temporary tables in your
+-- session (in DAAS_UAT.DAAS_TEMP_WORK), gone when the session ends. Run it before the first RUN, statements in order,
+-- in one worksheet. A Large warehouse helps: K2 reads TRIP_DETAIL for every affected guest. Screenshots are fine.
+--
+--   K1  the trips the run will queue (the RUN file's own rule), by market and by run
+--   K0  the canary's five pilot guests: the rule in PROD against UAT's pilot table (run after K1)
+--   K2  the size of the job: transactions on those trips, the property trips the new market trips will match, and the
+--       property trips that get a rating marked (with and without a summary row)
+--   K2b two old leftovers the rebuild cannot tidy (overlapping trips), so their post-check rows come as no surprise
+--   K2c how many passes the recalculation step's date-cutting loop will make (the longest unbroken run of play days)
+--   K3  PROD's own yardstick: the big recalculation days in the last 75 days, how long their summary run took, and the
+--       row counts the pipeline logged for them; K3c how long whole trip runs have lasted (the 2-hour graph limit)
+--   K4  the warehouses the trip jobs run on; K4b the size of the trip tables and the days of history they keep;
+--       K4c where the trip steps log their batches (BATCH_S02)
+--   K5  whether the post-check's views can read DAAS_BACKUP (where the run's clones go)
+--   K6  the RCA example now (the standup query)
+--   K7  Tracy's view now: max trip days per market, every guest
+--   K8  the chain and its three streams, as your roles see them; K8b the task time limits the bulk run needs
+--   K9  the caps the pipeline reads on every date of the affected trips (the RUN's C2 stops on any other)
+--   K10 the downstream objects the bulk run pauses, and their state now; K10b what each dynamic table reads, and how
+--       long its tables keep history
+
+USE ROLE DAAS_TEAM;
+USE SECONDARY ROLES ALL;
+USE SCHEMA DAAS_UAT.DAAS_TEMP_WORK;
+
+
+-- K1. The trips the run will queue: every live BEM/WLM market trip with no property trip of the same guest and dates at
+--     IBE/IWA, real guest ids only, exactly as DAASI_3641_PROD_2_RUN.sql selects them. Run 1 (the canary) is the five
+--     UAT pilot guests plus a fixed 1% of the others; run 2 is the rest. part 6 (P2) counted 399,444 such trips in all,
+--     38 of them on placeholder guest ids.
+CREATE OR REPLACE TEMPORARY TABLE PRE_SCOPE AS
+WITH pr AS (
+    SELECT DISTINCT guest_unique_id, DECODE(property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd, trip_start_dt, trip_end_dt
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+    WHERE trip_type = 'PROPERTY' AND delete_ind = 'N' AND property_cd IN ('IBE', 'IWA')
+),
+tw AS (
+    SELECT m.trip_master_id, m.guest_unique_id, m.market_cd, m.trip_start_dt, m.trip_end_dt, m.created_dttm
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+    LEFT JOIN pr
+           ON pr.guest_unique_id = m.guest_unique_id AND pr.market_cd = m.market_cd
+          AND pr.trip_start_dt = m.trip_start_dt AND pr.trip_end_dt = m.trip_end_dt
+    WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND m.market_cd IN ('BEM', 'WLM')
+      AND m.guest_unique_id > 0
+      AND pr.guest_unique_id IS NULL
+)
+SELECT tw.*,
+       DATEDIFF(day, tw.trip_start_dt, tw.trip_end_dt) + 1                                              AS trip_days,
+       (tw.guest_unique_id IN (17600543027, 19606195360, 15903662806, 13101515746, 14100446118))        AS pilot_guest,
+       (MOD(ABS(HASH(tw.guest_unique_id)), 100) = 0)                                                    AS sample_guest,
+       IFF(tw.guest_unique_id IN (17600543027, 19606195360, 15903662806, 13101515746, 14100446118)
+           OR MOD(ABS(HASH(tw.guest_unique_id)), 100) = 0, 'run 1 (canary)', 'run 2 (the rest)')        AS run
+FROM tw;
+
+SELECT run, market_cd,
+       COUNT(*)                                                         AS trips_to_queue,
+       COUNT(DISTINCT guest_unique_id)                                  AS guests,
+       COUNT(DISTINCT IFF(pilot_guest, guest_unique_id, NULL))          AS pilot_guests,
+       COUNT_IF(trip_days > DECODE(market_cd, 'BEM', 1, 'WLM', 3))       AS longer_than_the_cap,
+       COUNT_IF(created_dttm >= '2026-08-12 11:16:26')                  AS built_after_the_aug_12_change,
+       MAX(trip_days)                                                   AS longest_days,
+       MIN(trip_start_dt)                                               AS first_start,
+       MAX(trip_end_dt)                                                 AS last_end
+FROM PRE_SCOPE
+GROUP BY ALL
+ORDER BY 1, 2;
+
+
+-- K0. The canary's five pilot guests, the ones the UAT pilot proved (the run names them: WLM 17600543027, 19606195360,
+--     15903662806; BEM 13101515746, 14100446118), against UAT's pilot table. Expect five rows, every verdict 'same'.
+WITH prod_pick AS (
+    SELECT guest_unique_id, market_cd, COUNT(*) AS trips FROM PRE_SCOPE WHERE pilot_guest GROUP BY 1, 2
+)
+SELECT COALESCE(u.guest_unique_id, p.guest_unique_id) AS guest_unique_id,
+       u.market_cd AS uat_market, u.pick_reason AS uat_reason, p.market_cd AS prod_market,
+       p.trips AS prod_trips_to_queue,
+       IFF(u.guest_unique_id IS NOT NULL AND p.guest_unique_id IS NOT NULL, 'same', 'DIFFERENT') AS verdict
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_GUESTS u
+FULL OUTER JOIN prod_pick p ON p.guest_unique_id = u.guest_unique_id AND p.market_cd = u.market_cd
+ORDER BY 1;
+
+
+-- K2. The size of the job, per run. The rebuild re-cuts the transactions on the queued trips into new market trips,
+--     one per matching property trip; the run marks one rating on each property trip that holds a rating of a queued
+--     trip, and the summary step then re-reads every rating of the new market trips and of the marked property trips.
+--     Those re-reads are what make the summary step the long one.
+CREATE OR REPLACE TEMPORARY TABLE PRE_TX AS                      -- live transactions on the trips to queue
+SELECT s.run, s.guest_unique_id, s.market_cd, d.trip_master_id, d.transaction_type, d.transaction_table_sk AS sk
+FROM PRE_SCOPE s
+JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL d ON d.trip_master_id = s.trip_master_id
+WHERE d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED';
+
+CREATE OR REPLACE TEMPORARY TABLE PRE_PT AS                      -- live transactions on those guests' property trips
+SELECT m.trip_master_id, m.guest_unique_id, DECODE(m.property_cd, 'IBE', 'BEM', 'IWA', 'WLM') AS market_cd,
+       d.transaction_type, d.transaction_table_sk AS sk
+FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL d ON d.trip_master_id = m.trip_master_id
+WHERE m.trip_type = 'PROPERTY' AND m.delete_ind = 'N' AND m.property_cd IN ('IBE', 'IWA')
+  AND d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+  AND m.guest_unique_id IN (SELECT guest_unique_id FROM PRE_SCOPE);
+
+WITH hit AS (       -- property trips holding any transaction of a queued trip: the new market trips will match these
+    SELECT DISTINCT t.run, t.market_cd, p.trip_master_id
+    FROM PRE_PT p
+    JOIN PRE_TX t ON t.guest_unique_id = p.guest_unique_id AND t.market_cd = p.market_cd
+                 AND t.transaction_type = p.transaction_type AND t.sk = p.sk
+),
+mark AS (           -- property trips holding a rating of a queued trip: the run marks one rating on each
+    SELECT DISTINCT t.run, t.market_cd, p.trip_master_id
+    FROM PRE_PT p
+    JOIN PRE_TX t ON t.guest_unique_id = p.guest_unique_id AND t.market_cd = p.market_cd AND t.sk = p.sk
+    WHERE p.transaction_type = 'RATINGS' AND t.transaction_type = 'RATINGS'
+),
+ts AS (
+    SELECT DISTINCT trip_master_id FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY
+    WHERE trip_master_id IN (SELECT trip_master_id FROM mark)
+),
+pr_ratings AS (
+    SELECT trip_master_id, COUNT(*) AS ratings FROM PRE_PT WHERE transaction_type = 'RATINGS' GROUP BY 1
+),
+tx AS (
+    SELECT run, market_cd, COUNT(*) AS rows_, COUNT_IF(transaction_type = 'RATINGS') AS ratings,
+           COUNT(DISTINCT trip_master_id) AS trips
+    FROM PRE_TX GROUP BY 1, 2
+),
+h AS (SELECT run, market_cd, COUNT(*) AS n FROM hit GROUP BY 1, 2),
+mk AS (
+    SELECT m.run, m.market_cd,
+           COUNT_IF(ts.trip_master_id IS NOT NULL)            AS to_mark,
+           COUNT_IF(ts.trip_master_id IS NULL)                AS no_summary_row,
+           SUM(IFF(ts.trip_master_id IS NOT NULL, r.ratings, 0)) AS their_ratings
+    FROM mark m
+    LEFT JOIN ts ON ts.trip_master_id = m.trip_master_id
+    LEFT JOIN pr_ratings r ON r.trip_master_id = m.trip_master_id
+    GROUP BY 1, 2
+)
+SELECT tx.run, tx.market_cd,
+       tx.trips                         AS trips_to_queue_with_transactions,
+       tx.rows_                         AS live_transactions_on_them,
+       h.n                              AS expected_new_market_trips,
+       mk.to_mark                       AS property_trips_to_mark,
+       mk.no_summary_row                AS property_trips_left_alone_no_summary_row,
+       tx.ratings + mk.their_ratings    AS ratings_the_summary_step_rereads
+FROM tx
+LEFT JOIN h  ON h.run  = tx.run AND h.market_cd  = tx.market_cd
+LEFT JOIN mk ON mk.run = tx.run AND mk.market_cd = tx.market_cd
+ORDER BY 1, 2;
+
+
+-- K2b. Two old leftovers the rebuild cannot tidy, counted now so their post-check rows come as no surprise.
+--      (a) Property trips that share a day with another live property trip of the same guest (two live trips holding
+--          the same day, which is how a rating ends up on two trips). Rebuilt market trips never overlap, so a
+--          market trip next to such a pair can end up without an identical property trip. The post-check counts those
+--          apart (P2 row 7, P3 marks them) and the RUN file's canary check leaves them out. Expect a small number.
+--      (b) Trips to queue that share a day with a live market trip that is not queued. The rebuild attaches a re-cut
+--          day to every live trip covering it, and the merge check then joins the two, as it does with any overlap.
+--          Expect 0 or close to it.
+WITH g AS (SELECT DISTINCT run, guest_unique_id, market_cd FROM PRE_SCOPE),
+pt AS (
+    SELECT g.run, g.market_cd, m.trip_master_id, m.guest_unique_id, m.property_cd, m.trip_start_dt, m.trip_end_dt
+    FROM g
+    JOIN DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+      ON m.guest_unique_id = g.guest_unique_id AND m.trip_type = 'PROPERTY' AND m.delete_ind = 'N'
+     AND m.property_cd = DECODE(g.market_cd, 'BEM', 'IBE', 'WLM', 'IWA')
+),
+ov AS (
+    SELECT DISTINCT p1.run, p1.market_cd, p1.guest_unique_id, p1.trip_master_id
+    FROM pt p1
+    JOIN pt p2 ON p2.guest_unique_id = p1.guest_unique_id AND p2.property_cd = p1.property_cd
+              AND p2.trip_master_id <> p1.trip_master_id
+              AND p2.trip_start_dt <= p1.trip_end_dt AND p2.trip_end_dt >= p1.trip_start_dt
+),
+mo AS (
+    SELECT DISTINCT s.run, s.market_cd, s.trip_master_id
+    FROM PRE_SCOPE s
+    JOIN DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+      ON m.guest_unique_id = s.guest_unique_id AND m.trip_type = 'MARKET' AND m.market_cd = s.market_cd
+     AND m.delete_ind = 'N' AND m.trip_master_id <> s.trip_master_id
+     AND m.trip_start_dt <= s.trip_end_dt AND m.trip_end_dt >= s.trip_start_dt
+    WHERE m.trip_master_id NOT IN (SELECT trip_master_id FROM PRE_SCOPE)
+),
+runs AS (SELECT DISTINCT run, market_cd FROM PRE_SCOPE),
+a AS (SELECT run, market_cd, COUNT(*) AS trips, COUNT(DISTINCT guest_unique_id) AS guests FROM ov GROUP BY 1, 2),
+b AS (SELECT run, market_cd, COUNT(*) AS trips FROM mo GROUP BY 1, 2)
+SELECT r.run, r.market_cd,
+       COALESCE(a.trips, 0)  AS a_property_trips_sharing_a_day_with_another,
+       COALESCE(a.guests, 0) AS a_their_guests,
+       COALESCE(b.trips, 0)  AS b_trips_to_queue_sharing_a_day_with_a_kept_market_trip
+FROM runs r
+LEFT JOIN a ON a.run = r.run AND a.market_cd = r.market_cd
+LEFT JOIN b ON b.run = r.run AND b.market_cd = r.market_cd
+ORDER BY 1, 2;
+
+
+-- K2c. How many passes the recalculation step's date-cutting loop will make. It cuts one trip's worth of days off
+--      every unbroken run of play days per pass, over all the queued trips' transactions at once, so the passes are
+--      the longest unbroken run of play days divided by the cap (BEM 1 day, WLM 3), rounded up. Its 3.1-minute record
+--      came from other caps; many passes make the step slower (its limit is 2 hours). Start dates only, so a hotel
+--      stay counts as its first night: approximate.
+WITH d AS (
+    SELECT DISTINCT s.run, s.market_cd, s.guest_unique_id, t.business_start_dt AS play_day
+    FROM PRE_SCOPE s
+    JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL t ON t.trip_master_id = s.trip_master_id
+    WHERE t.delete_ind = 'N' AND t.transaction_sub_type = 'OPENED'
+),
+i AS (
+    SELECT run, market_cd, guest_unique_id, play_day,
+           DATEADD(day, -ROW_NUMBER() OVER (PARTITION BY run, market_cd, guest_unique_id ORDER BY play_day), play_day) AS streak
+    FROM d
+),
+s AS (SELECT run, market_cd, guest_unique_id, streak, COUNT(*) AS days FROM i GROUP BY 1, 2, 3, 4)
+SELECT run, market_cd,
+       MAX(days)                                                  AS longest_unbroken_play_days,
+       MAX(CEIL(days / DECODE(market_cd, 'BEM', 1, 'WLM', 3)))     AS date_cutting_passes,
+       COUNT_IF(days >= 30)                                       AS runs_of_30_days_or_more,
+       COUNT(DISTINCT IFF(days >= 30, guest_unique_id, NULL))     AS their_guests
+FROM s
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+
+-- K3. PROD's own yardstick: every recalculation batch in the last 75 days that took 100,000 trips or more (Aug 18:
+--     774K trips; Sep 21: 1.66M in 4 batches), with the summary, comp-worth and NG runs right after it.
+WITH big AS (
+    SELECT batch_id, COUNT(*) AS trips_recalculated, MIN(created_dttm) AS processed_at
+    FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_PROCESSED
+    WHERE created_dttm >= DATEADD(day, -75, CURRENT_DATE())
+    GROUP BY 1
+    HAVING COUNT(*) >= 100000
+),
+steps AS (
+    SELECT big.batch_id AS recalc_batch, big.trips_recalculated, j.job_name, b.batch_id, b.batch_status, b.batch_start_date,
+           ROUND(DATEDIFF(second, b.batch_start_date, b.updated_dttm) / 60, 1) AS minutes
+    FROM big
+    JOIN DAAS_PROD.DAAS_COMMON.BATCH_S02 b ON b.batch_id >= big.batch_id
+    JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+    WHERE j.job_name IN ('TRIP_RECALCULATION', 'TRIP_MERGE_CHECK', 'TRIP_MERGE', 'TRIP_SUMMARY_WRAPPER', 'TRIP_COMP_WORTH',
+                         'TRIP_NG_REVENUE_SUMMARY')
+      AND b.batch_start_date <= DATEADD(hour, 8, big.processed_at)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY big.batch_id, j.job_name ORDER BY b.batch_id) = 1
+)
+SELECT recalc_batch, trips_recalculated, job_name, batch_id, batch_status, batch_start_date, minutes
+FROM steps
+ORDER BY recalc_batch, batch_id;
+
+-- K3b. The row counts the pipeline logged for those runs (the batch metrics table: masters and details the
+--      recalculation inserted, summary rows the summary step inserted and updated). Its columns are shown as they are.
+WITH big AS (
+    SELECT batch_id, MIN(created_dttm) AS processed_at
+    FROM DAAS_PROD.DAAS_CORE.TRIP_RECALC_PROCESSED
+    WHERE created_dttm >= DATEADD(day, -75, CURRENT_DATE())
+    GROUP BY 1
+    HAVING COUNT(*) >= 100000
+),
+runs AS (
+    SELECT b.batch_id
+    FROM big
+    JOIN DAAS_PROD.DAAS_COMMON.BATCH_S02 b ON b.batch_id >= big.batch_id
+    JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+    WHERE j.job_name IN ('TRIP_RECALCULATION', 'TRIP_SUMMARY_WRAPPER')
+      AND b.batch_start_date <= DATEADD(hour, 8, big.processed_at)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY big.batch_id, j.job_name ORDER BY b.batch_id) = 1
+)
+SELECT m.*
+FROM DAAS_PROD.DAAS_COMMON.BATCH_METRICS_S02 m
+WHERE m.batch_id IN (SELECT batch_id FROM runs)
+ORDER BY m.batch_id
+LIMIT 200;
+
+-- K3c. How long whole trip runs have lasted, from their first step to the end of comp worth. The root task's 2-hour
+--      limit applies to the whole task graph and the comp-worth task has no limit of its own, so a trip run longer than
+--      that could lose its comp-worth step; the RUN file stops before the bulk run until that task has its own limit
+--      (see K8b). This shows how close the last 75 days came.
+WITH b AS (
+    SELECT j.job_name, b.batch_id, b.batch_status, b.batch_start_date, b.updated_dttm
+    FROM DAAS_PROD.DAAS_COMMON.BATCH_S02 b
+    JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+    WHERE j.job_name IN ('TRIP_FILTERED_TXNS', 'TRIP_COMP_WORTH')
+      AND b.batch_start_date >= DATEADD(day, -75, CURRENT_DATE())
+),
+t AS (
+    SELECT b.*,
+           MAX(IFF(job_name = 'TRIP_FILTERED_TXNS', batch_start_date, NULL))
+               OVER (ORDER BY batch_start_date, batch_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run_start
+    FROM b
+)
+SELECT LEFT(batch_status, 7)                                               AS comp_worth_status,
+       COUNT(*)                                                            AS comp_worth_batches,
+       ROUND(MAX(DATEDIFF(second, run_start, updated_dttm)) / 60, 1)       AS longest_minutes_run_start_to_comp_worth_end,
+       COUNT_IF(DATEDIFF(minute, run_start, updated_dttm) > 120)           AS runs_over_2_hours
+FROM t
+WHERE job_name = 'TRIP_COMP_WORTH'
+GROUP BY 1
+ORDER BY 1;
+
+
+-- K4. The warehouses the trip jobs run on (each step switches to its job's warehouse), and their sizes.
+SELECT job_name, warehouse_name
+FROM DAAS_PROD.DAAS_COMMON.JOB
+WHERE job_name IN ('TRIP_RECALCULATION', 'TRIP_MERGE_CHECK', 'TRIP_MERGE', 'TRIP_SUMMARY_WRAPPER', 'TRIP_COMP_WORTH',
+                   'TRIP_NG_REVENUE_SUMMARY', 'TRIP_INACTIVE_TXNS_ARCHIVAL')
+ORDER BY 1;
+
+SHOW WAREHOUSES LIKE 'DAAS_PROD%';
+SELECT "name", "size", "state", "min_cluster_count", "max_cluster_count", "auto_suspend"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" IN (SELECT warehouse_name FROM DAAS_PROD.DAAS_COMMON.JOB WHERE job_name LIKE 'TRIP%')
+   OR "name" ILIKE '%BULK%'
+ORDER BY 1;
+
+-- K4b. The size of the tables the run writes or the next trip run rewrites (Pete's run marks about a million
+--      TRIP_DETAIL rows in one statement; this says how big that table is, for the warehouse choice), and how many days
+--      of change history each keeps: the bulk run pauses dynamic tables built on them, and a dynamic table paused for
+--      longer than that cannot resume normally (the resume file runs within hours; this says how much room there is).
+--      The dynamic tables read other tables too: K10b lists every table each one reads, with the same history days.
+SELECT table_name, row_count, ROUND(bytes / POWER(1024, 3), 1) AS gb, retention_time AS history_days, clustering_key
+FROM DAAS_PROD.INFORMATION_SCHEMA.TABLES
+WHERE table_schema = 'DAAS_CORE'
+  AND table_name IN ('TRIP_MASTER', 'TRIP_DETAIL', 'TRIP_SUMMARY', 'DAILY_ACTIVITY_SUMMARY', 'TRIP_RECALC_QUEUE',
+                     'TRIP_NG_REVENUE_SUMMARY')
+ORDER BY bytes DESC;
+
+-- K4c. Where the trip steps log their batches. The RUN, the post-check and the resume file read BATCH_S02 for the
+--      summary, comp-worth and NG steps; expect recent batches and a recent SUCCESS for each job here (archival nightly).
+SELECT j.job_name, COUNT(b.batch_id) AS batches_last_2_days,
+       MAX(IFF(STARTSWITH(b.batch_status, 'SUCCESS'), b.batch_start_date, NULL)) AS last_success
+FROM DAAS_PROD.DAAS_COMMON.JOB j
+LEFT JOIN DAAS_PROD.DAAS_COMMON.BATCH_S02 b
+       ON b.job_id = j.job_id AND b.batch_start_date >= DATEADD(day, -2, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)
+WHERE j.job_name IN ('TRIP_RECALCULATION', 'TRIP_MERGE', 'TRIP_SUMMARY_WRAPPER', 'TRIP_COMP_WORTH', 'TRIP_NG_REVENUE_SUMMARY',
+                     'TRIP_INACTIVE_TXNS_ARCHIVAL')
+GROUP BY 1
+ORDER BY 1;
+
+
+-- K5. Can the post-check read the run's clones? It reads them through temporary views, and a view reads with its
+--     owner's rights: those of your primary role (DAAS_TEAM), not your secondary roles. So this asks, with secondary
+--     roles off, whether DAAS_TEAM itself sees DAAS_PROD.DAAS_BACKUP (the RUN grants DAAS_TEAM SELECT on the clones).
+--     Expect 1. 0 or an error: DAAS_TEAM needs USAGE on database DAAS_PROD and schema DAAS_PROD.DAAS_BACKUP (ask the
+--     owner), or run the post-check with USE ROLE set to a role that has it. Either way, run the third line next.
+USE SECONDARY ROLES NONE;
+SELECT CURRENT_ROLE() AS primary_role, COUNT(*) AS sees_daas_backup_expect_1
+FROM DAAS_PROD.INFORMATION_SCHEMA.SCHEMATA WHERE schema_name = 'DAAS_BACKUP';
+USE SECONDARY ROLES ALL;
+
+
+-- K6. The RCA example now (the standup query): WLM market trip 2895722234 is one 4-day trip while the IWA property
+--     trips are Aug 7-9 and Aug 10, and it has the same id and dates as in the Aug 12 backup taken before the change.
+USE SECONDARY ROLES ALL;
+SELECT 'today' AS as_of, trip_type, trip_master_id, trip_start_dt, trip_end_dt,
+       DATEDIFF(day, trip_start_dt, trip_end_dt) + 1 AS trip_days
+FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+WHERE guest_unique_id = 17600543027
+  AND delete_ind = 'N'
+  AND ((trip_type = 'MARKET' AND market_cd = 'WLM') OR (trip_type = 'PROPERTY' AND property_cd = 'IWA'))
+  AND trip_start_dt <= '2026-08-10' AND trip_end_dt >= '2026-08-07'
+UNION ALL
+SELECT 'Aug 12 backup (before the change)', trip_type, trip_master_id, trip_start_dt, trip_end_dt,
+       DATEDIFF(day, trip_start_dt, trip_end_dt) + 1
+FROM DAAS_PROD.DAAS_BACKUP.TRIP_MASTER_DAASI_3376_20260812
+WHERE trip_master_id = 2895722234
+ORDER BY as_of DESC, trip_type, trip_start_dt;
+
+
+-- K7. Tracy's view now, every guest: live BEM and WLM market trips, the longest, and how many are longer than the cap
+--     with and without a hotel stay (a hotel stay is kept whole, the pipeline's own rule). The post-check's P9 repeats
+--     this after each run.
+WITH mk AS (
+    SELECT trip_master_id, market_cd, DATEDIFF(day, trip_start_dt, trip_end_dt) + 1 AS trip_days
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+    WHERE trip_type = 'MARKET' AND delete_ind = 'N' AND market_cd IN ('BEM', 'WLM')
+),
+over_cap AS (SELECT * FROM mk WHERE trip_days > DECODE(market_cd, 'BEM', 1, 'WLM', 3)),
+hotel AS (
+    SELECT DISTINCT d.trip_master_id
+    FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+    WHERE d.transaction_type = 'HOTEL' AND d.delete_ind = 'N' AND d.trip_master_id IN (SELECT trip_master_id FROM over_cap)
+)
+SELECT mk.market_cd,
+       COUNT(*)                                                         AS live_market_trips,
+       MAX(mk.trip_days)                                                AS longest_days,
+       COUNT_IF(o.trip_master_id IS NOT NULL AND h.trip_master_id IS NULL)     AS longer_than_cap_no_hotel_stay,
+       COUNT_IF(o.trip_master_id IS NOT NULL AND h.trip_master_id IS NOT NULL) AS longer_than_cap_with_hotel_stay
+FROM mk
+LEFT JOIN over_cap o ON o.trip_master_id = mk.trip_master_id
+LEFT JOIN hotel h ON h.trip_master_id = mk.trip_master_id
+GROUP BY 1
+ORDER BY 1;
+
+
+-- K8. The chain and the three streams the run relies on, as your roles see them (Pete's run checks them again with
+--     his role): the queue's, the summary step's, and the daily-summary stream on TRIP_MASTER. Expect TRIP_ROOT_TASK
+--     started, all three streams not stale, the summary stream DEFAULT. Empty results only mean this role cannot see
+--     them.
+SHOW STREAMS IN SCHEMA DAAS_PROD.DAAS_CORE;
+SELECT "name", "mode", "stale", "owner"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" IN ('TRIP_RECALC_QUEUE_STREAM', 'TRIP_DETAIL_SUMMARY_STREAM', 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM');
+
+SHOW TASKS LIKE 'TRIP_ROOT_TASK' IN SCHEMA DAAS_PROD.DAAS_COMMON;
+SELECT "name", "state", "schedule", "owner", "last_suspended_on"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+-- K8b. The time limits the bulk run needs, read from the tasks' own definitions: the summary task 6 hours or more
+--      (4 now), the comp-worth task a limit of its own of 3 hours or more (none now). Until both show, the RUN file
+--      stops before the bulk run with the four statements for the tasks' owner.
+SELECT ROUND(TRY_TO_NUMBER(REGEXP_SUBSTR(REPLACE(UPPER(GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK')), ' ', ''),
+                                        'USER_TASK_TIMEOUT_MS=([0-9]+)', 1, 1, 'e', 1)) / 3600000, 1)                AS root_task_hours,
+       ROUND(TRY_TO_NUMBER(REGEXP_SUBSTR(REPLACE(UPPER(GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_SUMMARY_LOAD_TASK')), ' ', ''),
+                                        'USER_TASK_TIMEOUT_MS=([0-9]+)', 1, 1, 'e', 1)) / 3600000, 1)                AS summary_task_hours,
+       ROUND(TRY_TO_NUMBER(REGEXP_SUBSTR(REPLACE(UPPER(GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK')), ' ', ''),
+                                        'USER_TASK_TIMEOUT_MS=([0-9]+)', 1, 1, 'e', 1)) / 3600000, 1)                AS comp_worth_task_hours_own;
+
+
+-- K9. The caps the pipeline will cut with, read through its own TRIP_CONFIG functions on every date the live BEM/WLM
+--     market trips span, from the earliest start to the latest end (or today, if later), as the RUN's C2 does. Expect
+--     no rows: every date reads MAX_TRIP_DAYS BEM 1, WLM 3, IBE 1, IWA 3 and TRIP_GAP_DAYS 1. Each row is a stretch of
+--     dates that reads otherwise (-1 = no config row covers the date, which would keep the date-cutting step looping
+--     until its time limit). The RUN stops on any.
+WITH span AS (
+    SELECT MIN(trip_start_dt) AS first_dt,
+           GREATEST(COALESCE(MAX(trip_end_dt), CURRENT_DATE()), CURRENT_DATE()) AS last_dt
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+    WHERE trip_type = 'MARKET' AND delete_ind = 'N' AND market_cd IN ('BEM', 'WLM')
+),
+d AS (
+    SELECT DATEADD(day, g.n, s.first_dt) AS dt
+    FROM (SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1 AS n FROM TABLE(GENERATOR(ROWCOUNT => 40000))) g
+    CROSS JOIN span s
+    WHERE DATEADD(day, g.n, s.first_dt) <= s.last_dt
+),
+caps AS (
+    SELECT d.dt,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', 'BEM', TO_VARCHAR(d.dt, 'YYYY-MM-DD'))), -1)   AS bem_days,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', 'WLM', TO_VARCHAR(d.dt, 'YYYY-MM-DD'))), -1)   AS wlm_days,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', 'IBE', TO_VARCHAR(d.dt, 'YYYY-MM-DD'))), -1) AS ibe_days,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', 'IWA', TO_VARCHAR(d.dt, 'YYYY-MM-DD'))), -1) AS iwa_days,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', 'BEM', TO_VARCHAR(d.dt, 'YYYY-MM-DD'))), -1)   AS bem_gap,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', 'WLM', TO_VARCHAR(d.dt, 'YYYY-MM-DD'))), -1)   AS wlm_gap,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('TRIP_GAP_DAYS', 'IBE', TO_VARCHAR(d.dt, 'YYYY-MM-DD'))), -1) AS ibe_gap,
+           COALESCE(TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('TRIP_GAP_DAYS', 'IWA', TO_VARCHAR(d.dt, 'YYYY-MM-DD'))), -1) AS iwa_gap
+    FROM d
+),
+odd AS (
+    SELECT c.*,
+           DATEADD(day, -ROW_NUMBER() OVER (PARTITION BY bem_days, wlm_days, ibe_days, iwa_days, bem_gap, wlm_gap, ibe_gap, iwa_gap
+                                            ORDER BY dt), dt) AS stretch
+    FROM caps c
+    WHERE NOT (bem_days = 1 AND wlm_days = 3 AND ibe_days = 1 AND iwa_days = 3
+               AND bem_gap = 1 AND wlm_gap = 1 AND ibe_gap = 1 AND iwa_gap = 1)
+)
+SELECT MIN(dt) AS from_date, MAX(dt) AS to_date, COUNT(*) AS dates,
+       bem_days, wlm_days, ibe_days, iwa_days, bem_gap, wlm_gap, ibe_gap, iwa_gap
+FROM odd
+GROUP BY stretch, bem_days, wlm_days, ibe_days, iwa_days, bem_gap, wlm_gap, ibe_gap, iwa_gap
+ORDER BY 1;
+
+
+-- K10. The downstream objects the bulk run pauses, as they stand now: 11 dynamic tables in DAAS_CORE, 9 in
+--      DAAS_TIBCO_DWS and 4 tasks in DAAS_TIBCO_SMART (August's list). Expect RUNNING and started. One that is already
+--      SUSPENDED is left alone by the run and by the resume file, for its owner to decide (August's runbook paused
+--      TRIP_SUMMARY_18MO and its resume list left it out). Empty results only mean this role cannot see them.
+SHOW DYNAMIC TABLES IN DATABASE DAAS_PROD;
+SELECT "schema_name", "name", "scheduling_state", "target_lag", "refresh_mode", "data_timestamp"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE ("schema_name" = 'DAAS_CORE'
+       AND "name" IN ('TRIP_SUMMARY_DT', 'DAILY_SUMMARY_DT', 'TRIP_DETAILS_GAMING_DT', 'TRIP_DETAILS_COMP_DT', 'TRIP_DETAILS_POS_DT',
+                      'TRIP_DETAILS_FREEPLAY_DT', 'TRIP_DETAILS_OFFER_DT', 'TRIP_DETAILS_MARKERS_DT',
+                      'TRIP_DETAILS_HOTEL_RESERVATIONS_DT', 'TRIP_DETAILS_HOTEL_FOLIOS_DT', 'DAILY_SUMMARY_YEAR_MONTH_METRICS'))
+   OR ("schema_name" = 'DAAS_TIBCO_DWS'
+       AND "name" IN ('TRIP_SUMMARY_18MO', 'GST_12_MONTH_PLUS', 'GST_24_MONTH_PLUS', 'GST_ACTIVITY_FTD', 'GST_PDB_TRIP',
+                      'NG_SPEND_BY_CATG', 'RMS_TRIPS', 'TRIP_NG_REVENUE_SUMMARY', 'TRIP_SUMMARY'))
+ORDER BY 1, 2;
+
+SHOW TASKS IN SCHEMA DAAS_PROD.DAAS_TIBCO_SMART;
+SELECT "name", "state", "schedule", "last_suspended_on"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" IN ('DT_AP_12_MONTH_PLUS', 'DT_AP_ACTIVITY_FTD', 'DT_AP_TRIP_DTL', 'DT_GST_TRIP_DTL')
+ORDER BY 1;
+
+-- K10b. What each dynamic table reads, from Snowflake's own graph, and the fewest days of change history any table it
+--       reads keeps. A dynamic table paused for longer than its tables keep history cannot resume normally, so that
+--       number, not K4b's, is the real room for the pause (the bulk run pauses for hours: 1 day or more is room enough).
+--       Rows: the 20 dynamic tables of K10 (in_runs_list Y), and any other dynamic table that reads a trip table or a
+--       TIBCO DWS table (N). An N row is not paused by the run and refreshes through it: tell Pete before run 2. A view
+--       among the inputs hides its own tables (look those up if the fewest days is blank); an input in another
+--       database shows no days here. Blank inputs or state only mean this role lacks MONITOR on that dynamic table.
+WITH g AS (
+    SELECT schema_name, name, scheduling_state:state::STRING AS state, inputs,
+           (schema_name = 'DAAS_CORE'
+            AND name IN ('TRIP_SUMMARY_DT', 'DAILY_SUMMARY_DT', 'TRIP_DETAILS_GAMING_DT', 'TRIP_DETAILS_COMP_DT', 'TRIP_DETAILS_POS_DT',
+                         'TRIP_DETAILS_FREEPLAY_DT', 'TRIP_DETAILS_OFFER_DT', 'TRIP_DETAILS_MARKERS_DT',
+                         'TRIP_DETAILS_HOTEL_RESERVATIONS_DT', 'TRIP_DETAILS_HOTEL_FOLIOS_DT', 'DAILY_SUMMARY_YEAR_MONTH_METRICS'))
+        OR (schema_name = 'DAAS_TIBCO_DWS'
+            AND name IN ('TRIP_SUMMARY_18MO', 'GST_12_MONTH_PLUS', 'GST_24_MONTH_PLUS', 'GST_ACTIVITY_FTD', 'GST_PDB_TRIP',
+                         'NG_SPEND_BY_CATG', 'RMS_TRIPS', 'TRIP_NG_REVENUE_SUMMARY', 'TRIP_SUMMARY')) AS in_list
+    FROM TABLE(DAAS_PROD.INFORMATION_SCHEMA.DYNAMIC_TABLE_GRAPH_HISTORY())
+    WHERE database_name = 'DAAS_PROD' AND valid_to IS NULL
+),
+i AS (
+    SELECT g.schema_name, g.name, g.state, g.in_list,
+           UPPER(REPLACE(f.value:name::STRING, '"', '')) AS input_name, LOWER(f.value:kind::STRING) AS input_kind
+    FROM g, LATERAL FLATTEN(input => g.inputs, outer => TRUE) f
+)
+SELECT i.schema_name, i.name, IFF(i.in_list, 'Y', 'N') AS in_runs_list, i.state,
+       LISTAGG(i.input_name || ' (' || i.input_kind || ')', ', ') WITHIN GROUP (ORDER BY i.input_name) AS reads,
+       MIN(t.retention_time) AS fewest_history_days
+FROM i
+LEFT JOIN DAAS_PROD.INFORMATION_SCHEMA.TABLES t
+       ON i.input_name = t.table_catalog || '.' || t.table_schema || '.' || t.table_name
+GROUP BY i.schema_name, i.name, i.in_list, i.state
+HAVING i.in_list
+    OR BOOLOR_AGG(i.input_name LIKE 'DAAS_PROD.DAAS_CORE.TRIP%' OR i.input_name LIKE 'DAAS_PROD.DAAS_CORE.DAILY%'
+                  OR i.input_name LIKE 'DAAS_PROD.DAAS_TIBCO_DWS.%')
+ORDER BY in_runs_list DESC, 1, 2;
