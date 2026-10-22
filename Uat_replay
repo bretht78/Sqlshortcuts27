@@ -1,0 +1,293 @@
+/* =====================================================================
+   DAASI-3640 | Step 6 of 7: limited replay in UAT
+   Proves that bumping REPLAY_COUNTER on a comp's latest raw row sends it
+   back through the stream, and that the v1.14 procs rebuild its comment
+   and remarks the way the answer key says they should. Also gives a rate
+   (comps per minute) to size the PROD run.
+
+   Slice: one property, one month. Change the three values in part B if
+   UAT's raw does not have that month.
+
+   Before this file: 01 (fact column), 03 and 04 (both procs), 05 (DT
+   deployed to UAT). Run top to bottom on a Large warehouse. Work tables
+   go in DAAS_TEMP_WORK.
+   ===================================================================== */
+
+USE DATABASE DAAS_UAT;
+
+
+/* ---------------------------------------------------------------------
+   A. PRE-FLIGHT (read-only)
+   --------------------------------------------------------------------- */
+
+-- A1. The deployed procs carry v1.14 (both TRUE).
+SELECT procedure_name,
+       CONTAINS(procedure_definition, 'COMMENTS_EXTENDED')             AS has_remarks,
+       CONTAINS(procedure_definition, 'SELECT DISTINCT CNUMRW, ISHDRW') AS has_ever_held_match
+FROM SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES
+WHERE deleted IS NULL
+  AND procedure_catalog = 'DAAS_UAT'
+  AND procedure_name LIKE 'HETCMS_COMP_DETAIL_FACT_LOAD_PROC%';
+
+-- A2. The fact has the column.
+SELECT COUNT(*) AS has_column
+FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
+WHERE table_schema = 'DAAS_CORE' AND table_name = 'COMP_DETAIL_FACT' AND column_name = 'COMMENTS_EXTENDED';
+
+-- A3. The stream the daily proc reads, and what already sits in it.
+--     If HAS_DATA is TRUE, run the load once (part E) before the bump so
+--     the timed run contains only the slice.
+SHOW STREAMS LIKE 'CMPRW_RAW_COMP_DETAIL_STREAM' IN SCHEMA DAAS_RAW_HETCMS;
+SELECT SYSTEM$STREAM_HAS_DATA('DAAS_RAW_HETCMS.CMPRW_RAW_COMP_DETAIL_STREAM') AS has_data;
+SELECT COUNT(*) AS rows_waiting FROM DAAS_RAW_HETCMS.CMPRW_RAW_COMP_DETAIL_STREAM;
+
+-- A4. The task that calls the proc, if UAT has one. Its definition shows
+--     the CALL with the real shard and warehouse names, which part E needs.
+SHOW TASKS IN DATABASE DAAS_UAT;
+SELECT "name", "schedule", "state", "warehouse", LEFT("definition", 300) AS definition
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "definition" ILIKE '%HETCMS_COMP_DETAIL_FACT_LOAD_PROC%';
+
+
+/* ---------------------------------------------------------------------
+   B. BACKUP AND ANSWER KEY (nothing in the fact changes yet)
+   --------------------------------------------------------------------- */
+
+-- B1. Zero-copy backup. Plain CREATE so a rerun cannot overwrite it.
+CREATE TABLE DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY
+  CLONE DAAS_CORE.COMP_DETAIL_FACT;
+
+-- B2. The answer key: for every active comp in the slice, what the fact
+--     holds now and what v1.14 should produce. The comment and remark
+--     rules here are the same SQL as the procs.
+CREATE OR REPLACE TRANSIENT TABLE DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED AS
+WITH slice AS (
+    SELECT COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD, GUEST_ID, ISSUE_DT,
+           COMP_COMMENTS_DESC AS OLD_COMMENT,
+           COMMENTS_EXTENDED  AS OLD_REMARKS,
+           UPDATED_DTTM       AS OLD_UPDATED_DTTM,
+           BATCH_ID           AS OLD_BATCH_ID,
+           MD5_CHECKSUM       AS OLD_MD5
+    FROM DAAS_CORE.COMP_DETAIL_FACT
+    WHERE DELETE_IND = 'N'
+      AND SOURCE_SYSTEM_NM = 'HETCMS'
+      AND PROPERTY_CD = 'UTU'                                   -- slice: property
+      AND ISSUE_DT BETWEEN '2026-08-01' AND '2026-08-31'        -- slice: issue dates
+),
+comments AS (   -- v1.14 rule: a line belongs to a comp when its guest ever held that comp
+    SELECT CNUMRW, ISHDRW, PROPERTY_CODE,
+           LISTAGG(CMNTCM, '|') WITHIN GROUP (ORDER BY CSEQCM) AS CMNTCM
+    FROM (
+        SELECT H.CNUMRW, H.ISHDRW, H.PROPERTY_CODE, L.CSEQCM, L.CMNTCM
+        FROM (SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
+              FROM DAAS_RAW_HETCMS.CMPRW_RAW) H
+        JOIN (SELECT SYIDCM, "CMP#CM", CSEQCM, CMNTCM, PROPERTY_CODE,
+                     OPERATION_DATE, OPERATION_SEQUENCE_NBR, CREATED_DATE
+              FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
+              QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+                      ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1) L
+          ON L.SYIDCM = H.SYIDRW AND L."CMP#CM" = H.CNUMRW AND L.PROPERTY_CODE = H.PROPERTY_CODE
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY H.CNUMRW, H.ISHDRW, H.PROPERTY_CODE, L.CSEQCM
+                ORDER BY L.OPERATION_DATE DESC, L.OPERATION_SEQUENCE_NBR DESC, L.CREATED_DATE DESC) = 1
+    )
+    GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE
+),
+remarks AS (    -- v1.14 rule: a remark line belongs to the comp live on its number when written
+    SELECT CNUMRW, ISHDRW, PROPERTY_CODE,
+           LEFT(LISTAGG(EXPLRM, '|') WITHIN GROUP (ORDER BY SEQNRM), 4000) AS COMMENTS_EXTENDED
+    FROM (
+        SELECT C.CNUMRW, C.ISHDRW, C.PROPERTY_CODE, R.SEQNRM, R.EXPLRM
+        FROM (SELECT CNUMRW, ISHDRW, PROPERTY_CODE, FIRST_SEEN,
+                     LAG(FIRST_SEEN)  OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS PREV_FIRST_SEEN,
+                     LEAD(FIRST_SEEN) OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS NEXT_FIRST_SEEN
+              FROM (SELECT CNUMRW, ISHDRW, PROPERTY_CODE, MIN(OPERATION_DATE) AS FIRST_SEEN
+                    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+                    GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE)) C
+        JOIN DAAS_RAW_HETCMS.CMPRM_RAW R
+          ON R.CNUMRM = C.CNUMRW
+         AND R.PROPERTY_CODE = C.PROPERTY_CODE
+         AND (C.PREV_FIRST_SEEN IS NULL OR R.OPERATION_DATE >= DATEADD(SECOND, -60, C.FIRST_SEEN))
+         AND (C.NEXT_FIRST_SEEN IS NULL OR R.OPERATION_DATE <  DATEADD(SECOND, -60, C.NEXT_FIRST_SEEN))
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY C.CNUMRW, C.ISHDRW, C.PROPERTY_CODE, R.SEQNRM
+                ORDER BY R.OPERATION_DATE DESC, R.OPERATION_SEQUENCE_NBR DESC, R.CREATED_DATE DESC) = 1
+    )
+    GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE
+)
+SELECT s.*,
+       c.CMNTCM            AS NEW_COMMENT,
+       r.COMMENTS_EXTENDED AS NEW_REMARKS
+FROM slice s
+LEFT JOIN comments c ON c.CNUMRW = s.COMP_NBR AND c.ISHDRW = s.ISHDRW AND c.PROPERTY_CODE = s.PROPERTY_CD
+LEFT JOIN remarks  r ON r.CNUMRW = s.COMP_NBR AND r.ISHDRW = s.ISHDRW AND r.PROPERTY_CODE = s.PROPERTY_CD;
+
+-- B3. Size of the slice and what should change. If COMPS is 0, UAT's raw
+--     does not have that month: change the slice in B2 and rerun it.
+SELECT COUNT(*)                                                        AS comps,
+       COUNT_IF(NEW_COMMENT IS DISTINCT FROM OLD_COMMENT)              AS comment_changes,
+       COUNT_IF(NEW_REMARKS IS DISTINCT FROM OLD_REMARKS)              AS remark_changes,
+       COUNT_IF(NEW_COMMENT IS NULL AND OLD_COMMENT IS NOT NULL)       AS comment_removed,
+       COUNT_IF(NEW_REMARKS IS NOT NULL)                               AS comps_with_remarks
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED;
+
+-- B4. The raw rows to replay: the latest version of each comp in the slice.
+CREATE OR REPLACE TRANSIENT TABLE DAAS_TEMP_WORK.DAASI3640_RP_SLICE AS
+SELECT CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE, OPERATION_DATE, OPERATION_SEQUENCE_NBR, CREATED_DATE
+FROM DAAS_RAW_HETCMS.CMPRW_RAW
+WHERE (CNUMRW, ISHDRW, PROPERTY_CODE, COTLRW) IN
+      (SELECT COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED)
+QUALIFY ROW_NUMBER() OVER (PARTITION BY CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE
+        ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1;
+
+SELECT COUNT(*) AS raw_rows_to_bump FROM DAAS_TEMP_WORK.DAASI3640_RP_SLICE;   -- should equal COMPS in B3
+
+
+/* ---------------------------------------------------------------------
+   C. DRAIN THE STREAM FIRST (only if A3 showed data waiting)
+   Run the load once exactly as in part E, so the timed run that follows
+   holds nothing but the slice. Skip if A3 showed HAS_DATA = FALSE.
+   --------------------------------------------------------------------- */
+
+
+/* ---------------------------------------------------------------------
+   D. THE BUMP: one UPDATE on the raw comp table
+   Adds 1 to REPLAY_COUNTER on the latest version of each comp in the
+   slice. The stream records each as an update; the proc reads the new
+   image as an INSERT and rebuilds the comp from raw with the v1.14 joins.
+   No business column changes.
+   --------------------------------------------------------------------- */
+UPDATE DAAS_RAW_HETCMS.CMPRW_RAW R
+SET REPLAY_COUNTER = COALESCE(R.REPLAY_COUNTER, 0) + 1
+FROM DAAS_TEMP_WORK.DAASI3640_RP_SLICE S
+WHERE R.CNUMRW                 = S.CNUMRW
+  AND R.ISHDRW                 = S.ISHDRW
+  AND R.COTLRW                 = S.COTLRW
+  AND R.PROPERTY_CODE          = S.PROPERTY_CODE
+  AND R.OPERATION_DATE         = S.OPERATION_DATE
+  AND R.OPERATION_SEQUENCE_NBR = S.OPERATION_SEQUENCE_NBR
+  AND R.CREATED_DATE IS NOT DISTINCT FROM S.CREATED_DATE;
+
+-- "number of rows updated" should equal RAW_ROWS_TO_BUMP. Then:
+SELECT SYSTEM$STREAM_HAS_DATA('DAAS_RAW_HETCMS.CMPRW_RAW_COMP_DETAIL_STREAM') AS has_data;   -- TRUE
+SELECT COUNT(*) AS rows_in_stream FROM DAAS_RAW_HETCMS.CMPRW_RAW_COMP_DETAIL_STREAM;         -- 2 x the bump (delete + insert per row)
+
+
+/* ---------------------------------------------------------------------
+   E. RUN THE LOAD, the way the task does
+   Preferred: run the UAT task itself, so the batch framework supplies
+   the batch id, shard and warehouse (name from A4):
+       EXECUTE TASK DAAS_COMMON.<task name from A4>;
+   If UAT has no task, call the proc directly with the shard and
+   warehouse names copied from the PROD task's definition and a batch id
+   of your own. The metrics step may complain about an unknown batch;
+   the data step commits before that and the return text says which.
+       CALL DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(36400001, '<shard from the task>', '<warehouse from the task>', '', '');
+   Note the clock time when it starts and when it returns.
+   --------------------------------------------------------------------- */
+
+
+/* ---------------------------------------------------------------------
+   F. CHECK THE RESULT
+   --------------------------------------------------------------------- */
+
+-- F1. Fact against the answer key. COMMENT_MISMATCHES and REMARK_MISMATCHES
+--     must be 0. ROWS_REWRITTEN will equal COMPS: MD5_CHECKSUM now includes
+--     the remarks, so every replayed row's checksum changed and the merge
+--     rewrote it, which is expected on this first pass. ACTIVE_ROW_MISSING
+--     counts comps whose active row was soft-deleted because raw's latest
+--     guest differs from the fact's (the guest-change step); expect 0 or
+--     close to it, and a new row for each under the new guest.
+SELECT COUNT(*)                                                           AS comps,
+       COUNT_IF(f.COMP_COMMENTS_DESC IS DISTINCT FROM e.NEW_COMMENT)      AS comment_mismatches,
+       COUNT_IF(f.COMMENTS_EXTENDED  IS DISTINCT FROM e.NEW_REMARKS)      AS remark_mismatches,
+       COUNT_IF(f.UPDATED_DTTM > e.OLD_UPDATED_DTTM)                      AS rows_rewritten,
+       COUNT_IF(f.COMP_NBR IS NULL)                                       AS active_row_missing
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+LEFT JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_NBR         = e.COMP_NBR
+  AND f.ISHDRW           = e.ISHDRW
+  AND f.PROPERTY_CD      = e.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD
+  AND f.DELETE_IND       = 'N';
+
+-- F2. The mismatches themselves, if F1 shows any.
+SELECT e.COMP_NBR, e.PROPERTY_CD, e.GUEST_ID, e.ISSUE_DT,
+       e.OLD_COMMENT, e.NEW_COMMENT AS EXPECTED_COMMENT, f.COMP_COMMENTS_DESC AS FACT_COMMENT,
+       e.OLD_REMARKS, e.NEW_REMARKS AS EXPECTED_REMARKS, f.COMMENTS_EXTENDED  AS FACT_REMARKS
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+LEFT JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_NBR = e.COMP_NBR AND f.ISHDRW = e.ISHDRW AND f.PROPERTY_CD = e.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND f.DELETE_IND = 'N'
+WHERE f.COMP_COMMENTS_DESC IS DISTINCT FROM e.NEW_COMMENT
+   OR f.COMMENTS_EXTENDED  IS DISTINCT FROM e.NEW_REMARKS
+LIMIT 100;
+
+-- F3. Drift: a replayed comp is rebuilt entirely under today's logic, so
+--     any column whose logic changed since the row was last loaded moves
+--     too. This counts the ones that matter against the backup. Nonzero
+--     is information, not failure; it tells you what else the PROD run
+--     will touch.
+SELECT COUNT(*)                                                      AS comps,
+       COUNT_IF(f.GUEST_ID          <> b.GUEST_ID)                    AS guest_changed,
+       COUNT_IF(f.DELETE_IND        <> b.DELETE_IND)                  AS delete_ind_changed,
+       COUNT_IF(f.COMP_CATEGORY     IS DISTINCT FROM b.COMP_CATEGORY) AS comp_category_changed,
+       COUNT_IF(f.COMPOR_NAME       IS DISTINCT FROM b.COMPOR_NAME)   AS compor_name_changed,
+       COUNT_IF(f.ISSUE_COMP_WORTH_AMT IS DISTINCT FROM b.ISSUE_COMP_WORTH_AMT) AS worth_changed,
+       COUNT_IF(f.REDEEM_DTTM       IS DISTINCT FROM b.REDEEM_DTTM)   AS redeem_dttm_changed
+FROM DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+JOIN DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+  ON  e.COMP_NBR = b.COMP_NBR AND e.ISHDRW = b.ISHDRW AND e.PROPERTY_CD = b.PROPERTY_CD
+  AND e.CASINO_OUTLET_CD = b.CASINO_OUTLET_CD
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK;
+
+-- F4. Runtime of the load, from the proc's own query tag
+--     (<batch id>_HETCMS_COMP_DETAIL_FACT_LOAD_PROC). Divide COMPS by
+--     SECONDS/60 for comps per minute; PROD has about 7.7 million to do.
+SELECT query_tag,
+       MIN(start_time)                                   AS started,
+       MAX(end_time)                                     AS finished,
+       DATEDIFF(second, MIN(start_time), MAX(end_time))  AS seconds,
+       COUNT(*)                                          AS statements
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(RESULT_LIMIT => 10000))
+WHERE query_tag LIKE '%HETCMS_COMP_DETAIL_FACT_LOAD_PROC%'
+  AND start_time > DATEADD(hour, -6, CURRENT_TIMESTAMP())
+GROUP BY 1
+ORDER BY started DESC;
+
+-- F5. Tracy's UTU comp, if the slice holds it. Expect comment "$95" and
+--     remarks "$95 BASED ON PLAY|PER HUAIBI LI".
+SELECT COMP_NBR, GUEST_ID, ISSUE_DT, COMP_COMMENTS_DESC, COMMENTS_EXTENDED, UPDATED_DTTM, BATCH_ID
+FROM DAAS_CORE.COMP_DETAIL_FACT
+WHERE PROPERTY_CD = 'UTU' AND COMP_NBR = 7009616 AND DELETE_IND = 'N'
+ORDER BY ISSUE_DT;
+
+-- F6. The dynamic table, once 05 is deployed and refreshed, against the
+--     same answer key. Both counts 0.
+ALTER DYNAMIC TABLE DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT REFRESH;
+SELECT COUNT(*)                                                      AS comps,
+       COUNT_IF(d.COMP_COMMENTS_DESC IS DISTINCT FROM e.NEW_COMMENT) AS comment_mismatches,
+       COUNT_IF(d.COMMENTS_EXTENDED  IS DISTINCT FROM e.NEW_REMARKS) AS remark_mismatches
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+LEFT JOIN DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT d
+  ON  d.COMP_NBR = e.COMP_NBR AND d.ISHDRW = e.ISHDRW AND d.PROPERTY_CD = e.PROPERTY_CD
+  AND d.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND d.DELETE_IND = 'N';
+
+
+/* ---------------------------------------------------------------------
+   G. UNDO (UAT only; not part of the test)
+   Puts the slice back exactly as it was from the backup clone.
+   ---------------------------------------------------------------------
+UPDATE DAAS_CORE.COMP_DETAIL_FACT f
+SET COMP_COMMENTS_DESC = b.COMP_COMMENTS_DESC,
+    COMMENTS_EXTENDED  = b.COMMENTS_EXTENDED,
+    UPDATED_DTTM       = b.UPDATED_DTTM,
+    UPDATED_BY         = b.UPDATED_BY,
+    BATCH_ID           = b.BATCH_ID,
+    LAST_DML_CD        = b.LAST_DML_CD,
+    MD5_CHECKSUM       = b.MD5_CHECKSUM
+FROM DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+JOIN DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+  ON  e.COMP_NBR = b.COMP_NBR AND e.ISHDRW = b.ISHDRW AND e.PROPERTY_CD = b.PROPERTY_CD
+  AND e.CASINO_OUTLET_CD = b.CASINO_OUTLET_CD
+WHERE f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK;
+--------------------------------------------------------------------- */
