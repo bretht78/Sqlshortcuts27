@@ -1,0 +1,1278 @@
+-- DAASI-3640 (v1.14 of the comp fact logic): comments matched to any guest who ever held the
+-- comp; remarks (CMPRM) matched to the comp live on the number when written, joined with | in
+-- line order (previously "1) ... | 2) ..." by comp number only). The header below is UAT's; if
+-- the repo file carries a different CREATE line or warehouse, keep those two lines from the repo.
+create or replace dynamic table DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT(
+	GUEST_ID COMMENT 'Guest Id',
+	COMP_NBR COMMENT 'Comp Number',
+	CASINO_OUTLET_CD COMMENT 'Casino Outlet Code',
+	LIMIT_TYPE_CD COMMENT 'Limit Type Code',
+	AUTHORIZER_ID COMMENT 'Authorizer Id',
+	COMPOR_DEPARTMENT_CD,
+	PROPERTY_CD,
+	REDEEM_AMT,
+	ISSUE_COMP_LIMIT_AMT,
+	LIMIT_DESC,
+	LAST_CHANGE_ISSUE_DTTM,
+	PROPERTY_ID,
+	ISSUE_DT,
+	SNAPSHOT_CMS_TRIP_WIN_LOSS_AMT,
+	SNAPSHOT_CMS_TRIP_COMP_WORTH,
+	SNAPSHOT_CMS_PROPERTY_COMP_WORTH,
+	SNAPSHOT_CMS_BRAND_COMP_WORTH,
+	COMP_AVERAGE_AMT,
+	COMP_OVERAGE_PCT,
+	COMPOR_AUTHOR_NBR,
+	STATUS_CD,
+	COMP_STATUS_CD,
+	LAST_CHANGE_DT,
+	LAST_CHANGE_COMP_LIMIT_AMT,
+	LAST_CHANGE_COMP_OVER_AMT,
+	LAST_CHANGE_COMP_OVER_PCT,
+	SNAPSHOT_CMS_COMP_WORTH_AVAILABLE_AMT,
+	SNAPSHOT_CMS_CURRENT_TRIP_THEO_AMT,
+	DISCRETIONARY_COMP_FLG,
+	ISSUED_BY_CD,
+	COMP_TYPE_CD,
+	NUMBER_OF_PEOPLE_CNT,
+	WINE_COMP_LIMIT_AMT,
+	ISSUE_POINT_LIMIT_AMT,
+	WINE_POINT_LIMIT_AMT,
+	ISSUE_POINT_LIMIT,
+	REDEEM_AUTHORIZATION_CD,
+	FOLIO_ID,
+	EXTERNAL_TICKET_NBR,
+	REDEEM_POINT_AMT,
+	COMP_EXCEPTION_CD,
+	VOID_AUTHORIZATION_CD,
+	VOID_DTTM,
+	CREATE_DTTM,
+	LAST_DTTM,
+	NGC_EXTRACTION_PROCESSED_FLG,
+	ISS_REWARD_CREDIT_AMT,
+	ISS_REWARD_CREDIT_NBR,
+	USED_REWARD_CREDT_AMT,
+	USED_REWARD_CREDITS_NBR,
+	PLAYER_DEVELOPMENT_FLG,
+	SNAPSHOT_CMS_REWARD_CREDIT_BALANCE_AT_ISSUE_AMT,
+	ISSUE_COMP_WORTH_AMT,
+	USED_COMP_WORTH_AMT,
+	UNIQUE_REWARD_LINK_NBR,
+	COMP_COMMENTS_DESC,
+	COMMENTS_EXTENDED,
+	SOURCE_SYSTEM_NM,
+	TIME_ZONE,
+	CREATED_DTTM,
+	CREATED_BY,
+	UPDATED_DTTM,
+	UPDATED_BY,
+	DELETE_IND,
+	OPERATION_SEQUENCE_NBR,
+	MD5_CHECKSUM,
+	ISSUE_DTTM,
+	REPLAY_COUNTER,
+	OUTLET_CATEGORY,
+	COMPOR_NAME,
+	EMPLOYEE_FIRST_NM,
+	EMPLOYEE_LAST_NM,
+	COMP_CATEGORY,
+	ISHDRW,
+	REDEEM_DTTM
+) target_lag = '1 day' refresh_mode = AUTO initialize = ON_SCHEDULE warehouse = DAAS_UAT_IT_DT_COMPUTE
+ as
+        
+            SELECT 
+            
+                GUEST_ID AS "GUEST_ID", 
+            
+                COMP_NBR AS "COMP_NBR", 
+            
+                CASINO_OUTLET_CD AS "CASINO_OUTLET_CD", 
+            
+                LIMIT_TYPE_CD AS "LIMIT_TYPE_CD", 
+            
+                AUTHORIZER_ID AS "AUTHORIZER_ID", 
+            
+                COMPOR_DEPARTMENT_CD AS "COMPOR_DEPARTMENT_CD", 
+            
+                PROPERTY_CD AS "PROPERTY_CD", 
+            
+                REDEEM_AMT AS "REDEEM_AMT", 
+            
+                ISSUE_COMP_LIMIT_AMT AS "ISSUE_COMP_LIMIT_AMT", 
+            
+                LIMIT_DESC AS "LIMIT_DESC", 
+            
+                LAST_CHANGE_ISSUE_DTTM AS "LAST_CHANGE_ISSUE_DTTM", 
+            
+                PROPERTY_ID AS "PROPERTY_ID", 
+            
+                ISSUE_DT AS "ISSUE_DT", 
+            
+                SNAPSHOT_CMS_TRIP_WIN_LOSS_AMT AS "SNAPSHOT_CMS_TRIP_WIN_LOSS_AMT", 
+            
+                SNAPSHOT_CMS_TRIP_COMP_WORTH AS "SNAPSHOT_CMS_TRIP_COMP_WORTH", 
+            
+                SNAPSHOT_CMS_PROPERTY_COMP_WORTH AS "SNAPSHOT_CMS_PROPERTY_COMP_WORTH", 
+            
+                SNAPSHOT_CMS_BRAND_COMP_WORTH AS "SNAPSHOT_CMS_BRAND_COMP_WORTH", 
+            
+                COMP_AVERAGE_AMT AS "COMP_AVERAGE_AMT", 
+            
+                COMP_OVERAGE_PCT AS "COMP_OVERAGE_PCT", 
+            
+                COMPOR_AUTHOR_NBR AS "COMPOR_AUTHOR_NBR", 
+            
+                STATUS_CD AS "STATUS_CD", 
+            
+                COMP_STATUS_CD AS "COMP_STATUS_CD", 
+            
+                LAST_CHANGE_DT AS "LAST_CHANGE_DT", 
+            
+                LAST_CHANGE_COMP_LIMIT_AMT AS "LAST_CHANGE_COMP_LIMIT_AMT", 
+            
+                LAST_CHANGE_COMP_OVER_AMT AS "LAST_CHANGE_COMP_OVER_AMT", 
+            
+                LAST_CHANGE_COMP_OVER_PCT AS "LAST_CHANGE_COMP_OVER_PCT", 
+            
+                SNAPSHOT_CMS_COMP_WORTH_AVAILABLE_AMT AS "SNAPSHOT_CMS_COMP_WORTH_AVAILABLE_AMT", 
+            
+                SNAPSHOT_CMS_CURRENT_TRIP_THEO_AMT AS "SNAPSHOT_CMS_CURRENT_TRIP_THEO_AMT", 
+            
+                DISCRETIONARY_COMP_FLG AS "DISCRETIONARY_COMP_FLG", 
+            
+                ISSUED_BY_CD AS "ISSUED_BY_CD", 
+            
+                COMP_TYPE_CD AS "COMP_TYPE_CD", 
+            
+                NUMBER_OF_PEOPLE_CNT AS "NUMBER_OF_PEOPLE_CNT", 
+            
+                WINE_COMP_LIMIT_AMT AS "WINE_COMP_LIMIT_AMT", 
+            
+                ISSUE_POINT_LIMIT_AMT AS "ISSUE_POINT_LIMIT_AMT", 
+            
+                WINE_POINT_LIMIT_AMT AS "WINE_POINT_LIMIT_AMT", 
+            
+                ISSUE_POINT_LIMIT AS "ISSUE_POINT_LIMIT", 
+            
+                REDEEM_AUTHORIZATION_CD AS "REDEEM_AUTHORIZATION_CD", 
+            
+                FOLIO_ID AS "FOLIO_ID", 
+            
+                EXTERNAL_TICKET_NBR AS "EXTERNAL_TICKET_NBR", 
+            
+                REDEEM_POINT_AMT AS "REDEEM_POINT_AMT", 
+            
+                COMP_EXCEPTION_CD AS "COMP_EXCEPTION_CD", 
+            
+                VOID_AUTHORIZATION_CD AS "VOID_AUTHORIZATION_CD", 
+            
+                VOID_DTTM AS "VOID_DTTM", 
+            
+                CREATE_DTTM AS "CREATE_DTTM", 
+            
+                LAST_DTTM AS "LAST_DTTM", 
+            
+                NGC_EXTRACTION_PROCESSED_FLG AS "NGC_EXTRACTION_PROCESSED_FLG", 
+            
+                ISS_REWARD_CREDIT_AMT AS "ISS_REWARD_CREDIT_AMT", 
+            
+                ISS_REWARD_CREDIT_NBR AS "ISS_REWARD_CREDIT_NBR", 
+            
+                USED_REWARD_CREDT_AMT AS "USED_REWARD_CREDT_AMT", 
+            
+                USED_REWARD_CREDITS_NBR AS "USED_REWARD_CREDITS_NBR", 
+            
+                PLAYER_DEVELOPMENT_FLG AS "PLAYER_DEVELOPMENT_FLG", 
+            
+                SNAPSHOT_CMS_REWARD_CREDIT_BALANCE_AT_ISSUE_AMT AS "SNAPSHOT_CMS_REWARD_CREDIT_BALANCE_AT_ISSUE_AMT", 
+            
+                ISSUE_COMP_WORTH_AMT AS "ISSUE_COMP_WORTH_AMT", 
+            
+                USED_COMP_WORTH_AMT AS "USED_COMP_WORTH_AMT", 
+            
+                UNIQUE_REWARD_LINK_NBR AS "UNIQUE_REWARD_LINK_NBR", 
+            
+                COMP_COMMENTS_DESC AS "COMP_COMMENTS_DESC", 
+            
+                COMMENTS_EXTENDED AS "COMMENTS_EXTENDED", 
+            
+                SOURCE_SYSTEM_NM AS "SOURCE_SYSTEM_NM", 
+            
+                TIME_ZONE AS "TIME_ZONE", 
+            
+                CREATED_DTTM AS "CREATED_DTTM", 
+            
+                CREATED_BY AS "CREATED_BY", 
+            
+                UPDATED_DTTM AS "UPDATED_DTTM", 
+            
+                UPDATED_BY AS "UPDATED_BY", 
+            
+                DELETE_IND AS "DELETE_IND", 
+            
+                OPERATION_SEQUENCE_NBR AS "OPERATION_SEQUENCE_NBR", 
+            
+                
+        
+        
+        
+        
+          
+        CAST( MD5(NVL(CAST(
+                
+                    GUEST_ID
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMP_NBR
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    CASINO_OUTLET_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    LIMIT_TYPE_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    AUTHORIZER_ID
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMPOR_DEPARTMENT_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    PROPERTY_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    REDEEM_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    ISSUE_COMP_LIMIT_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    LIMIT_DESC
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    LAST_CHANGE_ISSUE_DTTM
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    PROPERTY_ID
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    ISSUE_DT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    SNAPSHOT_CMS_TRIP_WIN_LOSS_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    SNAPSHOT_CMS_TRIP_COMP_WORTH
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    SNAPSHOT_CMS_PROPERTY_COMP_WORTH
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    SNAPSHOT_CMS_BRAND_COMP_WORTH
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMP_AVERAGE_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMP_OVERAGE_PCT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMPOR_AUTHOR_NBR
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    STATUS_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMP_STATUS_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    LAST_CHANGE_DT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    LAST_CHANGE_COMP_LIMIT_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    LAST_CHANGE_COMP_OVER_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    LAST_CHANGE_COMP_OVER_PCT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    SNAPSHOT_CMS_COMP_WORTH_AVAILABLE_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    SNAPSHOT_CMS_CURRENT_TRIP_THEO_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    DISCRETIONARY_COMP_FLG
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    ISSUED_BY_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMP_TYPE_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    NUMBER_OF_PEOPLE_CNT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    WINE_COMP_LIMIT_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    ISSUE_POINT_LIMIT_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    WINE_POINT_LIMIT_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    ISSUE_POINT_LIMIT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    REDEEM_AUTHORIZATION_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    FOLIO_ID
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    EXTERNAL_TICKET_NBR
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    REDEEM_POINT_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMP_EXCEPTION_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    VOID_AUTHORIZATION_CD
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    VOID_DTTM
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    CREATE_DTTM
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    LAST_DTTM
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    NGC_EXTRACTION_PROCESSED_FLG
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    ISS_REWARD_CREDIT_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    ISS_REWARD_CREDIT_NBR
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    USED_REWARD_CREDT_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    USED_REWARD_CREDITS_NBR
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    PLAYER_DEVELOPMENT_FLG
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    SNAPSHOT_CMS_REWARD_CREDIT_BALANCE_AT_ISSUE_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    ISSUE_COMP_WORTH_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    USED_COMP_WORTH_AMT
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    UNIQUE_REWARD_LINK_NBR
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMP_COMMENTS_DESC
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMMENTS_EXTENDED
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    OUTLET_CATEGORY
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMPOR_NAME
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    EMPLOYEE_FIRST_NM
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    EMPLOYEE_LAST_NM
+                 
+            AS VARCHAR), 'null') ||  '||' || 
+        
+        
+        
+          
+        NVL(CAST(
+                
+                    COMP_CATEGORY
+                 
+            AS VARCHAR), 'null')) AS STRING )
+     AS "MD5_CHECKSUM", 
+            
+                ISSUE_DTTM AS "ISSUE_DTTM", 
+            
+                0 AS "REPLAY_COUNTER", 
+            
+                OUTLET_CATEGORY AS "OUTLET_CATEGORY", 
+            
+                COMPOR_NAME AS "COMPOR_NAME", 
+            
+                EMPLOYEE_FIRST_NM AS "EMPLOYEE_FIRST_NM", 
+            
+                EMPLOYEE_LAST_NM AS "EMPLOYEE_LAST_NM", 
+            
+                COMP_CATEGORY AS "COMP_CATEGORY", 
+            
+                ISHDRW AS "ISHDRW", 
+            
+                REDEEM_DTTM AS "REDEEM_DTTM"
+            
+
+            FROM 
+	(  
+		SELECT 
+			CMPRW_RAW.SYIDRW AS GUEST_ID,
+			CMPRW_RAW.CNUMRW AS COMP_NBR,
+			CMPRW_RAW.COTLRW AS CASINO_OUTLET_CD,
+			CMPRC_RAW.OCATRC AS OUTLET_CATEGORY,
+			COALESCE(CMPHA_RAW.COPNM, CMPAS_RAW.COPNM, LKP.C_COMPOR_NAME) AS COMPOR_NAME,
+			COALESCE(CMPHA_RAW.FNAMHA, CMPAS_RAW.FNAMAS, SPLIT_PART(LKP.C_COMPOR_NAME, ',', 1))  AS EMPLOYEE_FIRST_NM,
+			COALESCE(CMPHA_RAW.LNAMHA, CMPAS_RAW.LNAMAS, SPLIT_PART(LKP.C_COMPOR_NAME, ',', 2)) AS EMPLOYEE_LAST_NM,
+			COALESCE(RCL.REVENUE_CATEGORY, CMPRW_RAW.CTYPRW) AS COMP_CATEGORY,
+			NVL(CMPRW_RAW.LMTTRW,'') AS LIMIT_TYPE_CD,
+			CMPRW_RAW.AUIDRW AS AUTHORIZER_ID,
+			--CMPRW_RAW.COTLRW AS REVENUE_CENTER_NBR,
+			CMPCD_RAW.DEPTCD AS COMPOR_DEPARTMENT_CD,
+			--CMPHA_RAW.LEVLHA AS COMPOR_LEVEL_CD,
+			CMPRW_RAW.PROPERTY_CODE AS PROPERTY_CD,
+			CMPRW_RAW.RAMTRW AS REDEEM_AMT,
+			CMPRW_RAW.IAMTRW AS ISSUE_COMP_LIMIT_AMT,
+			CMPLT_RAW.LMTDLT AS LIMIT_DESC,
+            DECODE(CMPCD_RAW.LSHDCD, 0, '1899-12-31'::DATE, CMPCD_RAW.LSHDCD + '1899-12-31'::DATE) AS LAST_CHANGE_ISSUE_DTTM,
+			CMPRW_RAW."PRP#RW" AS PROPERTY_ID,
+			CMPRW_RAW.ISTMRW,
+			DECODE(CMPRW_RAW.ISHDRW, 0, '1899-12-31'::DATE, CMPRW_RAW.ISHDRW + '1899-12-31'::DATE) AS ISSUE_DT, 
+			CMPCD_RAW.CTWLCD AS SNAPSHOT_CMS_TRIP_WIN_LOSS_AMT,
+			CMPCD_RAW.CCPWCD AS SNAPSHOT_CMS_TRIP_COMP_WORTH,
+			CMPCD_RAW.PCPWCD AS SNAPSHOT_CMS_PROPERTY_COMP_WORTH,
+			CMPCD_RAW.BCPWCD AS SNAPSHOT_CMS_BRAND_COMP_WORTH,
+			CMPCD_RAW.OVR$CD AS COMP_AVERAGE_AMT,
+			CMPCD_RAW.OVRPCD AS COMP_OVERAGE_PCT,
+			CMPRW_RAW.CAUTRW AS COMPOR_AUTHOR_NBR,
+			CMPRW_RAW.TYPERW AS STATUS_CD,
+			CMPRW_RAW.STATRW AS COMP_STATUS_CD,
+			DECODE(CMPRW_RAW.TRHDRW, 0, '1899-12-31'::DATE, CMPRW_RAW.TRHDRW + '1899-12-31'::DATE) AS LAST_CHANGE_DT,
+			CMPCD_RAW.LAMTCD AS LAST_CHANGE_COMP_LIMIT_AMT,
+			CMPCD_RAW.LOV$CD AS LAST_CHANGE_COMP_OVER_AMT,
+			CMPCD_RAW.LOVPCD AS LAST_CHANGE_COMP_OVER_PCT,
+			CMPCD_RAW.CWA$CD AS SNAPSHOT_CMS_COMP_WORTH_AVAILABLE_AMT,
+			CMPCD_RAW.CTT$CD AS SNAPSHOT_CMS_CURRENT_TRIP_THEO_AMT,
+			CMPCD_RAW.EXCLCD AS DISCRETIONARY_COMP_FLG,
+			CMPRW_RAW.ISBYRW AS ISSUED_BY_CD,
+			CMPRW_RAW.CTYPRW AS COMP_TYPE_CD,
+			CMPRW_RAW."#PPLRW" AS NUMBER_OF_PEOPLE_CNT,
+			CMPRW_RAW.WAMTRW AS WINE_COMP_LIMIT_AMT,
+			CMPRW_RAW.IPNTRW AS ISSUE_POINT_LIMIT_AMT,
+			CMPRW_RAW.WPDARW AS WINE_POINT_LIMIT_AMT,
+			CMPRW_RAW.IPDARW AS ISSUE_POINT_LIMIT,
+			/*CONCAT(
+				"DAAS_COMMON"."HUNDRED_YEAR_BUSINESS_DATE_CON_UDF"(CMPRW_RAW.RDHDRW), ' ',
+				DATEADD(HOUR,HOUR_TXT,
+					CASE 
+						WHEN CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET  > 240000 THEN '00:00:00'::TIME
+						WHEN CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET  < 000000 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 1, 2)::INTEGER >= 24 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 3, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 5, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						ELSE TO_CHAR((SUBSTR('000000', 1, 6 - LENGTH((CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))) || (CMPRW_RAW.RDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))::INTEGER,  '00:00:00')::TIME END
+				)
+			) AS REDEEM_DTTM, */
+			CONCAT(
+				DECODE(CMPRW_RAW.RDHDRW, 0, '1899-12-31'::DATE, CMPRW_RAW.RDHDRW + '1899-12-31'::DATE), ' ',
+				CASE WHEN CMPRW_RAW.RDTMRW >= 240000 THEN '00:00:00'::TIME ELSE 
+        LPAD(
+            CASE WHEN CMPRW_RAW.RDTMRW = 240000 THEN 0 ELSE CMPRW_RAW.RDTMRW END,
+            6,
+            '0'
+        )::TIME
+		END
+			) AS REDEEM_DTTM,
+			CMPRW_RAW.RDBYRW AS REDEEM_AUTHORIZATION_CD,
+			"DAAS_COMMON"."FOLIO_ID_UDF"(CMPRW_RAW.FKDTRW, CMPRW_RAW.FSEQRW) AS FOLIO_ID,
+			CMPRW_RAW."TKT#RW" AS EXTERNAL_TICKET_NBR,
+			CMPRW_RAW.RPDARW AS REDEEM_POINT_AMT,
+			CMPRW_RAW.CMPXRW AS COMP_EXCEPTION_CD,
+			CMPRW_RAW.VAUTRW AS VOID_AUTHORIZATION_CD,
+			/*CONCAT(
+				"DAAS_COMMON"."HUNDRED_YEAR_BUSINESS_DATE_CON_UDF"(CMPRW_RAW.VDHDRW), ' ',
+				DATEADD(HOUR,HOUR_TXT,
+					CASE 
+						WHEN CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET  > 240000 THEN '00:00:00'::TIME
+						WHEN CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET  < 000000 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 1, 2)::INTEGER >= 24 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 3, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 5, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						ELSE TO_CHAR((SUBSTR('000000', 1, 6 - LENGTH((CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))) || (CMPRW_RAW.VDTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))::INTEGER,  '00:00:00')::TIME END
+				)
+			) AS VOID_DTTM,*/
+			CONCAT(
+				  DECODE(CMPRW_RAW.VDHDRW, 0, '1899-12-31'::DATE, CMPRW_RAW.VDHDRW + '1899-12-31'::DATE), ' ',
+				CASE WHEN CMPRW_RAW.VDTMRW >= 240000 THEN '00:00:00'::TIME ELSE 
+        LPAD(
+            CASE WHEN CMPRW_RAW.VDTMRW = 240000 THEN 0 ELSE CMPRW_RAW.VDTMRW END,
+            6,
+            '0'
+        )::TIME
+  END
+			) AS VOID_DTTM, 
+			/*CONCAT(
+				"DAAS_COMMON"."HUNDRED_YEAR_BUSINESS_DATE_CON_UDF"(CMPRW_RAW.CRHDRW), ' ',
+				DATEADD(HOUR,HOUR_TXT,
+					CASE 
+						WHEN CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET  > 240000 THEN '00:00:00'::TIME
+						WHEN CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET  < 000000 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 1, 2)::INTEGER >= 24 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 3, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 5, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						ELSE TO_CHAR((SUBSTR('000000', 1, 6 - LENGTH((CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))) || (CMPRW_RAW.CRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))::INTEGER,  '00:00:00')::TIME
+					END
+				)
+			) AS CREATE_DTTM,*/ 
+			CONCAT(
+				DECODE(CMPRW_RAW.CRHDRW, 0, '1899-12-31'::DATE, CMPRW_RAW.CRHDRW + '1899-12-31'::DATE), ' ',
+				CASE WHEN CMPRW_RAW.CRTMRW >= 240000 THEN '00:00:00'::TIME ELSE 
+        LPAD(
+            CASE WHEN CMPRW_RAW.CRTMRW = 240000 THEN 0 ELSE CMPRW_RAW.CRTMRW END,
+            6,
+            '0'
+        )::TIME
+		END
+			) AS CREATE_DTTM, 
+			/*CONCAT(
+				"DAAS_COMMON"."HUNDRED_YEAR_BUSINESS_DATE_CON_UDF"(CMPRW_RAW.TRHDRW), ' ',
+				DATEADD(HOUR, HOUR_TXT,
+					CASE 
+						WHEN CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET  > 240000 THEN '00:00:00'::TIME
+						WHEN CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET  < 000000 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 1, 2)::INTEGER >= 24 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 3, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 5, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						ELSE TO_CHAR((SUBSTR('000000', 1, 6 - LENGTH((CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))) || (CMPRW_RAW.TRTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))::INTEGER,  '00:00:00')::TIME
+					END
+				)
+			) AS LAST_DTTM,*/
+			CONCAT(
+				DECODE(CMPRW_RAW.TRHDRW, 0, '1899-12-31'::DATE, CMPRW_RAW.TRHDRW + '1899-12-31'::DATE), ' ',
+				CASE WHEN CMPRW_RAW.TRTMRW >= 240000 THEN '00:00:00'::TIME ELSE 
+        LPAD(
+            CASE WHEN CMPRW_RAW.TRTMRW = 240000 THEN 0 ELSE CMPRW_RAW.TRTMRW END,
+            6,
+            '0'
+        )::TIME
+		END
+			) AS LAST_DTTM, 	
+			CMPRW_RAW.NGCFRW AS NGC_EXTRACTION_PROCESSED_FLG,
+			CMPRW_RAW.IRC$RW AS ISS_REWARD_CREDIT_AMT,
+			CMPRW_RAW."IRC#RW" AS ISS_REWARD_CREDIT_NBR,
+			CMPRW_RAW.URC$RW AS USED_REWARD_CREDT_AMT,
+			CMPRW_RAW."URC#RW" AS USED_REWARD_CREDITS_NBR,
+			CMPRW_RAW.PLDVRW AS PLAYER_DEVELOPMENT_FLG,
+			CMPRW_RAW.RAVLRW AS SNAPSHOT_CMS_REWARD_CREDIT_BALANCE_AT_ISSUE_AMT,
+			CMPRW_RAW.ICW$RW AS ISSUE_COMP_WORTH_AMT,
+			CMPRW_RAW.UCW$RW AS USED_COMP_WORTH_AMT,
+			CMPRW_RAW.RWNBRW AS UNIQUE_REWARD_LINK_NBR,
+			ECPCMPCM_RAW.CMNTCM AS COMP_COMMENTS_DESC,
+			CMPRW_RAW.SOURCE_SYSTEM_NAME AS SOURCE_SYSTEM_NM,
+			CMPRW_RAW.TIME_ZONE AS TIME_ZONE,
+			CURRENT_TIMESTAMP AS CREATED_DTTM,
+			CURRENT_USER AS CREATED_BY,
+			CURRENT_TIMESTAMP AS UPDATED_DTTM,
+			CURRENT_USER AS UPDATED_BY,
+			CASE 
+				WHEN TRIM(CMPRW_RAW.PROGRAM_NAME) ='QRYO04' AND CMPRW_RAW.OPERATION_TYPE IN(0,5,8) THEN 'N'
+				WHEN PPNL_CMPRW.PROGRAM_NM IS NOT NULL THEN 'N'
+				WHEN CMPRW_RAW.OPERATION_TYPE IN(0, 5, 8) THEN 'Y'
+				ELSE 'N'
+			END AS DELETE_IND,
+			CMPRW_RAW.OPERATION_SEQUENCE_NBR AS OPERATION_SEQUENCE_NBR,
+			/*CONCAT(
+				"DAAS_COMMON"."HUNDRED_YEAR_BUSINESS_DATE_CON_UDF"(CMPRW_RAW.ISHDRW), ' ',
+				DATEADD(HOUR,HOUR_TXT,
+					CASE 
+						WHEN CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET  > 240000 THEN '00:00:00'::TIME
+						WHEN CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET  < 000000 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 1, 2)::INTEGER >= 24 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 3, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						WHEN SUBSTR(SUBSTR('000000', 1, 6-(LENGTH((CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6)))) || (CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6) , 5, 2)::INTEGER >= 60 THEN '00:00:00'::TIME
+						ELSE TO_CHAR((SUBSTR('000000', 1, 6 - LENGTH((CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))) || (CMPRW_RAW.ISTMRW - OFFSET_CONTROL.OFFSET)::CHAR(6))::INTEGER,  '00:00:00')::TIME
+					END
+				)
+			) AS ISSUE_DTTM,*/
+			CONCAT(
+				DECODE(CMPRW_RAW.ISHDRW, 0, '1899-12-31'::DATE, CMPRW_RAW.ISHDRW + '1899-12-31'::DATE) , ' ',				
+				CASE WHEN CMPRW_RAW.ISTMRW >= 240000 THEN '00:00:00'::TIME ELSE 
+        LPAD(
+            CASE WHEN CMPRW_RAW.ISTMRW = 240000 THEN 0 ELSE CMPRW_RAW.ISTMRW END,
+            6,
+            '0'
+        )::TIME
+			END	
+			) AS ISSUE_DTTM, 
+			CMPRW_RAW.ISHDRW,
+			CMPRM_RAW.COMMENTS_EXTENDED AS COMMENTS_EXTENDED
+		FROM 
+		(
+			SELECT 
+				CMPRW_RAW.*
+			FROM 
+				"DAAS_RAW_HETCMS"."CMPRW_RAW" CMPRW_RAW
+			QUALIFY ROW_NUMBER() OVER (PARTITION BY --CMPRW_RAW.SYIDRW,
+													CMPRW_RAW.CNUMRW, CMPRW_RAW.ISHDRW, CMPRW_RAW.COTLRW, CMPRW_RAW.PROPERTY_CODE
+									  ORDER BY CMPRW_RAW.OPERATION_DATE DESC, CMPRW_RAW.OPERATION_SEQUENCE_NBR DESC, CMPRW_RAW.CREATED_DATE DESC) = 1
+		) CMPRW_RAW  
+		LEFT JOIN 
+		(
+			SELECT 
+				CMPCD_RAW.*
+			FROM 
+				"DAAS_RAW_HETCMS"."CMPCD_RAW" 
+			QUALIFY ROW_NUMBER() OVER(PARTITION BY --SYIDCD, 
+												CNUMCD, ISHDCD, COTLCD, PROPERTY_CODE
+									  ORDER BY OPERATION_DATE DESC ,OPERATION_SEQUENCE_NBR DESC,CREATED_DATE DESC) = 1
+		) CMPCD_RAW 
+		ON 
+			--CMPRW_RAW.SYIDRW = CMPCD_RAW.SYIDCD AND
+			 CMPRW_RAW.CNUMRW = CMPCD_RAW.CNUMCD
+			AND CMPRW_RAW.ISHDRW = CMPCD_RAW.ISHDCD
+			--AND CMPRW_RAW.STATRW = CMPCD_RAW.CSTSCD
+			AND CMPRW_RAW.COTLRW = CMPCD_RAW.COTLCD
+			AND CMPRW_RAW.PROPERTY_CODE = CMPCD_RAW.PROPERTY_CODE
+		LEFT JOIN 
+		(
+			SELECT 
+				APIDAS,
+				PROPERTY_CODE,
+				LNAMAS,
+				FNAMAS,
+				--CONCAT(FNAMAS , ' ,', LNAMAS) AS COPNM,
+				CONCAT(
+						REGEXP_REPLACE ( 
+									concat(
+								 case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 1) end,
+								 case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 2) end,  
+								 case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 3) end,  
+								 case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 4) end,  
+								 case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 5) end
+									),'[0-9]',''),
+						', ',
+						REGEXP_REPLACE ( 
+							concat(
+							 case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 1) end,
+							 case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 2) end,  
+							 case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 3) end,  
+							 case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 4) end,  
+							 case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 5) end
+							),'[0-9]','') ) AS COPNM
+			 FROM
+				"DAAS_RAW_HETCMS"."CMPAS_RAW"
+			 QUALIFY ROW_NUMBER() OVER (PARTITION BY APIDAS,PROPERTY_CODE
+										ORDER BY OPERATION_DATE DESC ,OPERATION_SEQUENCE_NBR DESC,CREATED_DATE DESC) = 1
+		) CMPAS_RAW
+		 ON 
+			CMPAS_RAW.APIDAS = CMPCD_RAW.CAUTCD
+			AND CMPAS_RAW.PROPERTY_CODE = CMPCD_RAW.PROPERTY_CODE
+		LEFT JOIN 
+		(
+			SELECT 
+				LMTTLT,
+				LMTDLT,
+				PROPERTY_CODE 
+			FROM 
+				"DAAS_RAW_HETCMS"."CMPLT_RAW" 
+			QUALIFY ROW_NUMBER() OVER (PARTITION BY CMPLT_RAW.LMTTLT,CMPLT_RAW.PROPERTY_CODE
+									   ORDER BY OPERATION_DATE DESC ,OPERATION_SEQUENCE_NBR DESC,CREATED_DATE DESC) = 1 
+		) CMPLT_RAW
+		ON 
+			CMPRW_RAW.LMTTRW = CMPLT_RAW.LMTTLT
+			AND CMPRW_RAW.PROPERTY_CODE = CMPLT_RAW.PROPERTY_CODE
+		LEFT JOIN
+		(
+			/* v1.14 (DAASI-3640): a comment line belongs to a comp when its guest ever held
+			   that comp (same number, issue date and property) in the comp table history.
+			   Comp numbers are reused, so matching on number alone copied comments across
+			   guests. The history match also keeps a note after a merge, where CMS re-points
+			   the comp to the surviving guest id but leaves the comment under the old one. */
+			SELECT
+				CNUMRW,
+				ISHDRW,
+				PROPERTY_CODE,
+				LISTAGG(CMNTCM, '|') WITHIN GROUP (ORDER BY CSEQCM) AS CMNTCM
+			FROM
+			(
+				SELECT
+					H.CNUMRW,
+					H.ISHDRW,
+					H.PROPERTY_CODE,
+					L.CSEQCM,
+					L.CMNTCM
+				FROM
+				(
+					/* every guest id that ever held each comp */
+					SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
+					FROM "DAAS_RAW_HETCMS"."CMPRW_RAW"
+				) H
+				JOIN
+				(
+					/* latest version of each comment line */
+					SELECT
+						SYIDCM,
+						"CMP#CM",
+						CSEQCM,
+						CMNTCM,
+						PROPERTY_CODE,
+						OPERATION_DATE,
+						OPERATION_SEQUENCE_NBR,
+						CREATED_DATE
+					FROM
+						"DAAS_RAW_HETCMS"."ECPCMPCM_RAW" ECPCMPCM_RAW
+					QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+										   ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+				) L
+				ON
+					L.SYIDCM = H.SYIDRW
+					AND L."CMP#CM" = H.CNUMRW
+					AND L.PROPERTY_CODE = H.PROPERTY_CODE
+				/* one text per line number; if a merged pair carries the same line under both ids, keep the latest */
+				QUALIFY ROW_NUMBER() OVER (PARTITION BY H.CNUMRW, H.ISHDRW, H.PROPERTY_CODE, L.CSEQCM
+										   ORDER BY L.OPERATION_DATE DESC, L.OPERATION_SEQUENCE_NBR DESC, L.CREATED_DATE DESC) = 1
+			)
+			GROUP BY
+				CNUMRW,
+				ISHDRW,
+				PROPERTY_CODE
+		) ECPCMPCM_RAW
+		ON
+			CMPRW_RAW.CNUMRW = ECPCMPCM_RAW.CNUMRW
+			AND CMPRW_RAW.ISHDRW = ECPCMPCM_RAW.ISHDRW
+			AND CMPRW_RAW.PROPERTY_CODE = ECPCMPCM_RAW.PROPERTY_CODE
+		LEFT JOIN
+		(
+			/* v1.14 (DAASI-3640): remarks (CMPRM) carry no guest id. A remark line belongs to the
+			   comp that was live on its number when the line was written: the comp whose first
+			   appearance in the comp table is the latest one at or before the line. A 60-second
+			   allowance covers lines captured just ahead of their own comp row, and the first comp
+			   seen on a number takes any earlier lines (the April 2022 history start). The purge
+			   deletes remarks by number, so a purged line still carries its text and stays with
+			   its comp. Lines are joined with | in line-number order, capped at 4000 characters. */
+			SELECT
+				CNUMRW,
+				ISHDRW,
+				PROPERTY_CODE,
+				LEFT(LISTAGG(EXPLRM, '|') WITHIN GROUP (ORDER BY SEQNRM), 4000) AS COMMENTS_EXTENDED
+			FROM
+			(
+				SELECT
+					C.CNUMRW,
+					C.ISHDRW,
+					C.PROPERTY_CODE,
+					R.SEQNRM,
+					R.EXPLRM
+				FROM
+				(
+					/* each comp's life on its number: first appearance, and the next comp's first appearance */
+					SELECT
+						CNUMRW,
+						ISHDRW,
+						PROPERTY_CODE,
+						FIRST_SEEN,
+						LAG(FIRST_SEEN)  OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS PREV_FIRST_SEEN,
+						LEAD(FIRST_SEEN) OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS NEXT_FIRST_SEEN
+					FROM
+					(
+						SELECT CNUMRW, ISHDRW, PROPERTY_CODE, MIN(OPERATION_DATE) AS FIRST_SEEN
+						FROM "DAAS_RAW_HETCMS"."CMPRW_RAW"
+						GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE
+					)
+				) C
+				JOIN
+					"DAAS_RAW_HETCMS"."CMPRM_RAW" R
+				ON
+					R.CNUMRM = C.CNUMRW
+					AND R.PROPERTY_CODE = C.PROPERTY_CODE
+					AND (C.PREV_FIRST_SEEN IS NULL OR R.OPERATION_DATE >= DATEADD(SECOND, -60, C.FIRST_SEEN))
+					AND (C.NEXT_FIRST_SEEN IS NULL OR R.OPERATION_DATE <  DATEADD(SECOND, -60, C.NEXT_FIRST_SEEN))
+				/* latest version of each remark line within that comp's life */
+				QUALIFY ROW_NUMBER() OVER (PARTITION BY C.CNUMRW, C.ISHDRW, C.PROPERTY_CODE, R.SEQNRM
+										   ORDER BY R.OPERATION_DATE DESC, R.OPERATION_SEQUENCE_NBR DESC, R.CREATED_DATE DESC) = 1
+			)
+			GROUP BY
+				CNUMRW,
+				ISHDRW,
+				PROPERTY_CODE
+		) CMPRM_RAW
+		ON
+			CMPRW_RAW.CNUMRW = CMPRM_RAW.CNUMRW
+			AND CMPRW_RAW.ISHDRW = CMPRM_RAW.ISHDRW
+			AND CMPRW_RAW.PROPERTY_CODE = CMPRM_RAW.PROPERTY_CODE
+
+		LEFT JOIN
+			DAAS_COMMON.OFFSET_CONTROL 
+		ON
+			CMPRW_RAW.PROPERTY_CODE=OFFSET_CONTROL.PROPERTY_CD
+		LEFT JOIN 
+		(
+			SELECT 
+				OCATRC,
+				COTLRC
+			 FROM 
+				"DAAS_RAW_HETCMS"."CMPRC_RAW"
+			QUALIFY ROW_NUMBER() OVER(PARTITION BY COTLRC 
+									  ORDER BY OPERATION_DATE DESC ,OPERATION_SEQUENCE_NBR DESC,CREATED_DATE DESC) = 1
+		) CMPRC_RAW
+		ON 
+			CMPRW_RAW.COTLRW = CMPRC_RAW.COTLRC							
+		LEFT JOIN 
+		(
+			SELECT 
+				AUTHHA,
+				RVCDHA,
+				FNAMHA,
+				LNAMHA,
+				--CONCAT(FNAMHA , ' ,', LNAMHA) AS COPNM,
+				--CONCAT(LNAMHA , ', ', FNAMHA) AS COPNM,
+			CONCAT(
+					REGEXP_REPLACE ( 
+							concat(
+						 case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 1) end,
+						 case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 2) end,  
+						 case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 3) end,  
+						 case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 4) end,  
+						 case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 5) end
+									),'[0-9]',''),
+					', ',       
+					REGEXP_REPLACE ( 
+							concat(
+						 case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 1) end,
+						 case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 2) end,  
+						 case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 3) end,  
+						 case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 4) end,  
+						 case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 5) end
+									),'[0-9]','')) AS COPNM,
+				PROPERTY_CODE,
+				LEVLHA 
+			FROM 
+				"DAAS_RAW_HETCMS"."CMPHA_RAW"
+			QUALIFY ROW_NUMBER() OVER (PARTITION BY AUTHHA,RVCDHA,PROPERTY_CODE
+									ORDER BY OPERATION_DATE DESC ,OPERATION_SEQUENCE_NBR DESC,CREATED_DATE DESC) = 1
+		) CMPHA_RAW 
+		ON 
+			CMPRW_RAW.CAUTRW=CMPHA_RAW.AUTHHA	
+			AND CMPRW_RAW.COTLRW=CMPHA_RAW.RVCDHA
+			AND CMPRW_RAW.PROPERTY_CODE=CMPHA_RAW.PROPERTY_CODE
+		LEFT JOIN
+			--DAAS_TERADATA_RAW.EDW_COMPOR_LKP LKP
+		"DAAS_TERADATA_RAW"."PML_COMP_DTL_COMPOR_LKP_DAAS" LKP
+		ON
+			CMPRW_RAW.CAUTRW = TRIM(LKP.C_COMPOR_CODE)	
+			AND CMPRW_RAW.PROPERTY_CODE = TRIM(LKP.C_PROP_CD)
+			AND DECODE(CMPRW_RAW.ISHDRW, 0, '1899-12-31'::DATE, CMPRW_RAW.ISHDRW + '1899-12-31'::DATE) BETWEEN LKP.START_DATE AND LKP.END_DATE
+		LEFT JOIN 
+			"DAAS_COMMON"."PURGE_PROGRAM_NM_LKP" PPNL_CMPRW
+		ON 
+			CMPRW_RAW.SOURCE_SYSTEM_NAME = PPNL_CMPRW.SOURCE_SYSTEM_NM
+			AND CMPRW_RAW.PROPERTY_CODE = PPNL_CMPRW.PROPERTY_CD
+			AND UPPER(TRIM(CMPRW_RAW.PROGRAM_NAME)) = UPPER(TRIM(PPNL_CMPRW.PROGRAM_NM))
+		/*LEFT JOIN
+			"DAAS_CORE"."CASINO_OUTLET_CD_LKP" COCL
+		ON
+			CMPRW_RAW.PROPERTY_CODE = COCL.PROPERTY_CD
+			AND CMPRW_RAW.COTLRW = COCL.CASINO_OUTLET_CD*/
+		LEFT JOIN 
+	    (
+			SELECT  
+				PROPERTY_CD,
+				CONS_REV_CENTER_CD,
+				MAX(REVENUE_CATEGORY_ID) AS REVENUE_CATEGORY_ID
+			FROM 
+				"DAAS_CORE"."CONS_REVENUE_CENTER_FACT"
+			WHERE 
+				ACTIVE_FLG ='Y'
+			GROUP BY ALL	
+	    ) CRCF
+		ON 
+			CMPRW_RAW.PROPERTY_CODE = CRCF.PROPERTY_CD
+			AND CMPRW_RAW.COTLRW = CRCF.CONS_REV_CENTER_CD		
+		LEFT JOIN
+			"DAAS_CORE"."REVENUE_CATEGORY_LKP" RCL
+		ON
+			 CRCF.REVENUE_CATEGORY_ID = RCL.REVENUE_CATEGORY_ID
+		QUALIFY ROW_NUMBER() OVER (PARTITION BY --CMPRW_RAW.SYIDRW, 
+														CMPRW_RAW.CNUMRW, CMPRW_RAW.ISHDRW, CMPRW_RAW.COTLRW, CMPRW_RAW.PROPERTY_CODE 
+					ORDER BY CMPRW_RAW.OPERATION_DATE DESC, CMPRW_RAW.OPERATION_SEQUENCE_NBR DESC, CMPRW_RAW.CREATED_DATE DESC, CMPCD_RAW.DEPTCD DESC NULLS LAST) = 1
+	)"COMP_DETAIL_FACT";
