@@ -844,6 +844,44 @@ JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
 WHERE e.batch_id >= (SELECT MIN(value) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS WHERE mark LIKE '%_batch')
 ORDER BY e.batch_id, e.created_dttm;
 
+-- B3b. (After a TRIP_MERGE FAILURE.) Did the merge commit? TRIP_MERGE_PROC commits its data, then its metrics, and only
+--      then recreates merge check's stream; in UAT that last statement fails on privileges (the stream belongs to
+--      STREAM_OWNERS_UAT), the batch is marked FAILURE, and the data stays committed. Expect: processed = nominated,
+--      expected_retired = 240 of 240, replacements > 0, merge queue empty, and the merge-check stream holding the
+--      merge's own changes. If instead processed is 0 and the queue still holds rows, the merge rolled back: send B3.
+WITH mb AS (SELECT value AS batch_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS WHERE mark = 'trip_merge_batch'),
+mk AS (SELECT value AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS WHERE mark = 'max_trip_master_id_before')
+SELECT (SELECT batch_id FROM mb)                                                                   AS merge_batch,
+       (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE)    AS nominated,
+       (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_PROCESSED
+         WHERE batch_id = (SELECT batch_id FROM mb))                                               AS processed,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT e
+          JOIN DAAS_UAT.DAAS_CORE.TRIP_MASTER m ON m.trip_master_id = e.trip_master_id
+         WHERE e.expect_nomination AND m.delete_ind = 'Y')                                         AS expected_retired,
+       (SELECT COUNT_IF(expect_nomination) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT)      AS expected_total,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+         WHERE m.delete_ind = 'N' AND m.trip_master_id > (SELECT max_tm FROM mk)
+           AND m.guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST')) AS replacements,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM WHERE METADATA$ACTION = 'INSERT')              AS merge_queue_still_waiting,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM WHERE METADATA$ACTION = 'INSERT')  AS merge_check_stream_rows;
+
+-- B3c. (Only after B3b showed the merge committed.) Do what the merge's last statement was for: move merge check's
+--      stream past the merge's own changes, keeping them in a scratch table (the same move as the pilot's B3d and the
+--      cleanup's E6). Run the three in order; expect FALSE in the last column. Then run B1 again with v_start_at = 4.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MERGE_CHANGES AS
+SELECT *, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ AS kept_at
+FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM;
+
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MERGE_CHANGES
+SELECT *, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM
+WHERE 0 = 1;
+
+SELECT COUNT(*)                                                                         AS merge_changes_kept,
+       COUNT_IF(delete_ind = 'N')                                                       AS of_them_live_replacements,
+       SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM') AS stream_has_rows_expect_false
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MERGE_CHANGES;
+
 -- B4. (Only if B1 says to.) Switch UAT's POS summary sub-step back on by hand.
 UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y'
 WHERE transaction_type = 'POS' AND active_flg = 'N' AND stored_procedure_name ILIKE '%TRIP_POS_SUMMARY_LOAD_PROC';
