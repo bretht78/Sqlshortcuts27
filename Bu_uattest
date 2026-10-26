@@ -1049,11 +1049,12 @@ board AS (
     UNION ALL SELECT 3, 'Of those, now retired and replaced',
            (SELECT COUNT_IF(expect_nomination) FROM e),
            (SELECT COUNT(*) FROM e JOIN tma ON tma.trip_master_id = e.trip_master_id WHERE e.expect_nomination AND tma.delete_ind = 'Y')
-    UNION ALL SELECT 4, 'Over-cap trips WITH a hotel night, still live and unchanged (exempt)',
-           (SELECT COUNT(*) FROM e WHERE has_hotel_stay = 'Y' AND trip_days > max_trip_days),
+    UNION ALL SELECT 4, 'Over-cap trips WITH a hotel night nominated by the new rule (exempt, so none)', 0,
+           (SELECT COUNT(*) FROM q WHERE why LIKE 'over cap, no stay%' AND has_hotel_stay = 'Y')
+    UNION ALL SELECT 24, 'Over-cap trips WITH a hotel night retired anyway, by the join rules merge check already had (C10 lists each with its partner)',
+           NULL,
            (SELECT COUNT(*) FROM e JOIN tma a ON a.trip_master_id = e.trip_master_id
-             WHERE e.has_hotel_stay = 'Y' AND e.trip_days > e.max_trip_days AND a.delete_ind = 'N'
-               AND a.trip_start_dt = e.trip_start_dt AND a.trip_end_dt = e.trip_end_dt)
+             WHERE e.has_hotel_stay = 'Y' AND e.trip_days > e.max_trip_days AND a.delete_ind = 'Y')
     UNION ALL SELECT 5, 'Touched trips outside the new rule (within cap, or with a stay) that were retired: join rules only, C4 lists each with its partner',
            NULL,
            (SELECT COUNT(*) FROM e JOIN tma a ON a.trip_master_id = e.trip_master_id
@@ -1217,3 +1218,114 @@ WHERE market_cd IN ('BEM', 'WLM')
   AND guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST')
 GROUP BY 1, 2
 ORDER BY 3 DESC, 1, 2 DESC;
+
+
+-- C9. The transactions of the retired trips that are NOT on exactly one live trip of the same grain now (C2 rows 8-9).
+--     One row per such transaction: what it is, its date, the retired trip it was on, how many live trips hold it now
+--     and which, and which live trips of the same guest and grain cover its date (a transaction can only be attached
+--     to a trip whose dates contain it). Expect one row; 0 holders with no covering trip means the windowing step left
+--     that date out, 2+ holders means the merge attached it to two overlapping trips (the double-attach the pilot's A7
+--     measured; the recalculation route has the same join).
+WITH g AS (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST'),
+retired AS (
+    SELECT b.trip_master_id, b.guest_unique_id, b.trip_type, b.property_cd, b.market_cd, b.trip_start_dt, b.trip_end_dt
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE b
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a ON a.trip_master_id = b.trip_master_id
+    WHERE b.delete_ind = 'N' AND a.delete_ind = 'Y' AND b.guest_unique_id IN (SELECT guest_unique_id FROM g)
+),
+tx AS (
+    SELECT DISTINCT r.trip_master_id AS retired_trip, r.guest_unique_id, r.trip_type, r.property_cd, r.market_cd,
+           r.trip_start_dt AS retired_start, r.trip_end_dt AS retired_end,
+           d.transaction_table, d.transaction_table_sk, d.transaction_type, d.business_start_dt, d.business_end_dt
+    FROM retired r
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE d ON d.trip_master_id = r.trip_master_id
+    WHERE d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+),
+holders AS (
+    SELECT a.guest_unique_id, a.trip_type, a.property_cd, a.market_cd, d.transaction_table, d.transaction_table_sk,
+           COUNT(DISTINCT a.trip_master_id) AS live_trips_holding_it,
+           LISTAGG(DISTINCT a.trip_master_id || ' [' || a.trip_start_dt || '..' || a.trip_end_dt || ']', ' | ') AS which_trips
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_AFTER d ON d.trip_master_id = a.trip_master_id
+    WHERE a.delete_ind = 'N' AND d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+    GROUP BY ALL
+),
+odd AS (
+    SELECT t.*, COALESCE(h.live_trips_holding_it, 0) AS live_trips_holding_it, h.which_trips
+    FROM tx t
+    LEFT JOIN holders h ON h.guest_unique_id = t.guest_unique_id AND h.trip_type = t.trip_type
+                       AND EQUAL_NULL(h.property_cd, t.property_cd) AND EQUAL_NULL(h.market_cd, t.market_cd)
+                       AND h.transaction_table = t.transaction_table AND h.transaction_table_sk = t.transaction_table_sk
+    WHERE COALESCE(h.live_trips_holding_it, 0) <> 1
+),
+covering AS (
+    SELECT o.transaction_table, o.transaction_table_sk, o.guest_unique_id, o.trip_type, o.property_cd, o.market_cd,
+           LISTAGG(x.trip_master_id || ' [' || x.trip_start_dt || '..' || x.trip_end_dt || ']', ' | ')
+               WITHIN GROUP (ORDER BY x.trip_start_dt) AS live_trips_covering_its_date
+    FROM odd o
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER x
+      ON x.guest_unique_id = o.guest_unique_id AND x.trip_type = o.trip_type AND x.delete_ind = 'N'
+     AND EQUAL_NULL(x.property_cd, o.property_cd) AND EQUAL_NULL(x.market_cd, o.market_cd)
+     AND o.business_start_dt BETWEEN x.trip_start_dt AND x.trip_end_dt
+    GROUP BY ALL
+)
+SELECT o.transaction_table, o.transaction_table_sk, o.transaction_type, o.business_start_dt, o.business_end_dt,
+       o.guest_unique_id, o.trip_type, COALESCE(NULLIF(o.market_cd, 'N/A'), NULLIF(o.property_cd, 'N/A'), 'ENTERPRISE') AS code,
+       o.retired_trip, o.retired_start, o.retired_end,
+       o.live_trips_holding_it, o.which_trips, c.live_trips_covering_its_date
+FROM odd o
+LEFT JOIN covering c ON c.transaction_table = o.transaction_table AND c.transaction_table_sk = o.transaction_table_sk
+                    AND c.guest_unique_id = o.guest_unique_id AND c.trip_type = o.trip_type
+                    AND EQUAL_NULL(c.property_cd, o.property_cd) AND EQUAL_NULL(c.market_cd, o.market_cd)
+ORDER BY o.guest_unique_id, o.business_start_dt;
+
+
+-- C10. Over-cap trips WITH a hotel night that were retired anyway (C2 row 24). The new rule cannot nominate them (C2
+--      row 4), so each must have come in through a join rule merge check already had: adjacency without the cap for a
+--      hotel trip, or an overlap. One row per such trip: the nominated trips of the same guest and grain that overlap
+--      or adjoin it (its partners), and the live trips covering its days now, with their length and whether they hold
+--      a hotel night. Expect every row to show a partner, and its hotel nights still on a live trip.
+WITH e AS (
+    SELECT e.*
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT e
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a ON a.trip_master_id = e.trip_master_id
+    WHERE e.has_hotel_stay = 'Y' AND e.trip_days > e.max_trip_days AND a.delete_ind = 'Y'
+),
+partners AS (
+    SELECT e.trip_master_id,
+           LISTAGG(p.trip_master_id || ' [' || p.trip_start_dt || '..' || p.trip_end_dt || ', ' || q.why || ']', ' | ')
+               WITHIN GROUP (ORDER BY p.trip_start_dt) AS nominated_partners
+    FROM e
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE q ON q.trip_master_id <> e.trip_master_id
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE p
+      ON p.trip_master_id = q.trip_master_id AND p.guest_unique_id = e.guest_unique_id AND p.trip_type = e.trip_type
+     AND EQUAL_NULL(p.property_cd, e.property_cd) AND EQUAL_NULL(p.market_cd, e.market_cd)
+     AND p.trip_start_dt <= DATEADD(day, 1, e.trip_end_dt) AND p.trip_end_dt >= DATEADD(day, -1, e.trip_start_dt)
+    GROUP BY 1
+),
+hotel_now AS (
+    SELECT DISTINCT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_AFTER
+    WHERE transaction_type = 'HOTEL' AND delete_ind = 'N'
+),
+replacements AS (
+    SELECT e.trip_master_id,
+           LISTAGG(x.trip_master_id || ' [' || x.trip_start_dt || '..' || x.trip_end_dt || ', '
+                   || (DATEDIFF(day, x.trip_start_dt, x.trip_end_dt) + 1) || 'd, ' || IFF(h.trip_master_id IS NOT NULL, 'stay', 'no stay') || ']', ' | ')
+               WITHIN GROUP (ORDER BY x.trip_start_dt) AS live_trips_on_those_days_now
+    FROM e
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER x
+      ON x.guest_unique_id = e.guest_unique_id AND x.trip_type = e.trip_type AND x.delete_ind = 'N'
+     AND EQUAL_NULL(x.property_cd, e.property_cd) AND EQUAL_NULL(x.market_cd, e.market_cd)
+     AND x.trip_start_dt <= e.trip_end_dt AND x.trip_end_dt >= e.trip_start_dt
+    LEFT JOIN hotel_now h ON h.trip_master_id = x.trip_master_id
+    GROUP BY 1
+)
+SELECT e.trip_master_id, e.guest_unique_id, e.trip_type,
+       COALESCE(NULLIF(e.market_cd, 'N/A'), NULLIF(e.property_cd, 'N/A'), 'ENTERPRISE') AS code,
+       e.trip_start_dt, e.trip_end_dt, e.trip_days, e.max_trip_days,
+       COALESCE(p.nominated_partners, '(none: send this row)') AS nominated_partners,
+       r.live_trips_on_those_days_now
+FROM e
+LEFT JOIN partners p ON p.trip_master_id = e.trip_master_id
+LEFT JOIN replacements r ON r.trip_master_id = e.trip_master_id
+ORDER BY e.guest_unique_id, e.trip_type, e.trip_start_dt;
