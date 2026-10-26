@@ -956,14 +956,16 @@ built_cap AS (
                     (SELECT cap FROM ent)) AS max_trip_days
     FROM built b LEFT JOIN hotel_a h ON h.trip_master_id = b.trip_master_id
 ),
--- the transactions of the retired trips, and where each sits now among live trips of the same guest and grain
+-- the transactions of the retired trips, and where each sits now among live trips of the same guest and grain.
+-- Grain: one row per transaction AND business date, because a hotel reservation holds one TRIP_DETAIL row per night,
+-- and a stay that crosses a trip boundary has its nights on two trips by design (before and after).
 tx_retired AS (
-    SELECT DISTINCT r.guest_unique_id, r.trip_type, r.property_cd, r.market_cd, d.transaction_table, d.transaction_table_sk
+    SELECT DISTINCT r.guest_unique_id, r.trip_type, r.property_cd, r.market_cd, d.transaction_table, d.transaction_table_sk, d.business_start_dt
     FROM retired r JOIN tdb d ON d.trip_master_id = r.trip_master_id
     WHERE d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
 ),
 tx_now AS (
-    SELECT a.guest_unique_id, a.trip_type, a.property_cd, a.market_cd, d.transaction_table, d.transaction_table_sk,
+    SELECT a.guest_unique_id, a.trip_type, a.property_cd, a.market_cd, d.transaction_table, d.transaction_table_sk, d.business_start_dt,
            COUNT(DISTINCT a.trip_master_id) AS live_trips_holding_it
     FROM tma a JOIN tda d ON d.trip_master_id = a.trip_master_id
     WHERE a.delete_ind = 'N' AND d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
@@ -975,6 +977,7 @@ tx AS (
     LEFT JOIN tx_now n ON n.guest_unique_id = r.guest_unique_id AND n.trip_type = r.trip_type
                       AND EQUAL_NULL(n.property_cd, r.property_cd) AND EQUAL_NULL(n.market_cd, r.market_cd)
                       AND n.transaction_table = r.transaction_table AND n.transaction_table_sk = r.transaction_table_sk
+                      AND n.business_start_dt = r.business_start_dt
 ),
 -- market trips of the test guests in their market, before and after, with the identical property twin test
 mk_b AS (SELECT m.trip_master_id, m.guest_unique_id, m.market_cd, m.trip_start_dt, m.trip_end_dt FROM tmb m
@@ -1062,9 +1065,9 @@ board AS (
     UNION ALL SELECT 6, 'Replacement trips built for the test guests (all grains)', NULL, (SELECT COUNT(*) FROM built)
     UNION ALL SELECT 7, 'Replacement trips with no hotel night longer than their cap', 0,
            (SELECT COUNT(*) FROM built_cap WHERE NOT has_stay AND trip_days > max_trip_days)
-    UNION ALL SELECT 8, 'Transactions of the retired trips now on exactly one live trip of the same grain',
+    UNION ALL SELECT 8, 'Transaction-nights of the retired trips now on exactly one live trip of the same grain',
            (SELECT COUNT(*) FROM tx), (SELECT COUNT_IF(live_trips_holding_it = 1) FROM tx)
-    UNION ALL SELECT 9, 'Of those transactions, lost (0 trips) or doubled (2+ trips)', 0,
+    UNION ALL SELECT 9, 'Of those transaction-nights, lost (0 trips) or doubled (2+ trips)', 0,
            (SELECT COUNT_IF(live_trips_holding_it <> 1) FROM tx)
     UNION ALL SELECT 23, 'Soft-deleted OPENED rows on the retired trips (the merge step gathers these too and would revive them)', 0,
            (SELECT COUNT(*) FROM retired r JOIN tdb d ON d.trip_master_id = r.trip_master_id
@@ -1220,12 +1223,10 @@ GROUP BY 1, 2
 ORDER BY 3 DESC, 1, 2 DESC;
 
 
--- C9. The transactions of the retired trips that are NOT on exactly one live trip of the same grain now (C2 rows 8-9).
---     One row per such transaction: what it is, its date, the retired trip it was on, how many live trips hold it now
---     and which, and which live trips of the same guest and grain cover its date (a transaction can only be attached
---     to a trip whose dates contain it). Expect one row; 0 holders with no covering trip means the windowing step left
---     that date out, 2+ holders means the merge attached it to two overlapping trips (the double-attach the pilot's A7
---     measured; the recalculation route has the same join).
+-- C9. The transaction-nights of the retired trips that are NOT on exactly one live trip of the same grain now (C2 rows
+--     8-9), one row per transaction and business date (a reservation holds one detail row per night). Expect no rows.
+--     0 holders with no covering trip means the windowing step left that date out; 2+ holders means the merge attached
+--     the same night to two overlapping trips (the double-attach the pilot's A7 measured).
 WITH g AS (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST'),
 retired AS (
     SELECT b.trip_master_id, b.guest_unique_id, b.trip_type, b.property_cd, b.market_cd, b.trip_start_dt, b.trip_end_dt
@@ -1242,7 +1243,7 @@ tx AS (
     WHERE d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
 ),
 holders AS (
-    SELECT a.guest_unique_id, a.trip_type, a.property_cd, a.market_cd, d.transaction_table, d.transaction_table_sk,
+    SELECT a.guest_unique_id, a.trip_type, a.property_cd, a.market_cd, d.transaction_table, d.transaction_table_sk, d.business_start_dt,
            COUNT(DISTINCT a.trip_master_id) AS live_trips_holding_it,
            LISTAGG(DISTINCT a.trip_master_id || ' [' || a.trip_start_dt || '..' || a.trip_end_dt || ']', ' | ') AS which_trips
     FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a
@@ -1256,6 +1257,7 @@ odd AS (
     LEFT JOIN holders h ON h.guest_unique_id = t.guest_unique_id AND h.trip_type = t.trip_type
                        AND EQUAL_NULL(h.property_cd, t.property_cd) AND EQUAL_NULL(h.market_cd, t.market_cd)
                        AND h.transaction_table = t.transaction_table AND h.transaction_table_sk = t.transaction_table_sk
+                       AND h.business_start_dt = t.business_start_dt
     WHERE COALESCE(h.live_trips_holding_it, 0) <> 1
 ),
 covering AS (
@@ -1329,3 +1331,58 @@ FROM e
 LEFT JOIN partners p ON p.trip_master_id = e.trip_master_id
 LEFT JOIN replacements r ON r.trip_master_id = e.trip_master_id
 ORDER BY e.guest_unique_id, e.trip_type, e.trip_start_dt;
+
+
+-- C11. Theo, trip by trip, where it can be compared (C2 row 16 and C5). For every retired BEM/WLM market trip of a test
+--      guest that had a summary row before: its theo against the summed theo of the live trips now lying entirely
+--      within its dates. A replacement that overlaps the retired trip without lying inside it (a window the merge cut
+--      across two retired trips that were joined together) is counted in 'straddling' and makes that row 'LOOK:
+--      straddled' rather than a miss. Expect every row ok or straddled, and the totals line equal apart from the
+--      straddled rows.
+WITH mark AS (SELECT MAX(IFF(mark = 'max_trip_master_id_before', value, NULL)) AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS),
+g AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST'),
+retired AS (
+    SELECT b.trip_master_id, b.guest_unique_id, b.market_cd, b.trip_start_dt, b.trip_end_dt,
+           DATEDIFF(day, b.trip_start_dt, b.trip_end_dt) + 1 AS trip_days, ROUND(s.total_theo_win_amt, 2) AS retired_theo
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE b
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a ON a.trip_master_id = b.trip_master_id
+    JOIN g ON g.guest_unique_id = b.guest_unique_id AND g.market_cd = b.market_cd
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_BEFORE s ON s.trip_master_id = b.trip_master_id
+    WHERE b.trip_type = 'MARKET' AND b.delete_ind = 'N' AND a.delete_ind = 'Y'
+),
+built AS (
+    SELECT a.trip_master_id, a.guest_unique_id, a.market_cd, a.trip_start_dt, a.trip_end_dt, ROUND(COALESCE(s.total_theo_win_amt, 0), 2) AS theo
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a
+    JOIN g ON g.guest_unique_id = a.guest_unique_id AND g.market_cd = a.market_cd
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_AFTER s ON s.trip_master_id = a.trip_master_id
+    WHERE a.trip_type = 'MARKET' AND a.delete_ind = 'N' AND a.trip_master_id > (SELECT max_tm FROM mark)
+),
+per_trip AS (
+    SELECT r.trip_master_id AS retired_trip, r.guest_unique_id, r.market_cd, r.trip_start_dt, r.trip_end_dt, r.trip_days, r.retired_theo,
+           COUNT_IF(b.trip_start_dt >= r.trip_start_dt AND b.trip_end_dt <= r.trip_end_dt)                          AS replacements_inside,
+           ROUND(SUM(IFF(b.trip_start_dt >= r.trip_start_dt AND b.trip_end_dt <= r.trip_end_dt, b.theo, 0)), 2) AS replacement_theo,
+           COUNT_IF(NOT (b.trip_start_dt >= r.trip_start_dt AND b.trip_end_dt <= r.trip_end_dt))                    AS straddling
+    FROM retired r
+    LEFT JOIN built b ON b.guest_unique_id = r.guest_unique_id AND b.market_cd = r.market_cd
+                     AND b.trip_start_dt <= r.trip_end_dt AND b.trip_end_dt >= r.trip_start_dt
+    GROUP BY ALL
+),
+verdicts AS (
+    SELECT p.*,
+           CASE WHEN p.retired_theo = p.replacement_theo THEN 'ok'
+                WHEN p.straddling > 0 THEN 'LOOK: straddled'
+                ELSE 'LOOK' END AS verdict
+    FROM per_trip p
+)
+SELECT 'per guest and market' AS level, guest_unique_id::VARCHAR AS guest, market_cd,
+       COUNT(*) AS retired_trips_compared, COUNT_IF(verdict = 'ok') AS equal, COUNT_IF(verdict = 'LOOK: straddled') AS straddled,
+       COUNT_IF(verdict = 'LOOK') AS unexplained,
+       ROUND(SUM(retired_theo), 2) AS retired_theo, ROUND(SUM(replacement_theo), 2) AS replacement_theo_inside
+FROM verdicts
+GROUP BY ALL
+UNION ALL
+SELECT 'trip', retired_trip::VARCHAR, market_cd, 1, IFF(verdict = 'ok', 1, 0), IFF(verdict = 'LOOK: straddled', 1, 0), IFF(verdict = 'LOOK', 1, 0),
+       retired_theo, replacement_theo
+FROM verdicts
+WHERE verdict <> 'ok'
+ORDER BY 1 DESC, 3, 2;
