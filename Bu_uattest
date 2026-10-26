@@ -351,18 +351,24 @@ BEGIN
                            || 'run again with v_start_at = 0#ROW#';
             RAISE proof_stop;
         END IF;
+        -- Counted row by row, because SYSTEM$STREAM_HAS_DATA can say TRUE for a stream that holds no INSERT rows (the
+        -- customer-merge check stream did, Oct 26), and the steps only ever read INSERT rows.
         v_txt := '';
-        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM'));
-        IF (v_has) THEN v_txt := v_txt || ' merge-queue'; END IF;
-        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM'));
-        IF (v_has) THEN v_txt := v_txt || ' customer-merge-check'; END IF;
-        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_CUSTOMER_MERGE_QUEUE_STREAM'));
-        IF (v_has) THEN v_txt := v_txt || ' customer-merge-queue'; END IF;
-        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM'));
-        IF (v_has) THEN v_txt := v_txt || ' daily-summary'; END IF;
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM WHERE METADATA$ACTION = 'INSERT');
+        IF (v_n > 0) THEN v_txt := v_txt || ' merge-queue (' || v_n || ')'; END IF;
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM WHERE METADATA$ACTION = 'INSERT');
+        IF (v_n > 0) THEN v_txt := v_txt || ' customer-merge-check (' || v_n || ')'; END IF;
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM WHERE METADATA$ACTION = 'INSERT');
+        IF (v_n > 0) THEN v_txt := v_txt || ' daily-summary (' || v_n || ')'; END IF;
         IF (v_txt <> '') THEN
             v_log := v_log || 'P4 other streams~|~STOP~|~these already hold changes that would be processed with ours:' || v_txt || '#ROW#';
             RAISE proof_stop;
+        END IF;
+        -- The customer-merge queue is read only by TRIP_CUSTOMER_MERGE, which this block never starts (and which cannot
+        -- run in UAT: insufficient privileges, Oct 23), so rows waiting there are noted, not a stop.
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_CUSTOMER_MERGE_QUEUE_STREAM'));
+        IF (v_has) THEN
+            v_log := v_log || 'P4 customer-merge queue~|~note~|~holds guest-merge rows from an earlier run; nothing here runs the customer merge, so they stay as they are#ROW#';
         END IF;
         v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM WHERE METADATA$ACTION = 'INSERT');
         v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM
@@ -379,7 +385,7 @@ BEGIN
             WHEN OTHER THEN
                 v_ng_clean := FALSE;
         END;
-        v_log := v_log || 'P4 streams~|~ok~|~merge-check stream: ' || IFF(v_can_read, v_m || ' of ours, nothing else', 'empty (row-level read not permitted; checked with SYSTEM$STREAM_HAS_DATA)') || '; merge, customer-merge and daily-summary '
+        v_log := v_log || 'P4 streams~|~ok~|~merge-check stream: ' || IFF(v_can_read, v_m || ' of ours, nothing else', 'empty (row-level read not permitted; checked with SYSTEM$STREAM_HAS_DATA)') || '; merge, customer-merge-check and daily-summary '
                        || 'streams empty; summary stream: ' || v_k || ' of ours, nothing else; non-gaming stream '
                        || IFF(v_ng_clean, 'empty', 'not empty or unreadable, that step will be skipped') || '#ROW#';
     ELSE
@@ -810,7 +816,8 @@ END;
 $$;
 
 -- B2. Progress, while B1 waits (another worksheet): the trip jobs' batches since PART A started.
-SELECT j.job_name, b.batch_id, b.batch_status, b.batch_start_date, b.batch_end_date
+SELECT j.job_name, b.batch_id, b.batch_status, b.batch_start_date, b.updated_dttm AS last_update,
+       ROUND(DATEDIFF(second, b.batch_start_date, b.updated_dttm) / 60, 1) AS minutes
 FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
 JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
 WHERE j.job_name LIKE 'TRIP%'
