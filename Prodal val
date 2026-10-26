@@ -1,0 +1,337 @@
+-- DAASI-3641: validations of the permanent fix (TRIP_MERGE_CHECK_PROC v1.4) for the PROD deployment approval.
+-- Read-only: SELECTs against the UAT proof's before/after copies (DAASI_3641_V14_*) and UAT's live tables. Run each
+-- statement on its own; a screenshot of each result is enough. The matching write-ups are in
+-- DAASI_3641_UAT_V14_VALIDATIONS_TEXT.md, one paragraph per validation, numbered the same way.
+--
+-- What was done in UAT (26 Oct): four test guests (two BEM, two WLM, chosen for having 5 to 60 market trips longer than
+-- the cap with no hotel night) and four control guests (same shape, left alone). TRIP_MASTER, TRIP_DETAIL, TRIP_SUMMARY
+-- and DAILY_ACTIVITY_SUMMARY were copied before; every live rating of the test guests' play at their property was
+-- replayed through the pipeline (recalculation, merge check on v1.4, merge, customer merge check, summaries, comp worth);
+-- the four tables were copied again after.
+--
+--   V0  the setup: the eight guests, and the caps the run cut with
+--   V1  the rule: what v1.4 did with each class of touched trip
+--   V2  the trips: market trips before and after, per market
+--   V3  the transactions: every transaction-night of a retired trip, where it sits now
+--   V4  the figures, theo: each retired market trip against the trips that replaced it
+--   V5  the figures, twins: each rebuilt market trip against its property twin, theo and comp worth
+--   V6  nothing else changed: the control guests, and the grains the ticket is not about
+--   V7  Tracy's own query from DAASI-3376
+
+USE ROLE DAAS_TEAM;
+USE SECONDARY ROLES ALL;
+
+
+-- V0a. The eight guests. Expect 2 TEST and 2 CONTROL per market, each with 5-60 over-cap market trips without a stay.
+SELECT grp, market_cd, property_cd, guest_unique_id, pick_reason
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS
+ORDER BY grp DESC, market_cd, guest_unique_id;
+
+-- V0b. The caps the run cut with, read through the pipeline's own config functions. Expect BEM 1, WLM 3, IBE 1, IWA 3,
+--      and the enterprise setting.
+SELECT 'MARKET BEM'   AS setting, DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', 'BEM', CURRENT_DATE())   AS max_trip_days
+UNION ALL SELECT 'MARKET WLM',    DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', 'WLM', CURRENT_DATE())
+UNION ALL SELECT 'PROPERTY IBE',  DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', 'IBE', CURRENT_DATE())
+UNION ALL SELECT 'PROPERTY IWA',  DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', 'IWA', CURRENT_DATE())
+UNION ALL SELECT 'ENTERPRISE', (SELECT MAX(value) FROM DAAS_UAT.DAAS_CORE.TRIP_CONFIG
+                                WHERE config_subtype = 'ENTERPRISE' AND key = 'MAX_TRIP_DAYS' AND active_flg = 'Y');
+
+
+-- V1. The rule. Every trip the replay touched (any grain), in the three classes the rule distinguishes, and what became
+--     of it. A trip "retired on its own" had no other nominated trip of the same guest and grain next to it or over it,
+--     so only the new rule can have sent it to the merge step; a trip "retired with a neighbour" is what merge check's
+--     pre-existing join rules do. Expect: the 'over cap, no stay' class retired in full; the other two classes retired
+--     only with a neighbour, never on their own.
+WITH e AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT),
+a AS (SELECT trip_master_id, delete_ind FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER),
+q AS (SELECT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE),
+tm AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE),
+neighbour AS (   -- another nominated trip of the same guest and grain that overlaps or adjoins the touched trip
+    SELECT DISTINCT e.trip_master_id
+    FROM e
+    JOIN q ON q.trip_master_id <> e.trip_master_id
+    JOIN tm p ON p.trip_master_id = q.trip_master_id
+             AND p.guest_unique_id = e.guest_unique_id AND p.trip_type = e.trip_type
+             AND EQUAL_NULL(p.property_cd, e.property_cd) AND EQUAL_NULL(p.market_cd, e.market_cd)
+             AND p.trip_start_dt <= DATEADD(day, 1, e.trip_end_dt) AND p.trip_end_dt >= DATEADD(day, -1, e.trip_start_dt)
+)
+SELECT e.expectation                                                   AS class_of_touched_trip,
+       COUNT(*)                                                        AS trips_touched,
+       COUNT_IF(a.delete_ind = 'Y')                                    AS retired_and_replaced,
+       COUNT_IF(a.delete_ind = 'Y' AND n.trip_master_id IS NULL)       AS retired_on_its_own_new_rule_only,
+       COUNT_IF(a.delete_ind = 'Y' AND n.trip_master_id IS NOT NULL)   AS retired_with_a_neighbour,
+       COUNT_IF(a.delete_ind = 'N')                                    AS left_as_it_was
+FROM e
+JOIN a ON a.trip_master_id = e.trip_master_id
+LEFT JOIN neighbour n ON n.trip_master_id = e.trip_master_id
+GROUP BY 1
+ORDER BY 1 DESC;
+
+
+-- V2. The trips. The four test guests' market trips in their market and property trips at their property, before and
+--     after. Expect after: 0 market trips over the cap without a hotel stay, the longest no-stay trip at the cap
+--     (BEM 1, WLM 3), every over-cap no-stay trip gone and each replacement with an identical property twin.
+WITH g AS (SELECT guest_unique_id, market_cd, property_cd FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST'),
+t AS (
+    SELECT 'before' AS picture, m.trip_master_id, m.trip_type, m.guest_unique_id, g.market_cd, m.trip_start_dt, m.trip_end_dt,
+           DATEDIFF(day, m.trip_start_dt, m.trip_end_dt) + 1 AS trip_days
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE m
+    JOIN g ON g.guest_unique_id = m.guest_unique_id
+          AND ((m.trip_type = 'MARKET' AND m.market_cd = g.market_cd) OR (m.trip_type = 'PROPERTY' AND m.property_cd = g.property_cd))
+    WHERE m.delete_ind = 'N'
+    UNION ALL
+    SELECT 'now', m.trip_master_id, m.trip_type, m.guest_unique_id, g.market_cd, m.trip_start_dt, m.trip_end_dt,
+           DATEDIFF(day, m.trip_start_dt, m.trip_end_dt) + 1
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER m
+    JOIN g ON g.guest_unique_id = m.guest_unique_id
+          AND ((m.trip_type = 'MARKET' AND m.market_cd = g.market_cd) OR (m.trip_type = 'PROPERTY' AND m.property_cd = g.property_cd))
+    WHERE m.delete_ind = 'N'
+),
+hotel AS (   -- trips holding a live hotel night (the proc's own test)
+    SELECT DISTINCT 'before' AS picture, trip_master_id
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE WHERE transaction_type = 'HOTEL' AND delete_ind = 'N'
+    UNION ALL
+    SELECT DISTINCT 'now', trip_master_id
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_AFTER WHERE transaction_type = 'HOTEL' AND delete_ind = 'N'
+),
+mk AS (
+    SELECT t.*, DECODE(t.market_cd, 'BEM', 1, 'WLM', 3) AS cap, (h.trip_master_id IS NOT NULL) AS has_stay
+    FROM t
+    LEFT JOIN hotel h ON h.picture = t.picture AND h.trip_master_id = t.trip_master_id
+    WHERE t.trip_type = 'MARKET'
+),
+pr   AS (SELECT DISTINCT picture, guest_unique_id, market_cd, trip_start_dt, trip_end_dt FROM t WHERE trip_type = 'PROPERTY'),
+pr_n AS (SELECT picture, market_cd, COUNT(*) AS property_trips FROM t WHERE trip_type = 'PROPERTY' GROUP BY 1, 2)
+SELECT mk.market_cd AS market, mk.picture,
+       COUNT(*)                                                                        AS market_trips,
+       MAX(pr_n.property_trips)                                                        AS property_trips,
+       COUNT_IF(NOT mk.has_stay AND mk.trip_days > mk.cap)                             AS market_trips_over_cap_no_hotel_stay,
+       MAX(IFF(NOT mk.has_stay, mk.trip_days, NULL))                                   AS longest_market_trip_days_no_hotel_stay,
+       MAX(IFF(mk.has_stay, mk.trip_days, NULL))                                       AS longest_market_trip_days_hotel_stay,
+       COUNT_IF(pr.guest_unique_id IS NOT NULL)                                        AS market_trips_with_identical_property_twin,
+       COUNT_IF(pr.guest_unique_id IS NULL AND NOT mk.has_stay AND mk.trip_days > mk.cap) AS no_twin_and_over_cap_no_stay
+FROM mk
+LEFT JOIN pr ON pr.picture = mk.picture AND pr.guest_unique_id = mk.guest_unique_id AND pr.market_cd = mk.market_cd
+            AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt
+LEFT JOIN pr_n ON pr_n.picture = mk.picture AND pr_n.market_cd = mk.market_cd
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+
+-- V3. The transactions. Every transaction-night that sat on a trip the run retired (any grain: market, property,
+--     enterprise), and how many live trips of the same guest and grain hold it now. One row per transaction and
+--     business date, because a hotel reservation holds one TRIP_DETAIL row per night. Expect every one on exactly one
+--     live trip: 0 lost, 0 doubled.
+WITH g AS (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST'),
+retired AS (
+    SELECT b.trip_master_id, b.guest_unique_id, b.trip_type, b.property_cd, b.market_cd
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE b
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a ON a.trip_master_id = b.trip_master_id
+    WHERE b.delete_ind = 'N' AND a.delete_ind = 'Y' AND b.guest_unique_id IN (SELECT guest_unique_id FROM g)
+),
+tx_retired AS (
+    SELECT DISTINCT r.guest_unique_id, r.trip_type, r.property_cd, r.market_cd,
+           d.transaction_table, d.transaction_table_sk, d.business_start_dt
+    FROM retired r
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE d ON d.trip_master_id = r.trip_master_id
+    WHERE d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+),
+tx_now AS (
+    SELECT a.guest_unique_id, a.trip_type, a.property_cd, a.market_cd,
+           d.transaction_table, d.transaction_table_sk, d.business_start_dt,
+           COUNT(DISTINCT a.trip_master_id) AS live_trips_holding_it
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_AFTER d ON d.trip_master_id = a.trip_master_id
+    WHERE a.delete_ind = 'N' AND d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+    GROUP BY ALL
+),
+tx AS (
+    SELECT r.*, COALESCE(n.live_trips_holding_it, 0) AS live_trips_holding_it
+    FROM tx_retired r
+    LEFT JOIN tx_now n ON n.guest_unique_id = r.guest_unique_id AND n.trip_type = r.trip_type
+                      AND EQUAL_NULL(n.property_cd, r.property_cd) AND EQUAL_NULL(n.market_cd, r.market_cd)
+                      AND n.transaction_table = r.transaction_table AND n.transaction_table_sk = r.transaction_table_sk
+                      AND n.business_start_dt = r.business_start_dt
+)
+SELECT COALESCE(trip_type, 'ALL GRAINS')          AS grain,
+       COUNT(*)                                   AS transaction_nights_on_retired_trips,
+       COUNT_IF(live_trips_holding_it = 1)        AS now_on_exactly_one_live_trip,
+       COUNT_IF(live_trips_holding_it = 0)        AS lost,
+       COUNT_IF(live_trips_holding_it >= 2)       AS doubled
+FROM tx
+GROUP BY ROLLUP (trip_type)
+ORDER BY trip_type NULLS LAST;
+
+
+-- V4. The figures, theo. Each retired BEM/WLM market trip of the test guests against the live trips that now lie
+--     within its dates, and the totals per guest and market. Theo is the house's expected win from the play, the figure
+--     Tracy reads. Trip by trip, expect 'theo_identical_trip_by_trip' plus 'new_window_crosses_old_boundary' to equal
+--     'with_a_summary_row_to_compare', and 'unexplained' 0. A crossing window is one the merge step cut across two
+--     retired trips that sat back to back (WLM's 3-day windows can do that; BEM's 1-day windows cannot). Totals can only
+--     be compared where every retired trip had a summary row in UAT (the 'totals' column says).
+WITH mark AS (SELECT MAX(IFF(mark = 'max_trip_master_id_before', value, NULL)) AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS),
+g AS (SELECT guest_unique_id, market_cd FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST'),
+retired AS (
+    SELECT b.trip_master_id, b.guest_unique_id, b.market_cd, b.trip_start_dt, b.trip_end_dt, s.total_theo_win_amt AS theo
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE b
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a ON a.trip_master_id = b.trip_master_id
+    JOIN g ON g.guest_unique_id = b.guest_unique_id AND g.market_cd = b.market_cd
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_BEFORE s ON s.trip_master_id = b.trip_master_id
+    WHERE b.trip_type = 'MARKET' AND b.delete_ind = 'N' AND a.delete_ind = 'Y'
+),
+built AS (
+    SELECT a.trip_master_id, a.guest_unique_id, a.market_cd, a.trip_start_dt, a.trip_end_dt, COALESCE(s.total_theo_win_amt, 0) AS theo
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a
+    JOIN g ON g.guest_unique_id = a.guest_unique_id AND g.market_cd = a.market_cd
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_AFTER s ON s.trip_master_id = a.trip_master_id
+    WHERE a.trip_type = 'MARKET' AND a.delete_ind = 'N' AND a.trip_master_id > (SELECT max_tm FROM mark)
+),
+per_trip AS (   -- each retired trip with a summary row: its theo against the replacements inside its dates
+    SELECT r.trip_master_id, r.guest_unique_id, r.market_cd, ROUND(r.theo, 2) AS retired_theo,
+           ROUND(SUM(IFF(b.trip_start_dt >= r.trip_start_dt AND b.trip_end_dt <= r.trip_end_dt, b.theo, 0)), 2) AS inside_theo,
+           COUNT_IF(NOT (b.trip_start_dt >= r.trip_start_dt AND b.trip_end_dt <= r.trip_end_dt))                AS crossing
+    FROM retired r
+    LEFT JOIN built b ON b.guest_unique_id = r.guest_unique_id AND b.market_cd = r.market_cd
+                     AND b.trip_start_dt <= r.trip_end_dt AND b.trip_end_dt >= r.trip_start_dt
+    WHERE r.theo IS NOT NULL
+    GROUP BY ALL
+),
+per_gm AS (
+    SELECT r.guest_unique_id, r.market_cd,
+           COUNT(*)                                                             AS retired_market_trips,
+           COUNT(r.theo)                                                        AS with_a_summary_row_to_compare,
+           ROUND(SUM(r.theo), 2)                                                AS retired_theo
+    FROM retired r
+    GROUP BY 1, 2
+),
+verdicts AS (
+    SELECT guest_unique_id, market_cd,
+           COUNT_IF(retired_theo = inside_theo)                 AS theo_identical_trip_by_trip,
+           COUNT_IF(retired_theo <> inside_theo AND crossing > 0) AS new_window_crosses_old_boundary,
+           COUNT_IF(retired_theo <> inside_theo AND crossing = 0) AS unexplained
+    FROM per_trip
+    GROUP BY 1, 2
+),
+built_t AS (SELECT guest_unique_id, market_cd, COUNT(*) AS replacement_trips, ROUND(SUM(theo), 2) AS replacement_theo FROM built GROUP BY 1, 2),
+rows_ AS (
+    SELECT p.guest_unique_id, p.market_cd, p.retired_market_trips, p.with_a_summary_row_to_compare,
+           COALESCE(v.theo_identical_trip_by_trip, 0) AS theo_identical_trip_by_trip,
+           COALESCE(v.new_window_crosses_old_boundary, 0) AS new_window_crosses_old_boundary,
+           COALESCE(v.unexplained, 0) AS unexplained,
+           p.retired_theo, b.replacement_trips, b.replacement_theo,
+           CASE WHEN p.with_a_summary_row_to_compare = p.retired_market_trips
+                THEN IFF(p.retired_theo = b.replacement_theo, 'identical to the cent', 'LOOK')
+                ELSE 'not comparable: ' || (p.retired_market_trips - p.with_a_summary_row_to_compare) || ' retired trips have no summary row in UAT' END AS totals
+    FROM per_gm p
+    LEFT JOIN verdicts v ON v.guest_unique_id = p.guest_unique_id AND v.market_cd = p.market_cd
+    LEFT JOIN built_t  b ON b.guest_unique_id = p.guest_unique_id AND b.market_cd = p.market_cd
+),
+out AS (
+    SELECT TO_VARCHAR(guest_unique_id) AS guest, market_cd AS market, retired_market_trips, with_a_summary_row_to_compare,
+           theo_identical_trip_by_trip, new_window_crosses_old_boundary, unexplained, retired_theo, replacement_trips, replacement_theo, totals
+    FROM rows_
+    UNION ALL
+    SELECT 'all four', 'BEM + WLM', SUM(retired_market_trips), SUM(with_a_summary_row_to_compare),
+           SUM(theo_identical_trip_by_trip), SUM(new_window_crosses_old_boundary), SUM(unexplained),
+           SUM(retired_theo), SUM(replacement_trips), SUM(replacement_theo), NULL
+    FROM rows_
+)
+SELECT * FROM out
+ORDER BY IFF(guest = 'all four', 1, 0), market, guest;
+
+
+-- V5. The figures, twins. Each market trip the run built, next to the property trip with the same guest and dates:
+--     theo and comp worth (the comp dollars the play earns). Expect every rebuilt market trip to have a twin and, on
+--     every pair where both summary rows exist, identical theo and identical comp worth. Pairs without both summary
+--     rows are UAT's gap (it stopped summarising new trips in June); PROD has no such gap.
+WITH mark AS (SELECT MAX(IFF(mark = 'max_trip_master_id_before', value, NULL)) AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS),
+g AS (SELECT guest_unique_id, market_cd, property_cd FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST'),
+pairs AS (
+    SELECT g.market_cd, mk.guest_unique_id, mk.trip_master_id AS market_trip_id, pr.trip_master_id AS property_trip_id
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER mk
+    JOIN g ON g.guest_unique_id = mk.guest_unique_id AND g.market_cd = mk.market_cd
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER pr
+           ON pr.guest_unique_id = mk.guest_unique_id AND pr.trip_type = 'PROPERTY' AND pr.property_cd = g.property_cd
+          AND pr.delete_ind = 'N' AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt
+    WHERE mk.trip_type = 'MARKET' AND mk.delete_ind = 'N'
+      AND mk.trip_master_id > (SELECT max_tm FROM mark)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY mk.trip_master_id ORDER BY pr.trip_master_id) = 1
+),
+v AS (
+    SELECT p.market_cd, p.guest_unique_id,
+           (p.property_trip_id IS NOT NULL)                                  AS has_twin,
+           (sm.trip_master_id IS NOT NULL AND sp.trip_master_id IS NOT NULL) AS compared,
+           ROUND(COALESCE(sm.total_theo_win_amt, 0), 2) AS m_theo, ROUND(COALESCE(sp.total_theo_win_amt, 0), 2) AS p_theo,
+           ROUND(COALESCE(sm.comp_worth, 0), 2)         AS m_cw,   ROUND(COALESCE(sp.comp_worth, 0), 2)         AS p_cw
+    FROM pairs p
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_AFTER sm ON sm.trip_master_id = p.market_trip_id
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_AFTER sp ON sp.trip_master_id = p.property_trip_id
+)
+SELECT COALESCE(market_cd, 'BEM + WLM')                   AS market,
+       COALESCE(TO_VARCHAR(guest_unique_id), 'all four')  AS guest,
+       COUNT(*)                                           AS rebuilt_market_trips,
+       COUNT_IF(has_twin)                                 AS with_identical_property_twin,
+       COUNT_IF(compared)                                 AS pairs_with_both_summary_rows,
+       COUNT_IF(compared AND m_theo = p_theo)             AS theo_identical,
+       COUNT_IF(compared AND m_cw = p_cw)                 AS comp_worth_identical,
+       ROUND(SUM(IFF(compared, m_theo, 0)), 2)            AS market_theo,
+       ROUND(SUM(IFF(compared, p_theo, 0)), 2)            AS property_theo,
+       ROUND(SUM(IFF(compared, m_cw, 0)), 2)              AS market_comp_worth,
+       ROUND(SUM(IFF(compared, p_cw, 0)), 2)              AS property_comp_worth
+FROM v
+GROUP BY GROUPING SETS ((market_cd, guest_unique_id), ())
+ORDER BY market_cd NULLS LAST, guest_unique_id NULLS LAST;
+
+
+-- V6. Nothing else changed. The four control guests (same shape as the test guests, not replayed) row for row in all
+--     four tables, and the grains the ticket is not about: the test guests' enterprise trips and property trips, which
+--     the replay also touched. Expect 0 for every control row; for enterprise and property, 0 trips over their cap
+--     without a stay (so nothing for the new rule to do) and any retirements only through the pre-existing join rules.
+WITH g AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS),
+ctrl_g AS (SELECT guest_unique_id FROM g WHERE grp = 'CONTROL'),
+tmb AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE  WHERE guest_unique_id IN (SELECT guest_unique_id FROM ctrl_g)),
+tma AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER   WHERE guest_unique_id IN (SELECT guest_unique_id FROM ctrl_g)),
+ids AS (SELECT trip_master_id FROM tmb UNION SELECT trip_master_id FROM tma),
+tdb AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE  WHERE trip_master_id IN (SELECT trip_master_id FROM ids)),
+tda AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_AFTER   WHERE trip_master_id IN (SELECT trip_master_id FROM ids)),
+tsb AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_BEFORE  WHERE trip_master_id IN (SELECT trip_master_id FROM ids)),
+tsa AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_AFTER   WHERE trip_master_id IN (SELECT trip_master_id FROM ids)),
+dasb AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_DAS_BEFORE WHERE trip_master_id IN (SELECT trip_master_id FROM ids)),
+dasa AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_DAS_AFTER  WHERE trip_master_id IN (SELECT trip_master_id FROM ids)),
+d_tm  AS (SELECT COUNT(*) AS n FROM ((SELECT * FROM tmb  MINUS SELECT * FROM tma)  UNION ALL (SELECT * FROM tma  MINUS SELECT * FROM tmb))),
+d_td  AS (SELECT COUNT(*) AS n FROM ((SELECT * FROM tdb  MINUS SELECT * FROM tda)  UNION ALL (SELECT * FROM tda  MINUS SELECT * FROM tdb))),
+d_ts  AS (SELECT COUNT(*) AS n FROM ((SELECT * FROM tsb  MINUS SELECT * FROM tsa)  UNION ALL (SELECT * FROM tsa  MINUS SELECT * FROM tsb))),
+d_das AS (SELECT COUNT(*) AS n FROM ((SELECT * FROM dasb MINUS SELECT * FROM dasa) UNION ALL (SELECT * FROM dasa MINUS SELECT * FROM dasb))),
+e AS (SELECT x.*, a.delete_ind AS delete_ind_after
+      FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT x
+      JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a ON a.trip_master_id = x.trip_master_id),
+board AS (
+    SELECT 1 AS n, 'Control guests (4, not replayed): TRIP_MASTER rows that differ, before vs after'            AS check_name, 0 AS expected, (SELECT n FROM d_tm)  AS actual
+    UNION ALL SELECT 2, 'Control guests: TRIP_DETAIL rows that differ',                                                     0, (SELECT n FROM d_td)
+    UNION ALL SELECT 3, 'Control guests: TRIP_SUMMARY rows that differ',                                                    0, (SELECT n FROM d_ts)
+    UNION ALL SELECT 4, 'Control guests: DAILY_ACTIVITY_SUMMARY rows that differ',                                          0, (SELECT n FROM d_das)
+    UNION ALL SELECT 5, 'Test guests, ENTERPRISE trips the replay touched',                                              NULL, (SELECT COUNT(*) FROM e WHERE trip_type = 'ENTERPRISE')
+    UNION ALL SELECT 6, '   ... of them over the enterprise cap with no hotel night (what the new rule would re-cut)',    NULL, (SELECT COUNT_IF(expect_nomination) FROM e WHERE trip_type = 'ENTERPRISE')
+    UNION ALL SELECT 7, '   ... retired, by the pre-existing join rules',                                                NULL, (SELECT COUNT_IF(delete_ind_after = 'Y') FROM e WHERE trip_type = 'ENTERPRISE')
+    UNION ALL SELECT 8, 'Test guests, PROPERTY trips (IBE, IWA) the replay touched',                                     NULL, (SELECT COUNT(*) FROM e WHERE trip_type = 'PROPERTY')
+    UNION ALL SELECT 9, '   ... of them over the property cap with no hotel night (what the new rule would re-cut)',      NULL, (SELECT COUNT_IF(expect_nomination) FROM e WHERE trip_type = 'PROPERTY')
+    UNION ALL SELECT 10, '   ... retired, by the pre-existing join rules',                                               NULL, (SELECT COUNT_IF(delete_ind_after = 'Y') FROM e WHERE trip_type = 'PROPERTY')
+)
+SELECT n, check_name, expected, actual,
+       CASE WHEN expected IS NULL THEN 'info' WHEN actual = expected THEN 'ok' ELSE 'LOOK' END AS verdict
+FROM board
+ORDER BY n;
+
+
+-- V7. Tracy's own query from DAASI-3376, pointed at UAT and the four test guests: the longest market trip per end date
+--     in the reporting view, hotel-stay trips excluded, longest first. Expect every BEM row at 1 and every WLM row at 3
+--     or less. A WLM row above 3 would be a hotel-stay trip whose reservation exists in PROD but not in UAT's reloaded
+--     hotel table, so UAT's summary could not flag the stay (the gap found in the first replay).
+SELECT market_cd, trip_end_dt, MAX(trip_days) AS max_trip_days
+FROM DAAS_UAT.DAAS_CORE_MARKETING_VW.TRIP_SUMMARY_VW
+WHERE market_cd IN ('BEM', 'WLM')
+  AND trip_type = 'MARKET'
+  AND hotel_flg = 'N'
+  AND guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST')
+GROUP BY 1, 2
+ORDER BY 3 DESC, 1, 2 DESC;
