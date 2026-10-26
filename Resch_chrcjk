@@ -1,0 +1,56 @@
+-- DAASI-3641 -- reach of the TRIP_MERGE_CHECK_PROC v1.4 rule. Read-only. Run on PROD before deploying the proc.
+--
+-- Lists every live, non-hotel trip that is longer than its MAX_TRIP_DAYS today, measured exactly the way the new
+-- rule measures it (TRIP_END_DT - TRIP_START_DT + 1 > cap; property/market cap from the config functions, the
+-- enterprise cap as the fallback; trips holding a live HOTEL detail row are exempt).
+--
+-- Deploying the proc changes none of these trips by itself. Each one is re-cut only when something touches it
+-- (a new transaction, a void, a replay). touched_last_30d and ended_last_7d show how many are still active and so
+-- would be re-cut in the first days after deployment; the rest wait for a replay.
+
+WITH ent AS (
+    SELECT MAX(VALUE) AS MAX_TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+    WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y'
+),
+multi AS (   -- only a multi-day trip can be over any cap
+    SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT, TRIP_END_DT, UPDATED_DTTM,
+           TRIP_END_DT - TRIP_START_DT + 1 AS TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+    WHERE DELETE_IND = 'N'
+      AND TRIP_END_DT > TRIP_START_DT
+),
+caps AS (    -- one config-function call per distinct grain / code / start date, not one per trip
+    SELECT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT,
+           CASE WHEN TRIP_TYPE = 'PROPERTY' THEN DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', PROPERTY_CD, TRIP_START_DT)
+                WHEN TRIP_TYPE = 'MARKET'   THEN DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT)
+           END AS CAP
+    FROM (SELECT DISTINCT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT FROM multi)
+),
+over_cap AS (
+    SELECT m.*, COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS)) AS MAX_TRIP_DAYS
+    FROM multi m
+    JOIN caps c
+      ON c.TRIP_TYPE = m.TRIP_TYPE
+     AND EQUAL_NULL(c.PROPERTY_CD, m.PROPERTY_CD)
+     AND EQUAL_NULL(c.MARKET_CD, m.MARKET_CD)
+     AND c.TRIP_START_DT = m.TRIP_START_DT
+    CROSS JOIN ent e
+    WHERE m.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS))
+      AND NOT EXISTS (SELECT 1
+                      FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                      WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID
+                        AND d.DELETE_IND = 'N'
+                        AND d.TRANSACTION_TYPE = 'HOTEL')
+)
+SELECT TRIP_TYPE,
+       CASE TRIP_TYPE WHEN 'PROPERTY' THEN PROPERTY_CD WHEN 'MARKET' THEN MARKET_CD ELSE 'ENTERPRISE' END AS CODE,
+       MAX_TRIP_DAYS,
+       COUNT(*)                                                          AS over_cap_trips,
+       COUNT(DISTINCT GUEST_UNIQUE_ID)                                   AS guests,
+       MAX(TRIP_DAYS)                                                    AS longest_days,
+       COUNT_IF(UPDATED_DTTM >= DATEADD(day, -30, CURRENT_TIMESTAMP()))  AS touched_last_30d,
+       COUNT_IF(TRIP_END_DT   >= DATEADD(day,  -7, CURRENT_DATE()))      AS ended_last_7d
+FROM over_cap
+GROUP BY ALL
+ORDER BY over_cap_trips DESC;
