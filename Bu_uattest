@@ -1,0 +1,1174 @@
+-- DAASI-3641: proof of TRIP_MERGE_CHECK_PROC v1.4 in UAT, with a fresh replay on fresh guests.
+--
+-- What v1.4 does. Every hour, merge check looks at every trip the pipeline touched and decides which trips should be
+-- re-windowed by the next step, TRIP_MERGE_PROC (a "window" is the start and end date the pipeline gives a group of
+-- one guest's transactions). Until now it only ever nominated trips to be joined. v1.4 adds one rule: a trip with no
+-- hotel night that is longer than its MAX_TRIP_DAYS is nominated on its own, so the merge step re-cuts it under the
+-- current cap. Nothing else in the proc changed.
+--
+-- How a replay reaches it. A replay bumps REPLAY_COUNTER on the source rows (RATINGS_FACT). The ratings step then
+-- (a) marks the rating's TRIP_DETAIL rows on every live trip holding it (property, market and enterprise), and
+-- (b) rewrites every one of those trips in TRIP_MASTER, which puts them in merge check's stream. From there the chain
+-- runs merge check, merge, summary and comp worth.
+--
+-- Why this file does (a) and (b) by hand. UAT's chain is suspended (root task TRIP_ROOT_TASK, since Aug 5) and UAT has
+-- no on-demand task for the ratings step, only for the steps after it. So a REPLAY_COUNTER bump in UAT would wait in
+-- its stream with nothing to consume it. PART B therefore writes exactly what the ratings step writes for a replay of
+-- these guests' IBE/IWA ratings: the same TRIP_DETAIL marks (TRIP_RATING_DOMAIN_PIPELINE_PROC step 4) and the same
+-- TRIP_MASTER rewrite (step 11), then starts UAT's own on-demand tasks for merge check, merge, customer-merge check,
+-- summary, comp worth and non-gaming revenue, in chain order, as the pilot's B3a did. Everything from merge check on
+-- is the real pipeline code, running as the pipeline role.
+--
+-- What it proves (PART C scoreboard):
+--   1. every touched trip longer than its cap with no hotel night is nominated by the new rule and re-cut;
+--   2. every touched trip longer than its cap WITH a hotel night is left exactly as it was;
+--   3. touched trips within their cap are not re-cut by the new rule (the only ones that change are joined by the
+--      rules merge check already had, and C4 shows each with its partner);
+--   4. the replacements are within the cap, hold every transaction of the trips they replace, once each;
+--   5. control guests with the same kind of trips, not touched, change nowhere;
+--   6. the rebuilt market trips get theo and comp worth equal to their property twins in the same run;
+--   7. what happened to the guests' enterprise trips (the rule's reach beyond BEM and WLM).
+--
+-- Roles: DAAS_TEAM with secondary roles on. PART B needs UPDATE on DAAS_UAT.DAAS_CORE.TRIP_DETAIL and TRIP_MASTER through
+-- a role you hold (it checks before changing anything) and OPERATE on the on-demand tasks (the first EXECUTE TASK
+-- settles it). The steps run as the task owner, APP_SERVICE_UAT. About 30 to 45 minutes in all.
+-- Run statement by statement; B1 is one block. Every check says what it expects.
+-- Scratch tables (DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_*): GUESTS, LOG, MARKS, TM/TD/TS/DAS_BEFORE, RATINGS, EXPECT,
+-- TASKS, QUEUE, TM/TD/TS/DAS_AFTER.
+
+USE ROLE DAAS_TEAM;
+USE SECONDARY ROLES ALL;
+USE SCHEMA DAAS_UAT.DAAS_TEMP_WORK;
+
+
+-- ===================================================================================================
+-- PART A. Scope and the before-picture (read-only on DAAS_CORE)
+-- ===================================================================================================
+
+-- A0. Is v1.4 the version UAT runs? Expect 'v1.4 is live in UAT'.
+SELECT IFF(CONTAINS(GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_MERGE_CHECK_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)'),
+                    'my_sql_command_3A'),
+           'v1.4 is live in UAT', 'UAT still runs the old version: deploy v1.4 first') AS merge_check_version;
+
+-- A1. The guests. Per market, among real guest ids that were not in the pilot: the guests with between 5 and 60 live
+--     market trips longer than the cap and holding no hotel night, preferring guests who also have over-cap trips
+--     WITH a hotel night (so the exemption is tested too). The first two per market are the TEST guests (replayed),
+--     the next two are CONTROL guests (left alone; they must not change).
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS (
+    guest_unique_id NUMBER(38,0), market_cd VARCHAR, property_cd VARCHAR, grp VARCHAR, pick_reason VARCHAR);
+
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS
+WITH cand AS (   -- live BEM/WLM market trips longer than the cap
+    SELECT m.trip_master_id, m.guest_unique_id, m.market_cd,
+           DATEDIFF(day, m.trip_start_dt, m.trip_end_dt) + 1 AS trip_days
+    FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+    WHERE m.trip_type = 'MARKET' AND m.market_cd IN ('BEM', 'WLM') AND m.delete_ind = 'N'
+      AND m.guest_unique_id > 0
+      AND DATEDIFF(day, m.trip_start_dt, m.trip_end_dt) + 1 > DECODE(m.market_cd, 'BEM', 1, 'WLM', 3)
+      AND m.guest_unique_id NOT IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_PILOT_GUESTS)
+),
+hotel AS (       -- the ones holding a live hotel night (the proc's own test)
+    SELECT DISTINCT d.trip_master_id
+    FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL d
+    JOIN cand c ON c.trip_master_id = d.trip_master_id
+    WHERE d.transaction_type = 'HOTEL' AND d.delete_ind = 'N'
+),
+per_guest AS (
+    SELECT c.guest_unique_id, c.market_cd,
+           COUNT_IF(h.trip_master_id IS NULL)     AS over_cap_no_stay,
+           COUNT_IF(h.trip_master_id IS NOT NULL) AS over_cap_with_stay,
+           MAX(c.trip_days)                       AS longest_days
+    FROM cand c
+    LEFT JOIN hotel h ON h.trip_master_id = c.trip_master_id
+    GROUP BY 1, 2
+),
+ranked AS (
+    SELECT p.*,
+           ROW_NUMBER() OVER (PARTITION BY p.market_cd
+                              ORDER BY (p.over_cap_with_stay > 0) DESC, p.over_cap_no_stay DESC, p.guest_unique_id) AS rn
+    FROM per_guest p
+    WHERE p.over_cap_no_stay BETWEEN 5 AND 60
+)
+SELECT guest_unique_id, market_cd, DECODE(market_cd, 'BEM', 'IBE', 'WLM', 'IWA'),
+       IFF(rn <= 2, 'TEST', 'CONTROL'),
+       market_cd || ': ' || over_cap_no_stay || ' over-cap market trips without a stay, ' || over_cap_with_stay
+                 || ' with a stay, longest ' || longest_days || ' days'
+FROM ranked
+WHERE rn <= 4;
+
+-- Expect 8 rows: 2 TEST and 2 CONTROL per market.
+SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS ORDER BY grp DESC, market_cd, guest_unique_id;
+
+-- A2. A log, and the highest trip id now: everything the run builds carries a higher one.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG (step VARCHAR, logged_at TIMESTAMP_NTZ, note VARCHAR);
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG VALUES ('A_START', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'before-picture starts');
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS (mark VARCHAR, value NUMBER(38,0));
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS
+SELECT 'max_trip_master_id_before', MAX(trip_master_id) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER;
+
+-- A3. Before-picture: every TRIP_MASTER row of the eight guests, whatever the trip type (property, market, enterprise)
+--     and live or not; every TRIP_DETAIL row of those trips; their TRIP_SUMMARY and DAILY_ACTIVITY_SUMMARY rows.
+--     The TRIP_DETAIL statement reads the whole table once: minutes.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE AS
+SELECT m.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+WHERE m.guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS);
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE AS
+SELECT d.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL d
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE t ON t.trip_master_id = d.trip_master_id;
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_BEFORE AS
+SELECT s.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY s
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE t ON t.trip_master_id = s.trip_master_id;
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_DAS_BEFORE AS
+SELECT s.*
+FROM DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY s
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE t ON t.trip_master_id = s.trip_master_id;
+
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG
+SELECT 'A_SNAPSHOT', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE) || ' masters, ' ||
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE) || ' details snapshotted';
+
+-- A4. The replay set. RATINGS: every live rating of a TEST guest at their property (IBE or IWA): a rating sitting on
+--     one of the guest's live property trips at that property, or on one of their live market trips in that market
+--     (a one-property market, so those are the same property's ratings). This is what a replay of the guest's play at
+--     the property would re-present. EXPECT: every live trip of a TEST guest holding one of those ratings, at any grain
+--     (the trips the ratings step would rewrite), with its length, its cap read the way the proc reads it (property or
+--     market config as of the trip start, the enterprise setting otherwise), whether it holds a hotel night, and
+--     whether the new rule should nominate it: no hotel night and longer than the cap.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_RATINGS AS
+SELECT DISTINCT d.transaction_table_sk AS rating_sk
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE d
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE m ON m.trip_master_id = d.trip_master_id
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS g ON g.guest_unique_id = m.guest_unique_id AND g.grp = 'TEST'
+WHERE d.transaction_table = 'RATINGS_FACT' AND d.delete_ind = 'N' AND m.delete_ind = 'N'
+  AND ((m.trip_type = 'PROPERTY' AND m.property_cd = g.property_cd)
+       OR (m.trip_type = 'MARKET' AND m.market_cd = g.market_cd));
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT AS
+WITH touched AS (
+    SELECT DISTINCT d.trip_master_id
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE d
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_RATINGS r ON r.rating_sk = d.transaction_table_sk
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE m ON m.trip_master_id = d.trip_master_id
+    WHERE d.transaction_table = 'RATINGS_FACT' AND d.delete_ind = 'N'
+      AND m.guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST')
+),
+hotel AS (
+    SELECT DISTINCT trip_master_id
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE
+    WHERE transaction_type = 'HOTEL' AND delete_ind = 'N'
+),
+ent AS (
+    SELECT MAX(value) AS max_trip_days
+    FROM DAAS_UAT.DAAS_CORE.TRIP_CONFIG
+    WHERE config_subtype = 'ENTERPRISE' AND key = 'MAX_TRIP_DAYS' AND active_flg = 'Y'
+),
+base AS (
+    SELECT m.trip_master_id, m.guest_unique_id, m.trip_type, m.property_cd, m.market_cd, m.trip_start_dt, m.trip_end_dt,
+           DATEDIFF(day, m.trip_start_dt, m.trip_end_dt) + 1 AS trip_days,
+           COALESCE(TRY_TO_NUMBER(CASE WHEN m.trip_type = 'PROPERTY'
+                                            THEN DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', m.property_cd, m.trip_start_dt)
+                                       WHEN m.trip_type = 'MARKET'
+                                            THEN DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', m.market_cd, m.trip_start_dt)
+                                  END),
+                    TRY_TO_NUMBER(e.max_trip_days))              AS max_trip_days,
+           IFF(h.trip_master_id IS NOT NULL, 'Y', 'N')          AS has_hotel_stay
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE m
+    JOIN touched t ON t.trip_master_id = m.trip_master_id
+    LEFT JOIN hotel h ON h.trip_master_id = m.trip_master_id
+    CROSS JOIN ent e
+    WHERE m.delete_ind = 'N'
+)
+SELECT b.*,
+       (b.has_hotel_stay = 'N' AND b.trip_days > b.max_trip_days) AS expect_nomination,
+       CASE WHEN b.has_hotel_stay = 'N' AND b.trip_days > b.max_trip_days THEN 'over cap, no stay: the new rule should re-cut it'
+            WHEN b.has_hotel_stay = 'Y' AND b.trip_days > b.max_trip_days THEN 'over cap with a stay: exempt, must stay as it is'
+            ELSE 'within cap: the new rule must leave it alone' END AS expectation
+FROM base b;
+
+-- A5. Dry-run report: what the replay will touch, per guest and trip type. Read it before PART B. Expect the
+--     'over cap, no stay' counts for MARKET to match A1's pick reasons; PROPERTY trips all within cap; ENTERPRISE
+--     rows show the rule's reach beyond the ticket (their cap is the enterprise setting).
+SELECT e.guest_unique_id, g.market_cd AS guest_market, e.trip_type,
+       COALESCE(NULLIF(e.market_cd, 'N/A'), NULLIF(e.property_cd, 'N/A'), 'ENTERPRISE') AS code,
+       MAX(e.max_trip_days)                                       AS cap,
+       COUNT(*)                                                   AS trips_touched,
+       COUNT_IF(e.expect_nomination)                              AS over_cap_no_stay_to_re_cut,
+       COUNT_IF(e.has_hotel_stay = 'Y' AND e.trip_days > e.max_trip_days) AS over_cap_with_stay_exempt,
+       COUNT_IF(e.trip_days <= e.max_trip_days)                   AS within_cap,
+       MAX(e.trip_days)                                           AS longest_days,
+       MIN(e.trip_start_dt)                                       AS first_trip_start,
+       MAX(e.trip_end_dt)                                         AS last_trip_end
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT e
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS g ON g.guest_unique_id = e.guest_unique_id
+GROUP BY ALL
+ORDER BY 2, 1, 3;
+
+-- A6. For the record: the caps the run will cut with, today, read through the pipeline's own config functions, and the
+--     enterprise setting. Expect BEM 1, WLM 3, IBE 1, IWA 3.
+SELECT 'MARKET BEM'   AS setting, DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', 'BEM', CURRENT_DATE())   AS max_trip_days
+UNION ALL SELECT 'MARKET WLM',    DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', 'WLM', CURRENT_DATE())
+UNION ALL SELECT 'PROPERTY IBE',  DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', 'IBE', CURRENT_DATE())
+UNION ALL SELECT 'PROPERTY IWA',  DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', 'IWA', CURRENT_DATE())
+UNION ALL SELECT 'ENTERPRISE', (SELECT MAX(value) FROM DAAS_UAT.DAAS_CORE.TRIP_CONFIG
+                                WHERE config_subtype = 'ENTERPRISE' AND key = 'MAX_TRIP_DAYS' AND active_flg = 'Y');
+
+-- A7. Scratch tables PART B fills (created empty here so the block only ever inserts).
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE (
+    trip_master_id NUMBER(38,0), why VARCHAR, trip_type VARCHAR, trip_days NUMBER(38,0), max_trip_days NUMBER(38,0), has_hotel_stay VARCHAR);
+
+
+-- ===================================================================================================
+-- PART B. The replay, through the pipeline
+-- ===================================================================================================
+
+-- B1. One block. Preflight (changes nothing): no trip job in progress; v1.4 live; the replay set from A4 still live;
+--     merge check's stream and the other trip streams empty; one suspended on-demand task per step; a role that may
+--     start them; UPDATE on TRIP_DETAIL and TRIP_MASTER; the POS switch (UAT's own POS summary code fails, as in the
+--     pilot, so step 5 runs with that one sub-step switched off and on again right after).
+--     Then the touch, exactly what the ratings step writes for a replay: the TRIP_DETAIL rows of the replay ratings
+--     marked on every live trip holding them (step 4 of the ratings proc: UPDATED_DTTM, UPDATED_BY, BATCH_ID,
+--     LAST_DML_CD 'U'), and every one of those trips rewritten in TRIP_MASTER (step 11: same columns; the end date
+--     it rewrites is unchanged in a replay, so it is left as it is). It checks that merge check's stream now shows
+--     exactly those trips and the summary stream exactly those rows, then starts the steps in chain order and waits
+--     for each in the pipeline's batch log (BATCH_S02). It stops at the first problem and says what to do.
+--     v_start_at: 0 is a fresh run; 2 to 7 resume at that step after a stop (2 only when the touch is done and the
+--     stream still holds our trips).
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_start_at INTEGER DEFAULT 0;      -- 0: fresh run (touch, then steps 2-7); 2..7: resume at that step
+    v_skip_pos BOOLEAN DEFAULT TRUE;   -- TRUE: step 5 runs with UAT's broken POS summary sub-step switched off
+    v_max_wait INTEGER DEFAULT 5400;   -- longest wait for one step, in seconds (90 minutes)
+    v_log      VARCHAR DEFAULT '';
+    v_txt      VARCHAR;
+    v_out      VARCHAR;
+    v_job      VARCHAR;
+    v_task     VARCHAR;
+    v_cmd      VARCHAR;
+    v_wait     VARCHAR;
+    v_who      VARCHAR DEFAULT '';
+    v_checked  INTEGER DEFAULT 0;
+    v_blocked  INTEGER DEFAULT 0;
+    v_status   VARCHAR;
+    v_has      BOOLEAN;
+    v_ng_clean BOOLEAN DEFAULT TRUE;
+    v_grants   BOOLEAN DEFAULT TRUE;
+    v_can_read BOOLEAN DEFAULT TRUE;   -- can this session read merge check's stream row by row?
+    v_n        INTEGER;
+    v_m        INTEGER;
+    v_k        INTEGER;
+    v_step     INTEGER;
+    v_waited   INTEGER;
+    v_mark     NUMBER(38,0);
+    v_batch    NUMBER(38,0);
+    v_max_tm   NUMBER(38,0);
+    v_touch    INTEGER;
+    v_expect   INTEGER;
+    v_marked   INTEGER DEFAULT 0;
+    v_pos_id   INTEGER;
+    v_pos_off  BOOLEAN DEFAULT FALSE;
+    res        RESULTSET;
+    proof_stop EXCEPTION (-20643, 'DAASI-3641 v1.4 proof stopped, see the rows');
+BEGIN
+    ---------------------------------------------------------------- preflight: nothing here changes anything
+    -- P0. No chain or on-demand run under way.
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+            JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+            WHERE j.job_name LIKE 'TRIP%' AND b.batch_status = 'IN PROGRESS'
+              AND b.batch_start_date >= DATEADD(hour, -6, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ));
+    IF (v_n > 0) THEN
+        v_log := v_log || 'P0 runs~|~STOP~|~' || v_n || ' trip job(s) show IN PROGRESS in the last 6 hours: let them finish, then run this block again#ROW#';
+        RAISE proof_stop;
+    END IF;
+    v_log := v_log || 'P0 runs~|~ok~|~no trip job in progress#ROW#';
+
+    -- P1. The session, for the record: the steps themselves run as the task owner.
+    v_txt := (SELECT COALESCE(TRY_PARSE_JSON(CURRENT_SECONDARY_ROLES()):roles::VARCHAR, ''));
+    v_log := v_log || 'P1 session~|~ok~|~role ' || CURRENT_ROLE()
+                   || IFF(v_txt = '', ', no secondary roles', ', secondary roles ' || v_txt)
+                   || ', warehouse ' || COALESCE(CURRENT_WAREHOUSE(), '(none)') || '#ROW#';
+
+    -- P2. v1.4 is the version UAT runs.
+    v_has := (SELECT CONTAINS(GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_MERGE_CHECK_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)'),
+                              'my_sql_command_3A'));
+    IF (NOT v_has) THEN
+        v_log := v_log || 'P2 version~|~STOP~|~UAT still runs the old TRIP_MERGE_CHECK_PROC: deploy v1.4, then run this block again#ROW#';
+        RAISE proof_stop;
+    END IF;
+    v_log := v_log || 'P2 version~|~ok~|~TRIP_MERGE_CHECK_PROC v1.4 is live in UAT#ROW#';
+
+    -- P3. The replay set from A4, every trip still live.
+    v_touch  := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT);
+    v_expect := (SELECT COUNT_IF(expect_nomination) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT);
+    v_max_tm := (SELECT value FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS WHERE mark = 'max_trip_master_id_before');
+    IF (v_touch = 0) THEN
+        v_log := v_log || 'P3 replay set~|~STOP~|~A4 found no trips to touch: run PART A again#ROW#';
+        RAISE proof_stop;
+    END IF;
+    IF (v_start_at = 0) THEN
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT e
+                JOIN DAAS_UAT.DAAS_CORE.TRIP_MASTER m ON m.trip_master_id = e.trip_master_id AND m.delete_ind = 'N');
+        IF (v_n < v_touch) THEN
+            v_log := v_log || 'P3 replay set~|~STOP~|~' || (v_touch - v_n) || ' of ' || v_touch
+                           || ' trips in the replay set are no longer live: run PART A again#ROW#';
+            RAISE proof_stop;
+        END IF;
+    END IF;
+    v_log := v_log || 'P3 replay set~|~ok~|~' || v_touch || ' trips to touch, ' || v_expect
+                   || ' of them over the cap with no hotel night (the new rule should re-cut exactly these)#ROW#';
+
+    -- P4. The trip streams. A fresh run needs them empty, or holding only ours from an earlier try of this block.
+    --     Merge check's stream lives in DAAS_TEMP and is recreated by every merge run; if this session cannot read its
+    --     rows, the block falls back to "does it hold anything" and asks for it to be empty.
+    IF (v_start_at = 0 OR v_start_at = 2) THEN
+        BEGIN
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM WHERE METADATA$ACTION = 'INSERT');
+            v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM
+                    WHERE METADATA$ACTION = 'INSERT' AND batch_id = -36414 AND updated_by = 'DAASI-3641 v1.4 proof');
+            v_can_read := TRUE;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_can_read := FALSE;
+                v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'));
+                v_n := IFF(v_has, 1, 0);
+                v_m := 0;
+        END;
+        IF (v_n > v_m) THEN
+            v_log := v_log || 'P4 merge-check stream~|~STOP~|~it holds '
+                           || IFF(v_can_read, (v_n - v_m) || ' trip changes that are not ours', 'changes this session cannot read row by row')
+                           || '; merge check would evaluate them with ours. Run B2x to see whose they are#ROW#';
+            RAISE proof_stop;
+        END IF;
+        IF (v_start_at = 2 AND v_m = 0 AND v_can_read) THEN
+            v_log := v_log || 'P4 merge-check stream~|~STOP~|~resuming at step 2 needs our touched trips waiting in the stream, and none are: '
+                           || 'run again with v_start_at = 0#ROW#';
+            RAISE proof_stop;
+        END IF;
+        v_txt := '';
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' merge-queue'; END IF;
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' customer-merge-check'; END IF;
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_CUSTOMER_MERGE_QUEUE_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' customer-merge-queue'; END IF;
+        v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM'));
+        IF (v_has) THEN v_txt := v_txt || ' daily-summary'; END IF;
+        IF (v_txt <> '') THEN
+            v_log := v_log || 'P4 other streams~|~STOP~|~these already hold changes that would be processed with ours:' || v_txt || '#ROW#';
+            RAISE proof_stop;
+        END IF;
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM WHERE METADATA$ACTION = 'INSERT');
+        v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM
+                WHERE METADATA$ACTION = 'INSERT' AND batch_id = -36414 AND updated_by = 'DAASI-3641 v1.4 proof');
+        IF (v_n > v_k) THEN
+            v_log := v_log || 'P4 summary stream~|~STOP~|~it holds ' || (v_n - v_k) || ' changed detail rows that are not ours, which would be '
+                           || 'summarised with ours. Run B2x#ROW#';
+            RAISE proof_stop;
+        END IF;
+        BEGIN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_NG_VW_STREAM'));
+            v_ng_clean := NOT v_has;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_ng_clean := FALSE;
+        END;
+        v_log := v_log || 'P4 streams~|~ok~|~merge-check stream: ' || IFF(v_can_read, v_m || ' of ours, nothing else', 'empty (row-level read not permitted; checked with SYSTEM$STREAM_HAS_DATA)') || '; merge, customer-merge and daily-summary '
+                       || 'streams empty; summary stream: ' || v_k || ' of ours, nothing else; non-gaming stream '
+                       || IFF(v_ng_clean, 'empty', 'not empty or unreadable, that step will be skipped') || '#ROW#';
+    ELSE
+        v_log := v_log || 'P4 streams~|~skipped~|~resuming at step ' || v_start_at || '#ROW#';
+    END IF;
+
+    -- P5. One suspended, standalone on-demand task per step, calling what the chain task calls (the pilot's lookup).
+    SHOW TASKS IN SCHEMA DAAS_UAT.DAAS_COMMON;
+    CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TASKS AS
+    WITH steps AS (
+        SELECT column1 AS step_no, column2 AS job_name, column3 AS stream_name
+        FROM VALUES (2, 'TRIP_MERGE_CHECK',                      'DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'),
+                    (3, 'TRIP_MERGE',                            'DAAS_CORE.TRIP_MERGE_QUEUE_STREAM'),
+                    (4, 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER', 'DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM'),
+                    (5, 'TRIP_SUMMARY_WRAPPER',                  'DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'),
+                    (6, 'TRIP_COMP_WORTH',                       NULL),
+                    (7, 'TRIP_NG_REVENUE_SUMMARY',               NULL)),
+    tasks AS (
+        SELECT "name"::VARCHAR AS task_name, "state"::VARCHAR AS task_state, "definition"::VARCHAR AS task_definition,
+               REPLACE(UPPER("definition"::VARCHAR), ' ', '') AS def_n,
+               COALESCE(ARRAY_SIZE("predecessors"), 0) AS predecessor_count
+        FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+        WHERE "name" ILIKE '%ONDEMAND%')
+    SELECT s.step_no, s.job_name, s.stream_name, t.task_name, t.task_state, t.task_definition, t.predecessor_count,
+           COUNT(t.task_name) OVER (PARTITION BY s.step_no) AS candidates,
+           (t.def_n ILIKE ('%BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC(''' || s.job_name || '''%')
+            AND (s.stream_name IS NULL
+                 OR REGEXP_COUNT(t.def_n, ',') = 2
+                 OR t.def_n ILIKE ('%' || s.stream_name || '''%'))) AS definition_ok
+    FROM steps s
+    LEFT JOIN tasks t ON t.task_definition ILIKE ('%''' || s.job_name || '''%')
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY s.step_no ORDER BY t.task_name) = 1;
+
+    v_txt := (SELECT COALESCE(LISTAGG('step ' || step_no || ' ' || job_name || ': '
+                                      || CASE WHEN task_name IS NULL THEN 'no on-demand task calls this job'
+                                              WHEN candidates > 1 THEN candidates || ' on-demand tasks call this job'
+                                              WHEN predecessor_count > 0 THEN task_name || ' runs after another task'
+                                              WHEN NOT definition_ok THEN task_name || ' calls something else: ' || task_definition
+                                              ELSE task_name || ' is ' || task_state || ', so it runs on its own schedule'
+                                         END, '; ') WITHIN GROUP (ORDER BY step_no), '')
+              FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TASKS
+              WHERE step_no >= GREATEST(:v_start_at, 2)
+                AND (task_name IS NULL OR candidates > 1 OR predecessor_count > 0 OR NOT definition_ok
+                     OR task_state <> 'suspended'));
+    IF (v_txt <> '') THEN
+        v_log := v_log || 'P5 tasks~|~STOP~|~' || REPLACE(REPLACE(v_txt, '#ROW#', ''), '~|~', '') || '#ROW#';
+        RAISE proof_stop;
+    END IF;
+    v_txt := (SELECT LISTAGG(step_no || ' ' || task_name, ', ') WITHIN GROUP (ORDER BY step_no)
+              FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TASKS WHERE step_no >= GREATEST(:v_start_at, 2));
+    v_log := v_log || 'P5 tasks~|~ok~|~' || v_txt || '#ROW#';
+
+    -- P6. Which tasks a role active in this session may start (OPERATE, or ownership).
+    v_txt     := '';
+    v_who     := '';
+    v_checked := 0;
+    v_blocked := 0;
+    LET rs_perm RESULTSET := (SELECT step_no, task_name FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TASKS
+                              WHERE step_no >= GREATEST(:v_start_at, 2) ORDER BY step_no);
+    LET c_perm CURSOR FOR rs_perm;
+    FOR r IN c_perm DO
+        v_task := r.task_name;
+        BEGIN
+            v_cmd := 'SHOW GRANTS ON TASK DAAS_UAT.DAAS_COMMON.' || v_task;
+            EXECUTE IMMEDIATE v_cmd;
+            SELECT COALESCE(LISTAGG(DISTINCT "grantee_name", ', '), '(no role)'), COUNT_IF(IS_ROLE_IN_SESSION("grantee_name"))
+              INTO :v_out, :v_n
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+             WHERE "privilege" IN ('OPERATE', 'OWNERSHIP') AND "granted_to" = 'ROLE';
+            v_checked := v_checked + 1;
+            IF (v_n = 0) THEN
+                v_blocked := v_blocked + 1;
+                v_txt := v_txt || ' ' || v_task;
+                IF (v_who = '') THEN
+                    v_who := v_out;
+                END IF;
+            END IF;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_grants := FALSE;
+        END;
+    END FOR;
+    IF (v_blocked > 0 AND v_blocked < v_checked) THEN
+        v_log := v_log || 'P6 permission~|~STOP~|~this session may start some of the tasks but not:' || v_txt
+                       || ' (may be started by: ' || v_who || '). Get OPERATE on those first (DevOps), then run this again#ROW#';
+        RAISE proof_stop;
+    END IF;
+    IF (v_blocked > 0) THEN
+        v_log := v_log || 'P6 permission~|~note~|~no role active in this session shows OPERATE on the tasks (they may be started by: '
+                       || v_who || '); the first EXECUTE TASK settles it#ROW#';
+    ELSE
+        v_log := v_log || 'P6 permission~|~' || IFF(v_grants, 'ok~|~this session may start every task',
+                                                    'note~|~grants are not visible to this session; the first EXECUTE TASK settles it') || '#ROW#';
+    END IF;
+
+    -- P7. May this session write the touch? Two UPDATEs that match nothing answer it.
+    IF (v_start_at = 0) THEN
+        BEGIN
+            UPDATE DAAS_UAT.DAAS_CORE.TRIP_DETAIL SET last_dml_cd = last_dml_cd WHERE 1 = 0;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || 'P7 permission~|~STOP~|~this session may not update DAAS_UAT.DAAS_CORE.TRIP_DETAIL: '
+                               || REPLACE(REPLACE(LEFT(SQLERRM, 200), '#ROW#', ''), '~|~', '')
+                               || '. Nothing was changed. The ask for DevOps: run B1 as it stands, or grant UPDATE on that table to a role you hold#ROW#';
+                RAISE proof_stop;
+        END;
+        BEGIN
+            UPDATE DAAS_UAT.DAAS_CORE.TRIP_MASTER SET last_dml_cd = last_dml_cd WHERE 1 = 0;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || 'P7 permission~|~STOP~|~this session may not update DAAS_UAT.DAAS_CORE.TRIP_MASTER: '
+                               || REPLACE(REPLACE(LEFT(SQLERRM, 200), '#ROW#', ''), '~|~', '')
+                               || '. Nothing was changed. The ask for DevOps: run B1 as it stands, or grant UPDATE on that table to a role you hold#ROW#';
+                RAISE proof_stop;
+        END;
+        v_log := v_log || 'P7 permission~|~ok~|~this session may update TRIP_DETAIL and TRIP_MASTER#ROW#';
+    END IF;
+
+    -- P8. The POS switch (as in the pilot): exactly one active POS row in TRIP_SUMMARY_CONFIG, and this session may change it.
+    IF (v_skip_pos AND v_start_at <= 5) THEN
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG
+                WHERE transaction_type = 'POS' AND active_flg = 'Y'
+                  AND stored_procedure_name ILIKE '%TRIP_POS_SUMMARY_LOAD_PROC');
+        v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG
+                WHERE transaction_type = 'POS' AND active_flg = 'N');
+        IF (v_n = 0 AND v_m > 0) THEN
+            v_log := v_log || 'P8 POS switch~|~STOP~|~UAT''s POS summary row is already switched off (an earlier run may have been '
+                           || 'cancelled mid-step): run B4 to switch it back on, then this block again#ROW#';
+            RAISE proof_stop;
+        END IF;
+        IF (v_n <> 1) THEN
+            v_log := v_log || 'P8 POS switch~|~STOP~|~expected one active POS row in TRIP_SUMMARY_CONFIG, found ' || v_n || '#ROW#';
+            RAISE proof_stop;
+        END IF;
+        v_pos_id := (SELECT MIN(trip_summary_config_id) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG
+                     WHERE transaction_type = 'POS' AND active_flg = 'Y'
+                       AND stored_procedure_name ILIKE '%TRIP_POS_SUMMARY_LOAD_PROC');
+        BEGIN
+            UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = active_flg WHERE 1 = 0;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || 'P8 POS switch~|~STOP~|~this session may not change TRIP_SUMMARY_CONFIG: '
+                               || REPLACE(REPLACE(LEFT(SQLERRM, 200), '#ROW#', ''), '~|~', '')
+                               || '. Run USE SECONDARY ROLES ALL on its own (DAAS_UAT_DEVELOPER holds UPDATE), then this block again#ROW#';
+                RAISE proof_stop;
+        END;
+        v_log := v_log || 'P8 POS switch~|~ok~|~step 5 will run without UAT''s POS summary sub-step (TRIP_SUMMARY_CONFIG row '
+                       || v_pos_id || '), switched back on right after#ROW#';
+    ELSEIF (v_start_at <= 5) THEN
+        v_log := v_log || 'P8 POS switch~|~note~|~v_skip_pos is FALSE: step 5 runs UAT''s POS summary code as it is#ROW#';
+    END IF;
+
+    ---------------------------------------------------------------- the touch: what the ratings step writes for a replay
+    IF (v_start_at = 0) THEN
+        -- (a) the replay ratings' detail rows, on every live trip holding them (ratings proc step 4)
+        UPDATE DAAS_UAT.DAAS_CORE.TRIP_DETAIL d
+           SET updated_dttm = CURRENT_TIMESTAMP(),
+               updated_by   = 'DAASI-3641 v1.4 proof',
+               batch_id     = -36414,
+               last_dml_cd  = 'U'
+         WHERE d.trip_master_id IN (SELECT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT)
+           AND d.transaction_table_sk IN (SELECT rating_sk FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_RATINGS)
+           AND d.transaction_table = 'RATINGS_FACT'
+           AND d.delete_ind = 'N';
+        v_marked := SQLROWCOUNT;
+
+        -- (b) every one of those trips rewritten (ratings proc step 11; the end date it rewrites is unchanged in a replay)
+        UPDATE DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+           SET updated_dttm = CURRENT_TIMESTAMP(),
+               updated_by   = 'DAASI-3641 v1.4 proof',
+               batch_id     = -36414,
+               last_dml_cd  = 'U'
+         WHERE m.trip_master_id IN (SELECT trip_master_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT)
+           AND m.delete_ind = 'N';
+        v_n := SQLROWCOUNT;
+
+        v_txt := v_marked || ' TRIP_DETAIL rows marked, ' || v_n || ' TRIP_MASTER rows rewritten (' || v_touch || ' expected)';
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG VALUES ('B1_TOUCHED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_txt);
+
+        IF (v_can_read) THEN
+            v_m := (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM
+                    WHERE METADATA$ACTION = 'INSERT' AND batch_id = -36414 AND updated_by = 'DAASI-3641 v1.4 proof');
+            v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM WHERE METADATA$ACTION = 'INSERT');
+            IF (v_m < v_touch OR v_k > v_m) THEN
+                v_log := v_log || 'T touch~|~STOP~|~' || v_txt || '; merge check''s stream shows ' || v_m || ' of our trips and ' || (v_k - v_m)
+                               || ' other rows. No step was started. Send this row#ROW#';
+                RAISE proof_stop;
+            END IF;
+        ELSE
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'));
+            IF (NOT v_has) THEN
+                v_log := v_log || 'T touch~|~STOP~|~' || v_txt || '; but merge check''s stream shows no change at all. No step was started. Send this row#ROW#';
+                RAISE proof_stop;
+            END IF;
+            v_m := v_touch;
+        END IF;
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM WHERE METADATA$ACTION = 'INSERT');
+        v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM
+                WHERE METADATA$ACTION = 'INSERT' AND batch_id = -36414 AND updated_by = 'DAASI-3641 v1.4 proof');
+        IF (v_k = 0 OR v_n > v_k) THEN
+            v_log := v_log || 'T touch~|~STOP~|~' || v_txt || '; the summary stream shows ' || v_k || ' of our marked rows and ' || (v_n - v_k)
+                           || ' others. No step was started. Send this row#ROW#';
+            RAISE proof_stop;
+        END IF;
+        v_log := v_log || 'T touch~|~ok~|~' || v_txt || '; merge check''s stream shows exactly our ' || v_m
+                       || ' trips, the summary stream exactly our ' || v_k || ' rows#ROW#';
+    END IF;
+
+    ---------------------------------------------------------------- the steps, each started as the task owner
+    LET rs_plan RESULTSET := (SELECT step_no, job_name, task_name FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TASKS
+                              WHERE step_no >= GREATEST(:v_start_at, 2) ORDER BY step_no);
+    LET c_plan CURSOR FOR rs_plan;
+    FOR r IN c_plan DO
+        v_step := r.step_no;
+        v_job  := r.job_name;
+        v_task := r.task_name;
+
+        -- Does the step have work? A stream-checked job logs no batch when its stream is empty.
+        v_has := TRUE;
+        IF (v_job = 'TRIP_MERGE_CHECK') THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'));
+        ELSEIF (v_job = 'TRIP_MERGE') THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM'));
+        ELSEIF (v_job = 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER') THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM'));
+        ELSEIF (v_job = 'TRIP_SUMMARY_WRAPPER') THEN
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'));
+        ELSEIF (v_job = 'TRIP_NG_REVENUE_SUMMARY') THEN
+            v_has := v_ng_clean;
+        END IF;
+        IF (NOT v_has) THEN
+            IF (v_job = 'TRIP_MERGE_CHECK') THEN
+                v_log := v_log || 'S2 TRIP_MERGE_CHECK~|~STOP~|~merge check''s stream is empty: nothing to evaluate. Run again with v_start_at = 0#ROW#';
+                RAISE proof_stop;
+            END IF;
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~' || IFF(v_job = 'TRIP_MERGE', 'LOOK', 'skipped') || '~|~'
+                           || IFF(v_job = 'TRIP_NG_REVENUE_SUMMARY', 'its stream held other changes or could not be read at preflight',
+                                  IFF(v_job = 'TRIP_MERGE', 'merge check nominated nothing: the new rule did not fire (C3 and the A5 report)',
+                                      'its stream is empty, so the job has no work'))
+                           || '#ROW#';
+            CONTINUE;
+        END IF;
+
+        -- Step 5 only: switch UAT's POS summary sub-step off just before the step starts (P8).
+        IF (v_job = 'TRIP_SUMMARY_WRAPPER' AND v_skip_pos) THEN
+            UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'N'
+             WHERE trip_summary_config_id = :v_pos_id AND active_flg = 'Y';
+            v_n := SQLROWCOUNT;
+            v_pos_off := (v_n > 0);
+            v_txt := 'TRIP_SUMMARY_CONFIG row ' || v_pos_id || ' (POS) switched off for step 5: ' || v_n || ' row(s) changed';
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG VALUES ('B1_POS_OFF', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_txt);
+            IF (v_n <> 1) THEN
+                v_log := v_log || 'S5 POS switch~|~STOP~|~switching the POS sub-step off changed ' || v_n || ' rows instead of 1; step 5 not started#ROW#';
+                RAISE proof_stop;
+            END IF;
+            v_log := v_log || 'S5 POS switch~|~ok~|~UAT''s POS summary sub-step switched off for this run#ROW#';
+        END IF;
+
+        -- Start it.
+        v_mark := (SELECT COALESCE(MAX(batch_id), 0) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02);
+        BEGIN
+            v_cmd := 'EXECUTE TASK DAAS_UAT.DAAS_COMMON.' || v_task;
+            EXECUTE IMMEDIATE v_cmd;
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~could not start ' || v_task || ': '
+                               || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '')
+                               || IFF(v_who <> '', '. Roles that may start it: ' || v_who || ' (the ask for DevOps: run this block, or grant OPERATE on the on-demand tasks)', '')
+                               || '#ROW#';
+                RAISE proof_stop;
+        END;
+
+        -- Wait for its batch in the pipeline's log to finish.
+        v_waited := 0;
+        v_status := NULL;
+        WHILE (v_waited < v_max_wait) DO
+            v_wait := (SELECT SYSTEM$WAIT(15));
+            v_waited := v_waited + 15;
+            v_status := (SELECT MAX_BY(b.batch_status, b.batch_id) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+                         JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+                         WHERE j.job_name = :v_job AND b.batch_id > :v_mark);
+            IF (v_status IS NOT NULL AND v_status <> 'IN PROGRESS') THEN
+                BREAK;
+            END IF;
+            IF (v_status IS NULL AND v_waited >= 900) THEN
+                BREAK;
+            END IF;
+        END WHILE;
+        -- Step 5 only: the step has finished (or is no longer waited for), so switch the POS sub-step back on.
+        IF (v_pos_off) THEN
+            UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y'
+             WHERE trip_summary_config_id = :v_pos_id AND active_flg = 'N';
+            v_pos_off := FALSE;
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG
+            VALUES ('B1_POS_ON', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'TRIP_SUMMARY_CONFIG POS row switched back on');
+            v_log := v_log || 'S5 POS switch~|~ok~|~UAT''s POS summary sub-step switched back on#ROW#';
+        END IF;
+        IF (v_status IS NULL) THEN
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~' || v_task || ' was started but logged no run within 15 minutes; '
+                           || 'its TASK_HISTORY says why. Then rerun with v_start_at = ' || v_step || '#ROW#';
+            RAISE proof_stop;
+        END IF;
+        v_batch := (SELECT MAX(b.batch_id) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+                    JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+                    WHERE j.job_name = :v_job AND b.batch_id > :v_mark);
+        v_txt := LOWER(v_job) || '_batch';
+        DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS WHERE mark = :v_txt;
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS VALUES (:v_txt, :v_batch);
+        IF (v_status = 'IN PROGRESS') THEN
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~STOP~|~still running after ' || (v_max_wait / 60)::INTEGER
+                           || ' minutes (batch ' || v_batch || '). Let it finish (B2 shows it), then rerun with v_start_at = ' || (v_step + 1) || '#ROW#';
+            RAISE proof_stop;
+        END IF;
+
+        -- Check what it did.
+        IF (v_job = 'TRIP_MERGE_CHECK') THEN
+            IF (NOT STARTSWITH(v_status, 'SUCCESS')) THEN
+                v_log := v_log || 'S2 TRIP_MERGE_CHECK~|~STOP~|~' || LEFT(v_status, 500) || ' (batch ' || v_batch || '). Send B3#ROW#';
+                RAISE proof_stop;
+            END IF;
+            -- What it nominated, by class, from the queue table rows it wrote in this batch.
+            DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE;
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE
+            SELECT q.trip_master_id,
+                   CASE WHEN e.expect_nomination THEN 'over cap, no stay: the new rule'
+                        WHEN e.trip_master_id IS NOT NULL THEN 'touched, within cap or with a stay: nominated by a join rule'
+                        ELSE 'not touched: partner of a join' END,
+                   e.trip_type, e.trip_days, e.max_trip_days, e.has_hotel_stay
+            FROM (SELECT DISTINCT trip_master_id FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE WHERE batch_id = :v_batch) q
+            LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT e ON e.trip_master_id = q.trip_master_id;
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE WHERE why LIKE 'over cap, no stay%');
+            v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE WHERE why LIKE 'touched, within cap%');
+            v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE WHERE why LIKE 'not touched%');
+            v_log := v_log || 'S2 TRIP_MERGE_CHECK~|~' || IFF(v_n = v_expect, 'ok', 'LOOK') || '~|~' || LEFT(v_status, 120) || ' (batch ' || v_batch
+                           || '); nominated by the new rule: ' || v_n || ' of ' || v_expect || ' expected; by the join rules it already had: '
+                           || v_m || ' touched trips and ' || v_k || ' untouched partners (C3, C4)#ROW#';
+        ELSEIF (v_job = 'TRIP_MERGE') THEN
+            IF (NOT (STARTSWITH(v_status, 'SUCCESS') OR STARTSWITH(v_status, 'Alert'))) THEN
+                v_log := v_log || 'S3 TRIP_MERGE~|~STOP~|~' || LEFT(v_status, 500) || ' (batch ' || v_batch
+                               || '). Send B3: if the merge committed and only its closing stream reset failed, the pilot''s B3c/B3d apply,'
+                               || ' then rerun with v_start_at = 4#ROW#';
+                RAISE proof_stop;
+            END IF;
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT e
+                    JOIN DAAS_UAT.DAAS_CORE.TRIP_MASTER m ON m.trip_master_id = e.trip_master_id
+                    WHERE e.expect_nomination AND m.delete_ind = 'Y');
+            v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+                    WHERE m.trip_master_id > :v_max_tm AND m.delete_ind = 'N'
+                      AND m.guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST'));
+            v_k := (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_PROCESSED WHERE batch_id = :v_batch);
+            v_log := v_log || 'S3 TRIP_MERGE~|~' || IFF(STARTSWITH(v_status, 'SUCCESS') AND v_n = v_expect, 'ok', 'LOOK') || '~|~'
+                           || LEFT(v_status, 120) || ' (batch ' || v_batch || '); ' || v_n || ' of ' || v_expect
+                           || ' over-cap trips retired, ' || v_m || ' replacement trips built, ' || v_k || ' trips logged in TRIP_MERGE_PROCESSED#ROW#';
+        ELSEIF (v_job = 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER') THEN
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_CUSTOMER_MERGE_QUEUE_STREAM WHERE METADATA$ACTION = 'INSERT');
+            v_log := v_log || 'S4 TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER~|~' || IFF(STARTSWITH(v_status, 'SUCCESS') AND v_n = 0, 'ok', 'note')
+                           || '~|~' || LEFT(v_status, 200)
+                           || IFF(v_n = 0, '; no guest merges queued',
+                                  '; ' || v_n || ' guest-merge rows queued and left for the chain (a guest merge rebuilds every trip of both guests)')
+                           || '#ROW#';
+        ELSEIF (v_job = 'TRIP_SUMMARY_WRAPPER') THEN
+            IF (NOT STARTSWITH(v_status, 'SUCCESS')) THEN
+                v_log := v_log || 'S5 TRIP_SUMMARY_WRAPPER~|~STOP~|~' || LEFT(v_status, 500) || ' (batch ' || v_batch
+                               || '). TRIP_MASTER and TRIP_DETAIL are rebuilt and checkable; the summary rows are not. Send B3, then rerun with v_start_at = 5#ROW#';
+                RAISE proof_stop;
+            END IF;
+            v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'));
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY WHERE batch_id = :v_batch);
+            v_log := v_log || 'S5 TRIP_SUMMARY_WRAPPER~|~ok~|~' || LEFT(v_status, 120) || ' (batch ' || v_batch || '); ' || v_n || ' summary rows written'
+                           || IFF(v_has, '; detail-summary stream still holds rows', '; summary stream consumed')
+                           || IFF(v_skip_pos, '; no POS totals this run, by design', '') || '#ROW#';
+        ELSEIF (v_job = 'TRIP_COMP_WORTH') THEN
+            v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+                    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS g ON g.guest_unique_id = m.guest_unique_id AND g.grp = 'TEST' AND g.market_cd = m.market_cd
+                    WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND m.trip_master_id > :v_max_tm);
+            v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+                    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS g ON g.guest_unique_id = m.guest_unique_id AND g.grp = 'TEST' AND g.market_cd = m.market_cd
+                    JOIN DAAS_UAT.DAAS_CORE.TRIP_SUMMARY s ON s.trip_master_id = m.trip_master_id
+                    WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N' AND m.trip_master_id > :v_max_tm AND COALESCE(s.comp_worth, 0) <> 0);
+            v_log := v_log || 'S6 TRIP_COMP_WORTH~|~' || IFF(STARTSWITH(v_status, 'SUCCESS'), 'ok', 'note') || '~|~' || LEFT(v_status, 120)
+                           || ' (batch ' || v_batch || '); ' || v_m || ' of ' || v_n
+                           || ' rebuilt market trips carry a comp worth (a trip whose theo earns no comps keeps 0; C2 compares each with its twin)#ROW#';
+        ELSE
+            v_log := v_log || 'S' || v_step || ' ' || v_job || '~|~' || IFF(STARTSWITH(v_status, 'SUCCESS'), 'ok', 'note')
+                           || '~|~' || LEFT(v_status, 300) || '#ROW#';
+        END IF;
+    END FOR;
+
+    v_log := v_log || 'END~|~done~|~next: C1, then C2#ROW#';
+    res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+            FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+    RETURN TABLE(res);
+EXCEPTION
+    WHEN proof_stop THEN
+        IF (v_pos_off) THEN
+            BEGIN
+                UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y'
+                 WHERE trip_summary_config_id = :v_pos_id AND active_flg = 'N';
+                INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG
+                VALUES ('B1_POS_ON', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'TRIP_SUMMARY_CONFIG POS row switched back on after a stop');
+                v_log := v_log || 'POS switch~|~ok~|~UAT''s POS summary sub-step switched back on#ROW#';
+            EXCEPTION
+                WHEN OTHER THEN
+                    v_log := v_log || 'POS switch~|~STOP~|~could not switch UAT''s POS summary sub-step back on: run B4 now#ROW#';
+            END;
+        END IF;
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+    WHEN OTHER THEN
+        v_log := v_log || 'error~|~STOP~|~' || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '') || '#ROW#';
+        IF (v_pos_off) THEN
+            BEGIN
+                UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y'
+                 WHERE trip_summary_config_id = :v_pos_id AND active_flg = 'N';
+                INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG
+                VALUES ('B1_POS_ON', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'TRIP_SUMMARY_CONFIG POS row switched back on after a stop');
+                v_log := v_log || 'POS switch~|~ok~|~UAT''s POS summary sub-step switched back on#ROW#';
+            EXCEPTION
+                WHEN OTHER THEN
+                    v_log := v_log || 'POS switch~|~STOP~|~could not switch UAT''s POS summary sub-step back on: run B4 now#ROW#';
+            END;
+        END IF;
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+END;
+$$;
+
+-- B2. Progress, while B1 waits (another worksheet): the trip jobs' batches since PART A started.
+SELECT j.job_name, b.batch_id, b.batch_status, b.batch_start_date, b.batch_end_date
+FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+WHERE j.job_name LIKE 'TRIP%'
+  AND b.batch_start_date >= (SELECT MIN(logged_at) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG WHERE step = 'A_START')
+ORDER BY b.batch_id;
+
+-- B2x. (Only if B1 says to.) What merge check's stream and the summary stream hold, grouped by who wrote the rows.
+SELECT 'merge-check stream' AS stream, updated_by, batch_id, COUNT(*) AS rows_waiting, MIN(updated_dttm) AS first_change, MAX(updated_dttm) AS last_change
+FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM
+WHERE METADATA$ACTION = 'INSERT'
+GROUP BY ALL
+UNION ALL
+SELECT 'summary stream', updated_by, batch_id, COUNT(*), MIN(updated_dttm), MAX(updated_dttm)
+FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM
+WHERE METADATA$ACTION = 'INSERT'
+GROUP BY ALL
+ORDER BY 1, 4 DESC;
+
+-- B3. (Only if a step stopped with FAILURE.) The pipeline's own error log for the run's batches.
+SELECT j.job_name, e.*
+FROM DAAS_UAT.DAAS_COMMON.BATCH_ERROR_LOG_S02 e
+JOIN DAAS_UAT.DAAS_COMMON.BATCH_S02 b ON b.batch_id = e.batch_id
+JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+WHERE e.batch_id >= (SELECT MIN(value) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS WHERE mark LIKE '%_batch')
+ORDER BY e.batch_id, e.created_dttm;
+
+-- B4. (Only if B1 says to.) Switch UAT's POS summary sub-step back on by hand.
+UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y'
+WHERE transaction_type = 'POS' AND active_flg = 'N' AND stored_procedure_name ILIKE '%TRIP_POS_SUMMARY_LOAD_PROC';
+
+
+-- ===================================================================================================
+-- PART C. Proof
+-- ===================================================================================================
+
+-- C1. After-picture, same shape as A3 (the eight guests' trips, now including the replacements).
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER AS
+SELECT m.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+WHERE m.guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS);
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_AFTER AS
+SELECT d.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL d
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER t ON t.trip_master_id = d.trip_master_id;
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_AFTER AS
+SELECT s.*
+FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY s
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER t ON t.trip_master_id = s.trip_master_id;
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_DAS_AFTER AS
+SELECT s.*
+FROM DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY s
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER t ON t.trip_master_id = s.trip_master_id;
+
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_LOG
+SELECT 'C_SNAPSHOT', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER) || ' masters, ' ||
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_AFTER) || ' details snapshotted';
+
+-- C2. Scoreboard: one row per check, the expected value next to the actual one. 'LOOK' is a row to explain, 'info'
+--     has no fixed expectation. Rows 1-5 are the new rule itself; 6-9 the replacements; 10-13 the control guests;
+--     14-16 the figures; 17 the reach beyond BEM and WLM; 18 Tracy's measure.
+WITH mark AS (SELECT MAX(IFF(mark = 'max_trip_master_id_before', value, NULL)) AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS),
+g    AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS),
+e    AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT),
+q    AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE),
+tmb  AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE),
+tdb  AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_BEFORE),
+tsb  AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_BEFORE),
+dasb AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_DAS_BEFORE),
+tma  AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER),
+tda  AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TD_AFTER),
+tsa  AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_AFTER),
+dasa AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_DAS_AFTER),
+test_g AS (SELECT guest_unique_id FROM g WHERE grp = 'TEST'),
+ctrl_g AS (SELECT guest_unique_id FROM g WHERE grp = 'CONTROL'),
+retired AS (   -- trips of the test guests that were live before and are retired now
+    SELECT b.trip_master_id, b.guest_unique_id, b.trip_type, b.property_cd, b.market_cd, b.trip_start_dt, b.trip_end_dt
+    FROM tmb b JOIN tma a ON a.trip_master_id = b.trip_master_id
+    WHERE b.delete_ind = 'N' AND a.delete_ind = 'Y' AND b.guest_unique_id IN (SELECT guest_unique_id FROM test_g)
+),
+built AS (     -- live trips of the test guests that did not exist before
+    SELECT a.trip_master_id, a.guest_unique_id, a.trip_type, a.property_cd, a.market_cd, a.trip_start_dt, a.trip_end_dt,
+           DATEDIFF(day, a.trip_start_dt, a.trip_end_dt) + 1 AS trip_days
+    FROM tma a
+    WHERE a.delete_ind = 'N' AND a.trip_master_id > (SELECT max_tm FROM mark)
+      AND a.guest_unique_id IN (SELECT guest_unique_id FROM test_g)
+),
+hotel_a AS (SELECT DISTINCT trip_master_id FROM tda WHERE transaction_type = 'HOTEL' AND delete_ind = 'N'),
+ent AS (SELECT TRY_TO_NUMBER(MAX(value)) AS cap FROM DAAS_UAT.DAAS_CORE.TRIP_CONFIG
+        WHERE config_subtype = 'ENTERPRISE' AND key = 'MAX_TRIP_DAYS' AND active_flg = 'Y'),
+built_cap AS (
+    SELECT b.*, (h.trip_master_id IS NOT NULL) AS has_stay,
+           COALESCE(TRY_TO_NUMBER(CASE WHEN b.trip_type = 'PROPERTY' THEN DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', b.property_cd, b.trip_start_dt)
+                                       WHEN b.trip_type = 'MARKET'   THEN DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', b.market_cd, b.trip_start_dt) END),
+                    (SELECT cap FROM ent)) AS max_trip_days
+    FROM built b LEFT JOIN hotel_a h ON h.trip_master_id = b.trip_master_id
+),
+-- the transactions of the retired trips, and where each sits now among live trips of the same guest and grain
+tx_retired AS (
+    SELECT DISTINCT r.guest_unique_id, r.trip_type, r.property_cd, r.market_cd, d.transaction_table, d.transaction_table_sk
+    FROM retired r JOIN tdb d ON d.trip_master_id = r.trip_master_id
+    WHERE d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+),
+tx_now AS (
+    SELECT a.guest_unique_id, a.trip_type, a.property_cd, a.market_cd, d.transaction_table, d.transaction_table_sk,
+           COUNT(DISTINCT a.trip_master_id) AS live_trips_holding_it
+    FROM tma a JOIN tda d ON d.trip_master_id = a.trip_master_id
+    WHERE a.delete_ind = 'N' AND d.delete_ind = 'N' AND d.transaction_sub_type = 'OPENED'
+    GROUP BY ALL
+),
+tx AS (
+    SELECT r.*, COALESCE(n.live_trips_holding_it, 0) AS live_trips_holding_it
+    FROM tx_retired r
+    LEFT JOIN tx_now n ON n.guest_unique_id = r.guest_unique_id AND n.trip_type = r.trip_type
+                      AND EQUAL_NULL(n.property_cd, r.property_cd) AND EQUAL_NULL(n.market_cd, r.market_cd)
+                      AND n.transaction_table = r.transaction_table AND n.transaction_table_sk = r.transaction_table_sk
+),
+-- market trips of the test guests in their market, before and after, with the identical property twin test
+mk_b AS (SELECT m.trip_master_id, m.guest_unique_id, m.market_cd, m.trip_start_dt, m.trip_end_dt FROM tmb m
+         JOIN g ON g.guest_unique_id = m.guest_unique_id AND g.grp = 'TEST' AND g.market_cd = m.market_cd
+         WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N'),
+pr_b AS (SELECT m.trip_master_id, m.guest_unique_id, g.market_cd, m.trip_start_dt, m.trip_end_dt FROM tmb m
+         JOIN g ON g.guest_unique_id = m.guest_unique_id AND g.grp = 'TEST' AND g.property_cd = m.property_cd
+         WHERE m.trip_type = 'PROPERTY' AND m.delete_ind = 'N'),
+mk_a AS (SELECT m.trip_master_id, m.guest_unique_id, m.market_cd, m.trip_start_dt, m.trip_end_dt,
+                DATEDIFF(day, m.trip_start_dt, m.trip_end_dt) + 1 AS trip_days FROM tma m
+         JOIN g ON g.guest_unique_id = m.guest_unique_id AND g.grp = 'TEST' AND g.market_cd = m.market_cd
+         WHERE m.trip_type = 'MARKET' AND m.delete_ind = 'N'),
+pr_a AS (SELECT m.trip_master_id, m.guest_unique_id, g.market_cd, m.trip_start_dt, m.trip_end_dt FROM tma m
+         JOIN g ON g.guest_unique_id = m.guest_unique_id AND g.grp = 'TEST' AND g.property_cd = m.property_cd
+         WHERE m.trip_type = 'PROPERTY' AND m.delete_ind = 'N'),
+twin_b AS (SELECT DISTINCT mk.trip_master_id FROM mk_b mk JOIN pr_b pr ON pr.guest_unique_id = mk.guest_unique_id AND pr.market_cd = mk.market_cd
+           AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt),
+twin_a AS (SELECT DISTINCT mk.trip_master_id FROM mk_a mk JOIN pr_a pr ON pr.guest_unique_id = mk.guest_unique_id AND pr.market_cd = mk.market_cd
+           AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt),
+-- theo: the retired BEM/WLM market trips against their replacements, per guest and market
+theo_r AS (SELECT r.guest_unique_id, r.market_cd, SUM(s.total_theo_win_amt) AS theo, COUNT(*) AS trips, COUNT(s.trip_master_id) AS trips_with_summary
+           FROM retired r JOIN mk_b ON mk_b.trip_master_id = r.trip_master_id
+           LEFT JOIN tsb s ON s.trip_master_id = r.trip_master_id
+           GROUP BY 1, 2),
+theo_n AS (SELECT b.guest_unique_id, b.market_cd, SUM(s.total_theo_win_amt) AS theo, COUNT(*) AS trips, COUNT(s.trip_master_id) AS trips_with_summary
+           FROM built b LEFT JOIN tsa s ON s.trip_master_id = b.trip_master_id
+           WHERE b.trip_type = 'MARKET' AND b.market_cd IN ('BEM', 'WLM')
+           GROUP BY 1, 2),
+theo AS (SELECT COALESCE(r.guest_unique_id, n.guest_unique_id) AS guest_unique_id, COALESCE(r.market_cd, n.market_cd) AS market_cd,
+                r.theo AS retired_theo, n.theo AS built_theo, r.trips AS retired_trips, r.trips_with_summary AS retired_with_summary,
+                n.trips AS built_trips, n.trips_with_summary AS built_with_summary
+         FROM theo_r r FULL OUTER JOIN theo_n n ON n.guest_unique_id = r.guest_unique_id AND n.market_cd = r.market_cd),
+-- comp worth: each rebuilt market trip against its property twin, pairs with both summary rows
+cw AS (SELECT mk.trip_master_id,
+              ROUND(COALESCE(sm.comp_worth, 0), 2)         AS m_cw, ROUND(COALESCE(sp.comp_worth, 0), 2)         AS p_cw,
+              ROUND(COALESCE(sm.total_theo_win_amt, 0), 2) AS m_theo, ROUND(COALESCE(sp.total_theo_win_amt, 0), 2) AS p_theo
+       FROM mk_a mk
+       JOIN pr_a pr ON pr.guest_unique_id = mk.guest_unique_id AND pr.market_cd = mk.market_cd
+                   AND pr.trip_start_dt = mk.trip_start_dt AND pr.trip_end_dt = mk.trip_end_dt
+       JOIN tsa sm ON sm.trip_master_id = mk.trip_master_id
+       JOIN tsa sp ON sp.trip_master_id = pr.trip_master_id
+       WHERE mk.trip_master_id > (SELECT max_tm FROM mark)
+       QUALIFY ROW_NUMBER() OVER (PARTITION BY mk.trip_master_id ORDER BY pr.trip_master_id) = 1),
+-- control guests: any row that differs, in any of the four tables
+ctrl_tmb AS (SELECT * FROM tmb WHERE guest_unique_id IN (SELECT guest_unique_id FROM ctrl_g)),
+ctrl_tma AS (SELECT * FROM tma WHERE guest_unique_id IN (SELECT guest_unique_id FROM ctrl_g)),
+ctrl_ids AS (SELECT trip_master_id FROM ctrl_tmb UNION SELECT trip_master_id FROM ctrl_tma),
+ctrl_tdb AS (SELECT * FROM tdb WHERE trip_master_id IN (SELECT trip_master_id FROM ctrl_ids)),
+ctrl_tda AS (SELECT * FROM tda WHERE trip_master_id IN (SELECT trip_master_id FROM ctrl_ids)),
+ctrl_tsb AS (SELECT * FROM tsb WHERE trip_master_id IN (SELECT trip_master_id FROM ctrl_ids)),
+ctrl_tsa AS (SELECT * FROM tsa WHERE trip_master_id IN (SELECT trip_master_id FROM ctrl_ids)),
+ctrl_dasb AS (SELECT * FROM dasb WHERE trip_master_id IN (SELECT trip_master_id FROM ctrl_ids)),
+ctrl_dasa AS (SELECT * FROM dasa WHERE trip_master_id IN (SELECT trip_master_id FROM ctrl_ids)),
+ctrl_tm AS (SELECT COUNT(*) AS n FROM ( (SELECT * FROM ctrl_tmb MINUS SELECT * FROM ctrl_tma)
+                                        UNION ALL
+                                        (SELECT * FROM ctrl_tma MINUS SELECT * FROM ctrl_tmb) )),
+ctrl_td AS (SELECT COUNT(*) AS n FROM ( (SELECT * FROM ctrl_tdb MINUS SELECT * FROM ctrl_tda)
+                                        UNION ALL
+                                        (SELECT * FROM ctrl_tda MINUS SELECT * FROM ctrl_tdb) )),
+ctrl_ts AS (SELECT COUNT(*) AS n FROM ( (SELECT * FROM ctrl_tsb MINUS SELECT * FROM ctrl_tsa)
+                                        UNION ALL
+                                        (SELECT * FROM ctrl_tsa MINUS SELECT * FROM ctrl_tsb) )),
+ctrl_das AS (SELECT COUNT(*) AS n FROM ( (SELECT * FROM ctrl_dasb MINUS SELECT * FROM ctrl_dasa)
+                                         UNION ALL
+                                         (SELECT * FROM ctrl_dasa MINUS SELECT * FROM ctrl_dasb) )),
+board AS (
+    SELECT 1 AS n, 'Trips touched by the replay (all grains)' AS check_name,
+           NULL AS expected, (SELECT COUNT(*) FROM e) AS actual
+    UNION ALL SELECT 2, 'Over-cap trips with no hotel night, nominated by the new rule',
+           (SELECT COUNT_IF(expect_nomination) FROM e),
+           (SELECT COUNT(*) FROM q WHERE why LIKE 'over cap, no stay%')
+    UNION ALL SELECT 3, 'Of those, now retired and replaced',
+           (SELECT COUNT_IF(expect_nomination) FROM e),
+           (SELECT COUNT(*) FROM e JOIN tma ON tma.trip_master_id = e.trip_master_id WHERE e.expect_nomination AND tma.delete_ind = 'Y')
+    UNION ALL SELECT 4, 'Over-cap trips WITH a hotel night, still live and unchanged (exempt)',
+           (SELECT COUNT(*) FROM e WHERE has_hotel_stay = 'Y' AND trip_days > max_trip_days),
+           (SELECT COUNT(*) FROM e JOIN tma a ON a.trip_master_id = e.trip_master_id
+             WHERE e.has_hotel_stay = 'Y' AND e.trip_days > e.max_trip_days AND a.delete_ind = 'N'
+               AND a.trip_start_dt = e.trip_start_dt AND a.trip_end_dt = e.trip_end_dt)
+    UNION ALL SELECT 5, 'Touched trips outside the new rule (within cap, or with a stay) that were retired: join rules only, C4 lists each with its partner',
+           NULL,
+           (SELECT COUNT(*) FROM e JOIN tma a ON a.trip_master_id = e.trip_master_id
+             WHERE NOT e.expect_nomination AND a.delete_ind = 'Y')
+    UNION ALL SELECT 6, 'Replacement trips built for the test guests (all grains)', NULL, (SELECT COUNT(*) FROM built)
+    UNION ALL SELECT 7, 'Replacement trips with no hotel night longer than their cap', 0,
+           (SELECT COUNT(*) FROM built_cap WHERE NOT has_stay AND trip_days > max_trip_days)
+    UNION ALL SELECT 8, 'Transactions of the retired trips now on exactly one live trip of the same grain',
+           (SELECT COUNT(*) FROM tx), (SELECT COUNT_IF(live_trips_holding_it = 1) FROM tx)
+    UNION ALL SELECT 9, 'Of those transactions, lost (0 trips) or doubled (2+ trips)', 0,
+           (SELECT COUNT_IF(live_trips_holding_it <> 1) FROM tx)
+    UNION ALL SELECT 23, 'Soft-deleted OPENED rows on the retired trips (the merge step gathers these too and would revive them)', 0,
+           (SELECT COUNT(*) FROM retired r JOIN tdb d ON d.trip_master_id = r.trip_master_id
+             WHERE d.delete_ind = 'Y' AND d.transaction_sub_type = 'OPENED')
+    UNION ALL SELECT 10, 'Control guests: TRIP_MASTER rows changed', 0, (SELECT n FROM ctrl_tm)
+    UNION ALL SELECT 11, 'Control guests: TRIP_DETAIL rows changed', 0, (SELECT n FROM ctrl_td)
+    UNION ALL SELECT 12, 'Control guests: TRIP_SUMMARY rows changed', 0, (SELECT n FROM ctrl_ts)
+    UNION ALL SELECT 13, 'Control guests: DAILY_ACTIVITY_SUMMARY rows changed', 0, (SELECT n FROM ctrl_das)
+    UNION ALL SELECT 14, 'BEM/WLM market trips of the test guests with an identical property twin, after (before: '
+                         || (SELECT COUNT(*) FROM twin_b) || ' of ' || (SELECT COUNT(*) FROM mk_b) || ')',
+           NULL, (SELECT COUNT(*) FROM twin_a)
+    UNION ALL SELECT 15, 'BEM/WLM market trips still without a twin: over the cap with no hotel night', 0,
+           (SELECT COUNT(*) FROM mk_a WHERE trip_master_id NOT IN (SELECT trip_master_id FROM twin_a)
+              AND trip_master_id NOT IN (SELECT trip_master_id FROM hotel_a)
+              AND trip_days > DECODE(market_cd, 'BEM', 1, 'WLM', 3))
+    UNION ALL SELECT 16, 'Theo: guest/market pairs where retired trips and replacements total the same (C5 shows each)',
+           (SELECT COUNT(*) FROM theo),
+           (SELECT COUNT_IF(ROUND(COALESCE(retired_theo, 0), 2) = ROUND(COALESCE(built_theo, 0), 2)) FROM theo)
+    UNION ALL SELECT 17, 'Comp worth: rebuilt market trips equal to their property twin (pairs with both summary rows)',
+           (SELECT COUNT(*) FROM cw), (SELECT COUNT_IF(m_cw = p_cw AND m_theo = p_theo) FROM cw)
+    UNION ALL SELECT 18, 'Enterprise trips: touched / nominated by the new rule / retired', NULL,
+           (SELECT COUNT(*) FROM e WHERE trip_type = 'ENTERPRISE')
+    UNION ALL SELECT 19, '   ... nominated by the new rule', NULL,
+           (SELECT COUNT(*) FROM q WHERE trip_type = 'ENTERPRISE' AND why LIKE 'over cap, no stay%')
+    UNION ALL SELECT 20, '   ... retired', NULL, (SELECT COUNT(*) FROM retired WHERE trip_type = 'ENTERPRISE')
+    UNION ALL SELECT 21, 'Tracy: longest BEM market trip with no hotel night, test guests, after', 1,
+           (SELECT MAX(trip_days) FROM mk_a WHERE market_cd = 'BEM' AND trip_master_id NOT IN (SELECT trip_master_id FROM hotel_a))
+    UNION ALL SELECT 22, 'Tracy: longest WLM market trip with no hotel night, test guests, after', 3,
+           (SELECT MAX(trip_days) FROM mk_a WHERE market_cd = 'WLM' AND trip_master_id NOT IN (SELECT trip_master_id FROM hotel_a))
+)
+SELECT n, check_name, expected, actual,
+       CASE WHEN expected IS NULL THEN 'info'
+            WHEN n IN (21, 22) THEN IFF(actual IS NULL OR actual <= expected, 'ok', 'LOOK')
+            WHEN n IN (2, 3, 8, 16, 17) AND expected = 0 THEN 'LOOK'   -- nothing to compare is not a pass
+            WHEN actual = expected THEN 'ok'
+            ELSE 'LOOK' END AS verdict
+FROM board
+ORDER BY n;
+
+-- C3. What merge check nominated, by class. Expect every 'over cap, no stay' row of EXPECT here, and nothing with a hotel
+--     night under the new rule. Rows nominated by a join rule are merge check's old behaviour, not v1.4.
+SELECT q.why, q.trip_type, COUNT(*) AS trips, MIN(q.trip_days) AS shortest_days, MAX(q.trip_days) AS longest_days,
+       MIN(q.max_trip_days) AS cap_min, MAX(q.max_trip_days) AS cap_max, COUNT_IF(q.has_hotel_stay = 'Y') AS with_hotel_stay
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE q
+GROUP BY ALL
+ORDER BY 1, 2;
+
+-- C4. Every touched trip the new rule did not cover (within its cap, or over it with a hotel night) that was retired
+--     anyway, with the nominated trips of the same guest and grain that overlap or adjoin it: the join rules merge
+--     check already had. Expect each row to show at least one partner; a row with none is a question for the proc.
+WITH ret AS (
+    SELECT e.trip_master_id, e.guest_unique_id, e.trip_type, e.property_cd, e.market_cd, e.trip_start_dt, e.trip_end_dt,
+           e.trip_days, e.max_trip_days, e.has_hotel_stay
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT e
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a ON a.trip_master_id = e.trip_master_id
+    WHERE NOT e.expect_nomination AND a.delete_ind = 'Y'
+)
+SELECT r.trip_master_id, r.guest_unique_id, r.trip_type, COALESCE(NULLIF(r.market_cd, 'N/A'), NULLIF(r.property_cd, 'N/A'), 'ENTERPRISE') AS code,
+       r.trip_start_dt, r.trip_end_dt, r.trip_days, r.max_trip_days, r.has_hotel_stay,
+       LISTAGG(p.trip_master_id || ' [' || p.trip_start_dt || '..' || p.trip_end_dt || ', ' || q.why || ']', ' | ')
+           WITHIN GROUP (ORDER BY p.trip_start_dt) AS nominated_partners
+FROM ret r
+LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_QUEUE q ON q.trip_master_id <> r.trip_master_id
+LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE p
+       ON p.trip_master_id = q.trip_master_id AND p.guest_unique_id = r.guest_unique_id AND p.trip_type = r.trip_type
+      AND EQUAL_NULL(p.property_cd, r.property_cd) AND EQUAL_NULL(p.market_cd, r.market_cd)
+      AND p.trip_start_dt <= DATEADD(day, 1, r.trip_end_dt) AND p.trip_end_dt >= DATEADD(day, -1, r.trip_start_dt)
+GROUP BY ALL
+ORDER BY r.guest_unique_id, r.trip_type, r.trip_start_dt;
+
+-- C5. Theo, per guest and market: the retired BEM/WLM market trips against the trips that replaced them. Expect equal
+--     totals wherever every retired trip had a summary row before (UAT has not summarised trips built since mid-June,
+--     so a retired trip without one makes the retired total read low; the column pair on the right shows it).
+WITH mark AS (SELECT MAX(IFF(mark = 'max_trip_master_id_before', value, NULL)) AS max_tm FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_MARKS),
+g AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST'),
+retired AS (
+    SELECT b.guest_unique_id, b.market_cd,
+           COUNT(*)                            AS retired_trips,
+           COUNT(s.trip_master_id)             AS retired_with_summary_row,
+           ROUND(SUM(s.total_theo_win_amt), 2) AS retired_theo
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE b
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a ON a.trip_master_id = b.trip_master_id
+    JOIN g ON g.guest_unique_id = b.guest_unique_id AND g.market_cd = b.market_cd
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_BEFORE s ON s.trip_master_id = b.trip_master_id
+    WHERE b.trip_type = 'MARKET' AND b.delete_ind = 'N' AND a.delete_ind = 'Y'
+    GROUP BY 1, 2
+),
+built AS (
+    SELECT a.guest_unique_id, a.market_cd,
+           COUNT(*)                            AS replacement_trips,
+           COUNT(s.trip_master_id)             AS replacements_with_summary_row,
+           ROUND(SUM(s.total_theo_win_amt), 2) AS replacement_theo
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a
+    JOIN g ON g.guest_unique_id = a.guest_unique_id AND g.market_cd = a.market_cd
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TS_AFTER s ON s.trip_master_id = a.trip_master_id
+    WHERE a.trip_type = 'MARKET' AND a.delete_ind = 'N' AND a.trip_master_id > (SELECT max_tm FROM mark)
+    GROUP BY 1, 2
+)
+SELECT g.guest_unique_id, g.market_cd,
+       r.retired_trips, r.retired_with_summary_row, r.retired_theo,
+       b.replacement_trips, b.replacements_with_summary_row, b.replacement_theo,
+       CASE WHEN COALESCE(r.retired_theo, 0) = COALESCE(b.replacement_theo, 0) THEN 'ok'
+            WHEN COALESCE(r.retired_with_summary_row, 0) < COALESCE(r.retired_trips, 0)
+              OR COALESCE(b.replacements_with_summary_row, 0) < COALESCE(b.replacement_trips, 0) THEN 'LOOK: a trip without a summary row'
+            ELSE 'LOOK' END AS verdict
+FROM g
+LEFT JOIN retired r ON r.guest_unique_id = g.guest_unique_id AND r.market_cd = g.market_cd
+LEFT JOIN built   b ON b.guest_unique_id = g.guest_unique_id AND b.market_cd = g.market_cd
+ORDER BY 2, 1;
+
+-- C6. The replacements, trip by trip: each retired trip of the test guests and the live trips of the same guest and
+--     grain that now cover its days. For the screenshot: an over-cap trip comes back as several trips at the cap.
+SELECT r.trip_master_id AS retired_trip, r.guest_unique_id, r.trip_type,
+       COALESCE(NULLIF(r.market_cd, 'N/A'), NULLIF(r.property_cd, 'N/A'), 'ENTERPRISE') AS code,
+       r.trip_start_dt, r.trip_end_dt, DATEDIFF(day, r.trip_start_dt, r.trip_end_dt) + 1 AS retired_days,
+       e.max_trip_days AS cap, e.has_hotel_stay, e.expectation,
+       LISTAGG(a.trip_master_id || ' [' || a.trip_start_dt || '..' || a.trip_end_dt || ']', ', ')
+           WITHIN GROUP (ORDER BY a.trip_start_dt) AS live_trips_on_those_days_now
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE r
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER x ON x.trip_master_id = r.trip_master_id AND x.delete_ind = 'Y'
+LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_EXPECT e ON e.trip_master_id = r.trip_master_id
+LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER a
+       ON a.guest_unique_id = r.guest_unique_id AND a.trip_type = r.trip_type AND a.delete_ind = 'N'
+      AND EQUAL_NULL(a.property_cd, r.property_cd) AND EQUAL_NULL(a.market_cd, r.market_cd)
+      AND a.trip_start_dt <= r.trip_end_dt AND a.trip_end_dt >= r.trip_start_dt
+WHERE r.delete_ind = 'N'
+  AND r.guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST')
+GROUP BY ALL
+ORDER BY r.guest_unique_id, r.trip_type, r.trip_start_dt;
+
+-- C7. Control guests: the differing rows themselves, if C2 rows 10-13 show any (expect no rows).
+WITH b AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_BEFORE
+           WHERE guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'CONTROL')),
+     a AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_TM_AFTER
+           WHERE guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'CONTROL')),
+     d1 AS (SELECT * FROM b MINUS SELECT * FROM a),
+     d2 AS (SELECT * FROM a MINUS SELECT * FROM b)
+SELECT 'TRIP_MASTER' AS tbl, 'before only' AS side, OBJECT_CONSTRUCT(*) AS row_value FROM d1
+UNION ALL
+SELECT 'TRIP_MASTER', 'after only', OBJECT_CONSTRUCT(*) FROM d2
+ORDER BY 1, 2;
+
+-- C8. Tracy's own measure (DAASI-3376), in the reporting view, for the test guests: the longest market trip per end date,
+--     hotel-stay trips excluded. Expect BEM rows at 1 and WLM rows at 3 or less. A higher row that is a hotel stay the
+--     UAT summary could not flag (reservation missing from UAT's reloaded hotel table) is the UAT gap found before.
+SELECT market_cd, trip_end_dt, MAX(trip_days) AS max_trip_days
+FROM DAAS_UAT.DAAS_CORE_MARKETING_VW.TRIP_SUMMARY_VW
+WHERE market_cd IN ('BEM', 'WLM')
+  AND trip_type = 'MARKET'
+  AND hotel_flg = 'N'
+  AND guest_unique_id IN (SELECT guest_unique_id FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_V14_GUESTS WHERE grp = 'TEST')
+GROUP BY 1, 2
+ORDER BY 3 DESC, 1, 2 DESC;
