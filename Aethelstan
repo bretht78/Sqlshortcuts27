@@ -1,0 +1,204 @@
+/* =====================================================================
+   DAASI-3640 | Evidence from the UAT replay (UTU, March 2026, 49,455 comps)
+   Six read-only queries, each with the result to expect, written so a
+   reviewer can run them and see the fix rather than take it on trust.
+
+   BEFORE = the backup clone taken before the replay
+            DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY
+   AFTER  = DAAS_UAT.DAAS_CORE.COMP_DETAIL_FACT as it stands now
+   CMS    = the raw tables (what the host typed): comments in
+            ECPCMPCM_RAW, remarks in CMPRM_RAW, comps in CMPRW_RAW
+   SLICE  = the 49,455 comps that were active before the replay; their
+            keys and the CMS-derived expectation sit in
+            DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED
+   Rows are matched BEFORE to AFTER by surrogate key, so every one of
+   the 49,455 is compared with itself.
+
+   E5 uses no work tables, so the same text run in PROD (read-only)
+   shows the BEFORE picture of the comment defect, which UAT cannot
+   show because its fact was scrubbed by the 10/13 script.
+   The examples carry host names; keep them off the ticket.
+   ===================================================================== */
+
+USE DATABASE DAAS_UAT;
+
+
+-- E1. THE REMARKS HALF, IN NUMBERS. Before the fix the fact held no
+--     remarks for any comp; CMS had remarks for 1,465 of these 49,455;
+--     after the fix the fact carries all 1,465 and none differs from
+--     CMS. Comments are untouched (same count before and after).
+--     Expect: 49,455 | 0 | 1,465 | 1,465 | 0 | 1,949 | 1,949 | 209
+SELECT COUNT(*)                                                      AS comps,
+       COUNT_IF(b.COMMENTS_EXTENDED IS NOT NULL)                      AS with_remarks_before,
+       COUNT_IF(e.NEW_REMARKS       IS NOT NULL)                      AS with_remarks_in_cms,
+       COUNT_IF(f.COMMENTS_EXTENDED IS NOT NULL)                      AS with_remarks_after,
+       COUNT_IF(f.COMMENTS_EXTENDED IS DISTINCT FROM e.NEW_REMARKS)   AS after_differs_from_cms,
+       COUNT_IF(b.COMP_COMMENTS_DESC IS NOT NULL)                     AS with_comment_before,
+       COUNT_IF(f.COMP_COMMENTS_DESC IS NOT NULL)                     AS with_comment_after,
+       COUNT_IF(f.DELETE_IND = 'Y')                                   AS now_soft_deleted   -- CMS deleted these; see E6
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+JOIN DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+  ON  b.COMP_NBR = e.COMP_NBR AND b.ISHDRW = e.ISHDRW AND b.PROPERTY_CD = e.PROPERTY_CD
+  AND b.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND b.GUEST_ID = e.GUEST_ID AND b.DELETE_IND = 'N'
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK;
+
+
+-- E2. WHAT THE REPORT WAS MISSING, BY PATTERN. The 1,465 comps that
+--     gained remarks, grouped by how the host had used the two CMS
+--     fields, with one before -> after example each. Pattern 1 is the
+--     ticket as Tracy reported it; pattern 3 is her own example's shape.
+SELECT CASE WHEN b.COMP_COMMENTS_DESC IS NULL                               THEN '1. comment blank, the reason was in remarks'
+            WHEN b.COMP_COMMENTS_DESC = f.COMMENTS_EXTENDED                 THEN '2. same text in both fields'
+            WHEN REGEXP_LIKE(b.COMP_COMMENTS_DESC, '\\$?[0-9][0-9.,]*\\.?') THEN '3. amount in comment, reason in remarks'
+            ELSE                                                                 '4. different text in the two fields' END AS pattern,
+       COUNT(*)                                                                          AS comps,
+       ANY_VALUE(COALESCE(b.COMP_COMMENTS_DESC, '(blank)') || '   ->   ' || f.COMMENTS_EXTENDED) AS example_comment_then_remarks
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+JOIN DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+  ON  b.COMP_NBR = e.COMP_NBR AND b.ISHDRW = e.ISHDRW AND b.PROPERTY_CD = e.PROPERTY_CD
+  AND b.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND b.GUEST_ID = e.GUEST_ID AND b.DELETE_IND = 'N'
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK
+WHERE f.COMMENTS_EXTENDED IS NOT NULL
+GROUP BY 1
+ORDER BY 1;
+
+--     Three comps per pattern, before and after side by side.
+SELECT pattern, COMP_NBR, ISSUE_DT, COMMENT_BEFORE, COMMENT_AFTER, REMARKS_BEFORE, REMARKS_AFTER
+FROM (
+    SELECT CASE WHEN b.COMP_COMMENTS_DESC IS NULL                               THEN '1. comment blank, the reason was in remarks'
+                WHEN b.COMP_COMMENTS_DESC = f.COMMENTS_EXTENDED                 THEN '2. same text in both fields'
+                WHEN REGEXP_LIKE(b.COMP_COMMENTS_DESC, '\\$?[0-9][0-9.,]*\\.?') THEN '3. amount in comment, reason in remarks'
+                ELSE                                                                 '4. different text in the two fields' END AS pattern,
+           f.COMP_NBR, f.ISSUE_DT,
+           b.COMP_COMMENTS_DESC AS COMMENT_BEFORE, f.COMP_COMMENTS_DESC AS COMMENT_AFTER,
+           b.COMMENTS_EXTENDED  AS REMARKS_BEFORE, f.COMMENTS_EXTENDED  AS REMARKS_AFTER
+    FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+    JOIN DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+      ON  b.COMP_NBR = e.COMP_NBR AND b.ISHDRW = e.ISHDRW AND b.PROPERTY_CD = e.PROPERTY_CD
+      AND b.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND b.GUEST_ID = e.GUEST_ID AND b.DELETE_IND = 'N'
+    JOIN DAAS_CORE.COMP_DETAIL_FACT f
+      ON  f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK
+    WHERE f.COMMENTS_EXTENDED IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY pattern ORDER BY LENGTH(f.COMMENTS_EXTENDED) DESC) <= 3
+)
+ORDER BY pattern, COMP_NBR;
+
+
+-- E3. TRACY'S EXACT CASE, REPRODUCED ON COMPS SHE NEVER REPORTED. Her
+--     example was comment "$95" with the reason "$95 BASED ON PLAY|PER
+--     HUAIBI LI" invisible to the report. Same host, same property, same
+--     habit, one month of comps: every one now carries the reason.
+SELECT f.COMP_NBR, f.ISSUE_DT,
+       b.COMP_COMMENTS_DESC AS report_showed_before,
+       f.COMMENTS_EXTENDED  AS report_can_show_now
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+JOIN DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+  ON  b.COMP_NBR = e.COMP_NBR AND b.ISHDRW = e.ISHDRW AND b.PROPERTY_CD = e.PROPERTY_CD
+  AND b.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND b.GUEST_ID = e.GUEST_ID AND b.DELETE_IND = 'N'
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK
+WHERE f.COMMENTS_EXTENDED ILIKE '%PER HUAIBI LI%'
+ORDER BY f.ISSUE_DT;
+
+
+-- E4. TWO INDEPENDENT PATHS AGREE. The dynamic table is built from CMS by
+--     its own code; the fact was rebuilt by the stored procedure. Over
+--     every comp that is active in both, comment and remarks are
+--     identical. Expect: 49,246 | 0 | 0 | 0
+SELECT COUNT(*)                                                      AS comps_active_in_fact,
+       COUNT_IF(d.COMP_NBR IS NULL)                                  AS missing_in_dt,
+       COUNT_IF(d.COMP_COMMENTS_DESC IS DISTINCT FROM f.COMP_COMMENTS_DESC) AS comment_differs,
+       COUNT_IF(d.COMMENTS_EXTENDED  IS DISTINCT FROM f.COMMENTS_EXTENDED)  AS remarks_differ
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_NBR = e.COMP_NBR AND f.ISHDRW = e.ISHDRW AND f.PROPERTY_CD = e.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND f.DELETE_IND = 'N'
+LEFT JOIN DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT d
+  ON  d.COMP_NBR = e.COMP_NBR AND d.ISHDRW = e.ISHDRW AND d.PROPERTY_CD = e.PROPERTY_CD
+  AND d.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND d.DELETE_IND = 'N';
+
+
+-- E5. THE COMMENT HALF: NO COMP SHOWS ANOTHER GUEST'S NOTE. Comp numbers
+--     are reused, so CMS holds comment lines on the same number written
+--     for other guests' comps (years apart). A comp's comment may only
+--     contain lines written under a guest who held that comp. This
+--     counts the comps in the slice whose number carries such foreign
+--     lines in CMS, and how many of them show a foreign line in the
+--     fact today.
+--     In UAT (after):  the last column is 0.
+--     In PROD (before, read-only: change the USE DATABASE above and run
+--     this one query): the last column is in the thousands, because the
+--     current PROD load matches comments by number alone.
+WITH slice AS (
+    SELECT COMP_NBR, ISHDRW, PROPERTY_CD, GUEST_ID, COMP_COMMENTS_DESC
+    FROM DAAS_CORE.COMP_DETAIL_FACT
+    WHERE DELETE_IND = 'N' AND SOURCE_SYSTEM_NM = 'HETCMS'
+      AND PROPERTY_CD = 'UTU' AND ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
+),
+holders AS (     -- every guest who ever held each comp
+    SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+    WHERE PROPERTY_CODE = 'UTU' AND CNUMRW IN (SELECT COMP_NBR FROM slice)
+),
+lines AS (       -- latest version of every comment line on these numbers, with the guest it was written under
+    SELECT "CMP#CM" AS CNUMRW, PROPERTY_CODE, SYIDCM, CSEQCM, CMNTCM
+    FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
+    WHERE PROPERTY_CODE = 'UTU' AND "CMP#CM" IN (SELECT COMP_NBR FROM slice)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+own_lines AS (   -- lines under a holder of the comp
+    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
+    FROM slice s
+    JOIN lines l   ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
+    JOIN holders h ON h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM
+),
+foreign_lines AS (   -- lines under someone who never held the comp, and not also written by a holder
+    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
+    FROM slice s
+    JOIN lines l ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
+    WHERE NOT EXISTS (SELECT 1 FROM holders h
+                      WHERE h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM)
+      AND NOT EXISTS (SELECT 1 FROM own_lines o
+                      WHERE o.COMP_NBR = s.COMP_NBR AND o.ISHDRW = s.ISHDRW AND o.CMNTCM = l.CMNTCM)
+),
+fact_lines AS (  -- the comment the fact shows, one row per line
+    SELECT s.COMP_NBR, s.ISHDRW, x.VALUE::VARCHAR AS line
+    FROM slice s, LATERAL FLATTEN(INPUT => SPLIT(s.COMP_COMMENTS_DESC, '|')) x
+    WHERE s.COMP_COMMENTS_DESC IS NOT NULL
+)
+SELECT (SELECT COUNT(*) FROM slice)                                          AS comps_in_slice,
+       (SELECT COUNT(DISTINCT COMP_NBR || '-' || ISHDRW) FROM foreign_lines)  AS comps_whose_number_has_other_guests_lines_in_cms,
+       COUNT(DISTINCT fl.COMP_NBR || '-' || fl.ISHDRW)                        AS comps_showing_another_guests_line
+FROM fact_lines fl
+JOIN foreign_lines fo
+  ON  fo.COMP_NBR = fl.COMP_NBR AND fo.ISHDRW = fl.ISHDRW AND fo.CMNTCM = fl.line;
+
+
+-- E6. NOTHING ELSE MOVED THAT SHOULD NOT HAVE. Every one of the 49,455
+--     rows was rebuilt from CMS by the pipeline's own statements; this is
+--     what changed on them besides the text. Expect guest, category,
+--     worth and redeem all 0. DELETE_IND 209: comps CMS deleted after the
+--     UAT fact last loaded, which the rebuild applied as the daily load
+--     would have (runbook F7 lists them). COMPOR_NAME 49,442: the host
+--     name rebuilt from today's host master under today's formula
+--     (runbook F8 shows the kind of change).
+SELECT COUNT(*)                                                                 AS rows_,
+       COUNT_IF(f.COMP_COMMENTS_DESC IS DISTINCT FROM b.COMP_COMMENTS_DESC)     AS comment_changed,
+       COUNT_IF(f.COMMENTS_EXTENDED  IS DISTINCT FROM b.COMMENTS_EXTENDED)      AS remarks_changed,
+       COUNT_IF(f.GUEST_ID              <> b.GUEST_ID)                          AS guest_changed,
+       COUNT_IF(f.DELETE_IND            <> b.DELETE_IND)                        AS delete_ind_changed,
+       COUNT_IF(f.COMP_CATEGORY         IS DISTINCT FROM b.COMP_CATEGORY)       AS category_changed,
+       COUNT_IF(f.ISSUE_COMP_WORTH_AMT  IS DISTINCT FROM b.ISSUE_COMP_WORTH_AMT) AS worth_changed,
+       COUNT_IF(f.USED_COMP_WORTH_AMT   IS DISTINCT FROM b.USED_COMP_WORTH_AMT)  AS used_worth_changed,
+       COUNT_IF(f.REDEEM_DTTM           IS DISTINCT FROM b.REDEEM_DTTM)         AS redeem_changed,
+       COUNT_IF(f.COMPOR_NAME           IS DISTINCT FROM b.COMPOR_NAME)         AS compor_name_changed,
+       COUNT_IF(f.BATCH_ID = 36400001 AND f.LAST_DML_CD = 'U')                  AS written_by_the_replay_batch
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+JOIN DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+  ON  b.COMP_NBR = e.COMP_NBR AND b.ISHDRW = e.ISHDRW AND b.PROPERTY_CD = e.PROPERTY_CD
+  AND b.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND b.GUEST_ID = e.GUEST_ID AND b.DELETE_IND = 'N'
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK;
