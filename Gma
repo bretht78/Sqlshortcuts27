@@ -1,0 +1,691 @@
+/* =====================================================================
+   DAASI-3640 | Step 6 of 7: limited replay in UAT         (rev 2i, 10/26)
+   Proves that bumping REPLAY_COUNTER on a comp's latest raw row sends it
+   back through the stream, and that the v1.14 procs rebuild its comment
+   and remarks the way the answer key says they should. Also gives a rate
+   (comps per minute) to size the PROD run.
+
+   Rev 2: UAT does not hold UTU August 2026 (B3 came back 0), so part B
+   now opens with a look at what UAT does hold (B0) and the slice is set
+   in two variables. Part C is a smoke run of the proc on the empty
+   stream, and part E has the CALL written out, since UAT has no task for
+   the daily proc (A4 found only the suspended HIST_V1 task).
+
+   Done on 10/22: A1-A4 (procs carry v1.14, column present, stream empty),
+   B0 (a) and (c), and B1 (backup clone exists; re-running B1 errors
+   "already exists", which is harmless). Rev 2a fixes B0 (b), which had
+   anchored on the fact's newest issue date and found only junk dates in
+   2088-2089. Resume at B0 (b).
+
+   Before this file: 01 (fact column), 03 and 04 (both procs), 05 (DT
+   deployed to UAT). Work tables go in DAAS_TEMP_WORK.
+   ===================================================================== */
+
+USE DATABASE DAAS_UAT;
+
+
+/* ---------------------------------------------------------------------
+   A. PRE-FLIGHT (read-only)                                  -- done 10/22
+   --------------------------------------------------------------------- */
+
+-- A1. The deployed procs carry v1.14 (both TRUE).
+SELECT procedure_name,
+       CONTAINS(procedure_definition, 'COMMENTS_EXTENDED')             AS has_remarks,
+       CONTAINS(procedure_definition, 'SELECT DISTINCT CNUMRW, ISHDRW') AS has_ever_held_match
+FROM SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES
+WHERE deleted IS NULL
+  AND procedure_catalog = 'DAAS_UAT'
+  AND procedure_name LIKE 'HETCMS_COMP_DETAIL_FACT_LOAD_PROC%';
+
+-- A2. The fact has the column.
+SELECT COUNT(*) AS has_column
+FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
+WHERE table_schema = 'DAAS_CORE' AND table_name = 'COMP_DETAIL_FACT' AND column_name = 'COMMENTS_EXTENDED';
+
+-- A3. The stream the daily proc reads, and what already sits in it.
+--     (10/22: HAS_DATA FALSE, 0 rows waiting.)
+SHOW STREAMS LIKE 'CMPRW_RAW_COMP_DETAIL_STREAM' IN SCHEMA DAAS_RAW_HETCMS;
+SELECT SYSTEM$STREAM_HAS_DATA('DAAS_RAW_HETCMS.CMPRW_RAW_COMP_DETAIL_STREAM') AS has_data;
+SELECT COUNT(*) AS rows_waiting FROM DAAS_RAW_HETCMS.CMPRW_RAW_COMP_DETAIL_STREAM;
+
+-- A4. The task that calls the proc, if UAT has one.
+--     (10/22: only HETCMS_COMP_DETAIL_FACT_LOAD_HIST_V1_TASK, suspended,
+--     no schedule, calling an older HIST_V1 procedure. Not ours; leave it.
+--     So part E calls the daily proc directly.)
+SHOW TASKS IN DATABASE DAAS_UAT;
+SELECT "name", "schedule", "state", "warehouse", LEFT("definition", 300) AS definition
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "definition" ILIKE '%HETCMS_COMP_DETAIL_FACT_LOAD_PROC%';
+
+
+/* ---------------------------------------------------------------------
+   B. BACKUP AND ANSWER KEY (nothing in the fact changes yet)
+   --------------------------------------------------------------------- */
+
+-- B0. What UAT holds. Three results, then set the slice.
+
+--     (a) Each table's span. The fact's SOURCE_SYSTEM_NM should read
+--         HETCMS, and the raw dates say how current UAT is. If CMPRM_RAW
+--         is empty, UAT cannot exercise the remarks path, and the run
+--         proves the mechanics and the comment path only.
+--         (10/22: fact 189.9M active HETCMS rows plus 60.6M EDW_CZR, last
+--         written 10/14; raw CMPRW_RAW 462M rows to 2026-07-02;
+--         ECPCMPCM_RAW 6.3M to 2026-05-11; CMPRM_RAW 14.7M to 2026-04-28.)
+SELECT 'fact (active)'        AS what,
+       SOURCE_SYSTEM_NM       AS src,
+       COUNT(*)               AS rows_,
+       MIN(ISSUE_DT)          AS first_dt,
+       MAX(ISSUE_DT)          AS last_dt,
+       COUNT(DISTINCT PROPERTY_CD) AS properties,
+       MAX(UPDATED_DTTM)::DATE AS last_written
+FROM DAAS_CORE.COMP_DETAIL_FACT
+WHERE DELETE_IND = 'N'
+GROUP BY 1, 2
+UNION ALL
+SELECT 'raw CMPRW_RAW', MAX(SOURCE_SYSTEM_NAME), COUNT(*),
+       MIN('1899-12-31'::DATE + ISHDRW), MAX('1899-12-31'::DATE + ISHDRW),
+       COUNT(DISTINCT PROPERTY_CODE), MAX(OPERATION_DATE)::DATE
+FROM DAAS_RAW_HETCMS.CMPRW_RAW
+UNION ALL
+SELECT 'raw ECPCMPCM_RAW', NULL, COUNT(*),
+       MIN(OPERATION_DATE)::DATE, MAX(OPERATION_DATE)::DATE,
+       COUNT(DISTINCT PROPERTY_CODE), MAX(OPERATION_DATE)::DATE
+FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
+UNION ALL
+SELECT 'raw CMPRM_RAW', NULL, COUNT(*),
+       MIN(OPERATION_DATE)::DATE, MAX(OPERATION_DATE)::DATE,
+       COUNT(DISTINCT PROPERTY_CODE), MAX(OPERATION_DATE)::DATE
+FROM DAAS_RAW_HETCMS.CMPRM_RAW;
+
+--     (b) Candidate slices. UAT's raw is a frozen copy (10/22: comps to
+--         2026-07-02, comments to 2026-05-11, remarks to 2026-04-28) and
+--         the fact carries junk issue dates out to 2089, so the window
+--         is anchored on the remarks feed, the first of the three to
+--         stop: the six complete months before its last day, which is
+--         where all three feeds cover every comp. Property x month, with
+--         a rough count of the comps that have remark lines in raw
+--         (matched by number and property, so a little high). The row
+--         marked SUGGESTED is the newest month with 1,000 to 60,000
+--         comps and some remarks; UTU wins ties because Tracy's comp
+--         lives there. It sorts to the top. Any row of that shape will do.
+--         (10/22: UTU 2026-03 has 49,455 comps, 1,949 with a comment,
+--         5,418 with remarks by the rough count; chosen. IBH 2026-03,
+--         37,212 comps, was the runner-up.)
+WITH b AS (
+    SELECT DATE_TRUNC('MONTH', MAX(OPERATION_DATE))::DATE AS first_open_month
+    FROM DAAS_RAW_HETCMS.CMPRM_RAW
+),
+m AS (
+    SELECT f.PROPERTY_CD,
+           DATE_TRUNC('MONTH', f.ISSUE_DT)::DATE          AS issue_month,
+           COUNT(*)                                       AS comps,
+           COUNT_IF(f.COMP_COMMENTS_DESC IS NOT NULL)     AS with_comment,
+           COUNT_IF(r.CNUMRM IS NOT NULL)                 AS with_remarks_rough
+    FROM DAAS_CORE.COMP_DETAIL_FACT f
+    LEFT JOIN (SELECT DISTINCT CNUMRM, PROPERTY_CODE FROM DAAS_RAW_HETCMS.CMPRM_RAW) r
+           ON r.CNUMRM = f.COMP_NBR AND r.PROPERTY_CODE = f.PROPERTY_CD
+    WHERE f.DELETE_IND = 'N'
+      AND f.SOURCE_SYSTEM_NM = 'HETCMS'
+      AND f.ISSUE_DT >= DATEADD(month, -6, (SELECT first_open_month FROM b))
+      AND f.ISSUE_DT <  (SELECT first_open_month FROM b)
+    GROUP BY 1, 2
+)
+SELECT PROPERTY_CD, issue_month, comps, with_comment, with_remarks_rough,
+       IFF(ROW_NUMBER() OVER (ORDER BY IFF(comps BETWEEN 1000 AND 60000 AND with_remarks_rough > 0, 0, 1),
+                                       issue_month DESC,
+                                       IFF(PROPERTY_CD = 'UTU', 0, 1),
+                                       with_remarks_rough DESC) = 1, 'SUGGESTED', '') AS pick
+FROM m
+ORDER BY pick DESC, IFF(PROPERTY_CD = 'UTU', 0, 1), issue_month DESC, comps DESC;
+
+--     (c) The column the bump writes exists on UAT's raw comp table (1).
+SELECT COUNT(*) AS has_replay_counter
+FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
+WHERE table_schema = 'DAAS_RAW_HETCMS' AND table_name = 'CMPRW_RAW' AND column_name = 'REPLAY_COUNTER';
+
+--     The slice: property and the first day of the month. Everything
+--     below reads these. Chosen 10/22: UTU, March 2026, 49,455 comps,
+--     the newest month all three UAT feeds cover and Tracy's property.
+--     Run all three lines in this worksheet before B2.
+SET slice_prop = 'UTU';
+SET slice_from = '2026-03-01';
+SET slice_to   = LAST_DAY($slice_from::DATE);
+
+-- B1. Zero-copy backup. Plain CREATE so a rerun cannot overwrite it.   -- done 10/22
+CREATE TABLE DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY
+  CLONE DAAS_CORE.COMP_DETAIL_FACT;
+
+-- B2. The answer key: for every active comp in the slice, what the fact
+--     holds now and what v1.14 should produce. The comment and remark
+--     rules here are the same SQL as the procs.
+CREATE OR REPLACE TRANSIENT TABLE DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED AS
+WITH slice AS (
+    SELECT COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD, GUEST_ID, ISSUE_DT,
+           COMP_COMMENTS_DESC AS OLD_COMMENT,
+           COMMENTS_EXTENDED  AS OLD_REMARKS,
+           UPDATED_DTTM       AS OLD_UPDATED_DTTM,
+           BATCH_ID           AS OLD_BATCH_ID,
+           MD5_CHECKSUM       AS OLD_MD5
+    FROM DAAS_CORE.COMP_DETAIL_FACT
+    WHERE DELETE_IND = 'N'
+      AND SOURCE_SYSTEM_NM = 'HETCMS'
+      AND PROPERTY_CD = $slice_prop                                -- slice: property
+      AND ISSUE_DT BETWEEN $slice_from::DATE AND $slice_to         -- slice: issue month
+),
+comments AS (   -- v1.14 rule: a line belongs to a comp when its guest ever held that comp
+    SELECT CNUMRW, ISHDRW, PROPERTY_CODE,
+           LISTAGG(CMNTCM, '|') WITHIN GROUP (ORDER BY CSEQCM) AS CMNTCM
+    FROM (
+        SELECT H.CNUMRW, H.ISHDRW, H.PROPERTY_CODE, L.CSEQCM, L.CMNTCM
+        FROM (SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
+              FROM DAAS_RAW_HETCMS.CMPRW_RAW) H
+        JOIN (SELECT SYIDCM, "CMP#CM", CSEQCM, CMNTCM, PROPERTY_CODE,
+                     OPERATION_DATE, OPERATION_SEQUENCE_NBR, CREATED_DATE
+              FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
+              QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+                      ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1) L
+          ON L.SYIDCM = H.SYIDRW AND L."CMP#CM" = H.CNUMRW AND L.PROPERTY_CODE = H.PROPERTY_CODE
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY H.CNUMRW, H.ISHDRW, H.PROPERTY_CODE, L.CSEQCM
+                ORDER BY L.OPERATION_DATE DESC, L.OPERATION_SEQUENCE_NBR DESC, L.CREATED_DATE DESC) = 1
+    )
+    GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE
+),
+remarks AS (    -- v1.14 rule: a remark line belongs to the comp live on its number when written
+    SELECT CNUMRW, ISHDRW, PROPERTY_CODE,
+           LEFT(LISTAGG(EXPLRM, '|') WITHIN GROUP (ORDER BY SEQNRM), 4000) AS COMMENTS_EXTENDED
+    FROM (
+        SELECT C.CNUMRW, C.ISHDRW, C.PROPERTY_CODE, R.SEQNRM, R.EXPLRM
+        FROM (SELECT CNUMRW, ISHDRW, PROPERTY_CODE, FIRST_SEEN,
+                     LAG(FIRST_SEEN)  OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS PREV_FIRST_SEEN,
+                     LEAD(FIRST_SEEN) OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS NEXT_FIRST_SEEN
+              FROM (SELECT CNUMRW, ISHDRW, PROPERTY_CODE, MIN(OPERATION_DATE) AS FIRST_SEEN
+                    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+                    GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE)) C
+        JOIN DAAS_RAW_HETCMS.CMPRM_RAW R
+          ON R.CNUMRM = C.CNUMRW
+         AND R.PROPERTY_CODE = C.PROPERTY_CODE
+         AND (C.PREV_FIRST_SEEN IS NULL OR R.OPERATION_DATE >= DATEADD(SECOND, -60, C.FIRST_SEEN))
+         AND (C.NEXT_FIRST_SEEN IS NULL OR R.OPERATION_DATE <  DATEADD(SECOND, -60, C.NEXT_FIRST_SEEN))
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY C.CNUMRW, C.ISHDRW, C.PROPERTY_CODE, R.SEQNRM
+                ORDER BY R.OPERATION_DATE DESC, R.OPERATION_SEQUENCE_NBR DESC, R.CREATED_DATE DESC) = 1
+    )
+    GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE
+)
+SELECT s.*,
+       c.CMNTCM            AS NEW_COMMENT,
+       r.COMMENTS_EXTENDED AS NEW_REMARKS
+FROM slice s
+LEFT JOIN comments c ON c.CNUMRW = s.COMP_NBR AND c.ISHDRW = s.ISHDRW AND c.PROPERTY_CODE = s.PROPERTY_CD
+LEFT JOIN remarks  r ON r.CNUMRW = s.COMP_NBR AND r.ISHDRW = s.ISHDRW AND r.PROPERTY_CODE = s.PROPERTY_CD;
+
+-- B3. Size of the slice and what should change. COMPS should match the
+--     B0(b) row you picked (UTU March 2026: 49,455); if it is 0, the
+--     variables did not take, so run the three SET lines again in this
+--     worksheet. COMPS_WITH_REMARKS should land a little under the rough
+--     count of 5,418, since the real rule ties each remark line to one
+--     holder of a reused number.
+SELECT COUNT(*)                                                        AS comps,
+       COUNT_IF(NEW_COMMENT IS DISTINCT FROM OLD_COMMENT)              AS comment_changes,
+       COUNT_IF(NEW_REMARKS IS DISTINCT FROM OLD_REMARKS)              AS remark_changes,
+       COUNT_IF(NEW_COMMENT IS NULL AND OLD_COMMENT IS NOT NULL)       AS comment_removed,
+       COUNT_IF(NEW_REMARKS IS NOT NULL)                               AS comps_with_remarks
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED;
+
+-- B4. The raw rows to replay: the latest version of each comp in the slice.
+CREATE OR REPLACE TRANSIENT TABLE DAAS_TEMP_WORK.DAASI3640_RP_SLICE AS
+SELECT CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE, OPERATION_DATE, OPERATION_SEQUENCE_NBR, CREATED_DATE
+FROM DAAS_RAW_HETCMS.CMPRW_RAW
+WHERE (CNUMRW, ISHDRW, PROPERTY_CODE, COTLRW) IN
+      (SELECT COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED)
+QUALIFY ROW_NUMBER() OVER (PARTITION BY CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE
+        ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1;
+
+SELECT COUNT(*) AS raw_rows_to_bump FROM DAAS_TEMP_WORK.DAASI3640_RP_SLICE;   -- should equal COMPS in B3
+
+--     (10/22 results: COMPS 49,455; COMMENT_CHANGES 0; REMARK_CHANGES 1,465;
+--     COMMENT_REMOVED 0; COMPS_WITH_REMARKS 1,465; RAW_ROWS_TO_BUMP 49,455.
+--     Two things to understand before trusting them, hence B5-B7.)
+
+-- B5-B7. READ-ONLY DIAGNOSTICS. Any time after B2; they read raw and the
+--        answer key only. The slice property is written in as a literal
+--        because the session variables die with the session.
+
+-- B5. The remarks the real rule set aside. Only 1,465 of the 5,418 comps
+--     the rough by-number count credited keep remarks, so this classes
+--     every remark line raw holds under the slice's numbers by who was
+--     live on the number when it was written. THIS_COMP should count
+--     1,465 comps, and the other two classes should sit months or years
+--     from the comp's issue date (MEDIAN_DAYS well away from 0). A class
+--     hugging zero would mean the window needs a look before PROD.
+WITH holders AS (
+    SELECT CNUMRW, ISHDRW, PROPERTY_CODE, FIRST_SEEN,
+           LAG(FIRST_SEEN)  OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS PREV_FIRST_SEEN,
+           LEAD(FIRST_SEEN) OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS NEXT_FIRST_SEEN
+    FROM (SELECT CNUMRW, ISHDRW, PROPERTY_CODE, MIN(OPERATION_DATE) AS FIRST_SEEN
+          FROM DAAS_RAW_HETCMS.CMPRW_RAW
+          WHERE PROPERTY_CODE = 'UTU'
+            AND CNUMRW IN (SELECT COMP_NBR FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED)
+          GROUP BY 1, 2, 3)
+),
+lines AS (
+    SELECT e.COMP_NBR, e.ISSUE_DT, r.SEQNRM, r.OPERATION_DATE AS written,
+           CASE WHEN (h.PREV_FIRST_SEEN IS NULL OR r.OPERATION_DATE >= DATEADD(SECOND, -60, h.FIRST_SEEN))
+                 AND (h.NEXT_FIRST_SEEN IS NULL OR r.OPERATION_DATE <  DATEADD(SECOND, -60, h.NEXT_FIRST_SEEN))
+                THEN 'THIS_COMP'
+                WHEN r.OPERATION_DATE < h.FIRST_SEEN THEN 'EARLIER_HOLDER'
+                ELSE 'LATER_HOLDER' END                      AS belongs_to,
+           DATEDIFF(day, e.ISSUE_DT, r.OPERATION_DATE)      AS days_from_issue
+    FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+    JOIN holders h ON h.CNUMRW = e.COMP_NBR AND h.ISHDRW = e.ISHDRW AND h.PROPERTY_CODE = e.PROPERTY_CD
+    JOIN DAAS_RAW_HETCMS.CMPRM_RAW r ON r.CNUMRM = e.COMP_NBR AND r.PROPERTY_CODE = e.PROPERTY_CD
+)
+SELECT belongs_to,
+       COUNT(*)                  AS raw_rows,
+       COUNT(DISTINCT COMP_NBR)  AS comps,
+       MIN(days_from_issue)      AS nearest_days,
+       MEDIAN(days_from_issue)   AS median_days,
+       MAX(days_from_issue)      AS farthest_days
+FROM lines
+GROUP BY 1
+ORDER BY 1;
+
+-- B6. What wrote the fact rows in the slice. One date for all 49,455
+--     means a full rebuild (the HIST proc); a spread of dates means the
+--     daily loads. Decides how to read B3's zero comment changes.
+SELECT OLD_UPDATED_DTTM::DATE          AS last_written,
+       OLD_BATCH_ID,
+       COUNT(*)                        AS comps,
+       COUNT_IF(OLD_COMMENT IS NOT NULL) AS with_comment
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED
+GROUP BY 1, 2
+ORDER BY comps DESC;
+
+-- B7. Reuse exposure in the slice: comps whose number carries comment
+--     lines under more than one guest id in raw. PROD's number-only
+--     match hands each of these the other guest's lines. If this is
+--     well above 0 while B3 showed 0 comment changes, the UAT fact was
+--     already built with a guest match (the v1.13 HIST run), which is
+--     why UAT cannot show the comment fix's before-and-after; PROD's
+--     answer key (07, B3) will.
+SELECT COUNT(*)                                                     AS comps,
+       COUNT_IF(g.guests > 1)                                       AS numbers_with_other_guests_lines,
+       COUNT_IF(g.guests > 1 AND e.OLD_COMMENT IS NOT NULL)         AS of_which_fact_has_a_comment,
+       COUNT_IF(g.guests > 1 AND e.NEW_COMMENT IS NOT NULL)         AS of_which_v114_keeps_a_comment
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+LEFT JOIN (SELECT "CMP#CM" AS CNUMRW, PROPERTY_CODE, COUNT(DISTINCT SYIDCM) AS guests
+           FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
+           WHERE PROPERTY_CODE = 'UTU'
+           GROUP BY 1, 2) g
+  ON g.CNUMRW = e.COMP_NBR AND g.PROPERTY_CODE = e.PROPERTY_CD;
+
+--     (10/22 results and what they settle.
+--      B5: THIS_COMP 2,411 rows / 1,431 numbers, -2 to +6 days from
+--          issue; EARLIER_HOLDER 13,700 rows / 4,051 numbers, 329 to
+--          1,448 days before issue, median 938; no LATER_HOLDER, as the
+--          remarks feed stops a month after the slice. The window rule
+--          holds: every line it set aside was written for a previous
+--          holder of the number, a year to four years earlier.
+--          B3 says 1,465 and B5 says 1,431 because B3 counts fact rows
+--          and B5 distinct numbers; a comp with two outlet rows counts
+--          twice in B3. B5b below confirms.
+--      B6: 13,716 (date, batch) groups: the ordinary daily loads of
+--          March and June 2026, plus rows whose UPDATED_DTTM moved to
+--          10/14 while BATCH_ID stayed. That is the in-place UPDATE of
+--          the 10/13 UAT script, DAASI-3640_comment_fix.sql, which
+--          rewrote only the rows whose comment changed under the
+--          guest-only match.
+--      B7: 3,148 comps sit on numbers carrying other guests' lines; 704
+--          have a comment in the fact and v1.14 keeps those same 704. So
+--          the borrowed text was already stripped on 10/14, B3's zero
+--          comment changes is expected, and UAT cannot show the comment
+--          fix's before-and-after; PROD's answer key (07, B3) will. What
+--          UAT does show: v1.14 agrees with the guest-only match on all
+--          49,455 rows, so nothing the first fix removed comes back.)
+
+-- B5b. The counting unit behind 1,465 vs 1,431.
+SELECT COUNT(*)                                       AS fact_rows,
+       COUNT(DISTINCT COMP_NBR)                       AS comp_numbers,
+       COUNT(DISTINCT COMP_NBR || '-' || ISHDRW)      AS comps
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED
+WHERE NEW_REMARKS IS NOT NULL;
+
+
+/* ---------------------------------------------------------------------
+   C. SMOKE RUN on the empty stream (A3), before anything is bumped
+   C0 is the CALL from part E, run once now. With nothing in the stream
+   the proc writes no fact rows, but it compiles and executes all four
+   statements end to end on UAT, the two new joins included, which is
+   the real test of the deployed text. Its elapsed time is also the
+   fixed cost of any run: the comment and remark subqueries read the
+   whole raw tables no matter what the stream holds, so slice run minus
+   smoke run is the per-comp cost.
+   Expect: a return value as read in part E, C1 = 0, C2 no rows, and
+   one row from C3 with the seconds.
+   --------------------------------------------------------------------- */
+
+-- C0a. Role and warehouse for the CALL. The proc runs as the caller, so
+--      the calling role needs USAGE on the warehouse it names, CREATE
+--      TABLE on DAAS_TEMP plus ownership of the existing TMP table
+--      (CREATE OR REPLACE requires it), INSERT and UPDATE on the fact,
+--      SELECT on the stream, and USAGE on the batch-control procs. The
+--      role that owns UAT's load task has all of that by construction;
+--      use it for the CALL, and switch back to the role that built the
+--      DAAS_TEMP_WORK tables for the F checks.
+--      (10/22: the first CALL, as DAAS_TEAM, failed in the setup lines;
+--      see C0b.)
+SHOW TASKS LIKE 'HETCMS_COMP_DETAIL_FACT_LOAD_HIST_V1_TASK' IN DATABASE DAAS_UAT;
+SELECT "owner" AS task_role, "warehouse" AS task_warehouse
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+SHOW TABLES LIKE 'COMP_DETAIL_FACT_TMP' IN SCHEMA DAAS_UAT.DAAS_TEMP;
+SELECT "owner" AS tmp_table_owner FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+SHOW GRANTS ON WAREHOUSE DAAS_UAT_IT_ADHOC_COMPUTE;      -- the roles with USAGE
+-- USE ROLE <task_role>;
+--      (10/22: task role APP_SERVICE_UAT on DAAS_UAT_IT_ADHOC_COMPUTE;
+--      TMP table owned by DOMAIN_TEMP_ADMIN_UAT; warehouse USAGE reaches
+--      DAAS_TEAM through the AUTH roles, since the worksheet runs on it.
+--      So the setup statement that failed is CREATE OR REPLACE TABLE
+--      DAAS_TEMP.COMP_DETAIL_FACT_TMP: replacing a table takes ownership
+--      of it, and DAAS_TEAM does not own it.)
+
+-- C0c. Finding a role that can run the proc. It needs, all at once:
+--      ownership of DAAS_TEMP.COMP_DETAIL_FACT_TMP (or the domain admin
+--      role that owns it), INSERT and UPDATE on DAAS_CORE.COMP_DETAIL_FACT,
+--      SELECT on the CMPRW_RAW stream, USAGE on the DAAS_COMMON procs and
+--      on the warehouse. APP_SERVICE_UAT has all of it. These show what
+--      you can switch to and what each candidate holds.
+SELECT CURRENT_AVAILABLE_ROLES() AS roles_you_can_use;
+SHOW GRANTS TO ROLE DAAS_UAT_DEVELOPER;                  -- the role you used this morning: does it inherit DOMAIN_TEMP_ADMIN_UAT or APP_SERVICE_UAT?
+SHOW GRANTS ON TABLE DAAS_UAT.DAAS_TEMP.COMP_DETAIL_FACT_TMP;
+SHOW GRANTS ON TABLE DAAS_UAT.DAAS_CORE.COMP_DETAIL_FACT;        -- roles with INSERT and UPDATE
+SHOW GRANTS ON TABLE DAAS_UAT.DAAS_RAW_HETCMS.CMPRW_RAW;          -- roles with UPDATE: part D needs one, and PROD day needs the PROD equivalent
+--      (10/22 findings. Owners: TMP table DOMAIN_TEMP_ADMIN_UAT; fact
+--      DEVOPS_SERVICE_UAT (the deploy pipeline's role); CMPRW_RAW
+--      DAAS_HVR_INGESTION_UAT. DML on all three: APP_SERVICE_UAT,
+--      DAAS_UAT_DEVELOPER, DAAS_DATA_SCRAMBLER_PROD. DAAS_TEAM is on
+--      none of the lists itself, so whatever it has comes by
+--      inheritance. Neither DAAS_TEAM nor DAAS_UAT_DEVELOPER owns the
+--      TMP table, so neither can run the proc; both can run part D,
+--      since DAAS_UAT_DEVELOPER holds UPDATE on CMPRW_RAW. None of the
+--      service or domain-admin roles is in CURRENT_AVAILABLE_ROLES.
+--      Route: the task below, owned by APP_SERVICE_UAT.)
+--      Who holds APP_SERVICE_UAT, and what it inherits (DAAS_SNOWFLAKE_ACCTUSAGE
+--      or RBAC_READER can read these), so the ask goes to the right people:
+--          SELECT grantee_name, granted_to
+--          FROM SNOWFLAKE.ACCOUNT_USAGE.GRANTS_TO_USERS
+--          WHERE role = 'APP_SERVICE_UAT' AND deleted_on IS NULL;
+--          SELECT name AS inherited_role
+--          FROM SNOWFLAKE.ACCOUNT_USAGE.GRANTS_TO_ROLES
+--          WHERE grantee_name = 'APP_SERVICE_UAT' AND granted_on = 'ROLE' AND deleted_on IS NULL;
+--      If a role of yours reaches DOMAIN_TEMP_ADMIN_UAT (and the rest):
+--          USE ROLE <that role>;   then C0.
+--      If none does, ask the Snowflake admins (the AUTH SNOWFLAKE ADMIN
+--      group) for either a day's grant of APP_SERVICE_UAT to your user,
+--      or this one-off task, owned by APP_SERVICE_UAT, which runs the
+--      proc as the task role while you keep your own. OPERATE lets you
+--      fire it; it has no schedule, so it never runs on its own.
+--      Admin runs (as APP_SERVICE_UAT or above):
+--          CREATE TASK DAAS_UAT.DAAS_COMMON.DAASI3640_UAT_REPLAY_TASK
+--            WAREHOUSE = DAAS_UAT_IT_ADHOC_COMPUTE
+--            COMMENT = 'DAASI-3640 UAT replay, manual runs only; drop after the test'
+--          AS CALL DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(36400001, 'DAASI3640_UAT', 'DAAS_UAT_IT_ADHOC_COMPUTE', '', '');
+--          GRANT OPERATE ON TASK DAAS_UAT.DAAS_COMMON.DAASI3640_UAT_REPLAY_TASK TO ROLE DAAS_TEAM;
+--          -- and, if OPERATE alone does not let DAAS_TEAM fire it:
+--          -- GRANT EXECUTE TASK ON ACCOUNT TO ROLE DAAS_TEAM;
+--      You run, for the smoke run and again for the slice run:
+--          EXECUTE TASK DAAS_UAT.DAAS_COMMON.DAASI3640_UAT_REPLAY_TASK;
+--          SELECT name, state, scheduled_time, completed_time, error_message
+--          FROM TABLE(DAAS_UAT.INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME => 'DAASI3640_UAT_REPLAY_TASK'))
+--          ORDER BY scheduled_time DESC;
+--      C1-C3 and F4 read the same way either route; the CALL text in C3
+--      and F4(a) matches the task's CALL too.
+--      No-admin fallback: DAASI-3640_06b_uat_manual_run.sql runs the
+--      proc's four statements by hand as DAAS_UAT_DEVELOPER against a
+--      TMP table that role owns. Order then: 06b (smoke), D here, 06b
+--      (slice), F1-F3, F5, F6 here, timing from 06b part 4 instead of
+--      F4(a). It proves the SQL, not the proc wrapper, so one
+--      task-driven run is still wanted before PROD.
+
+-- C0. The smoke run itself. Same statement as part E; see E for the
+--     warehouse choice and how to read the return value.
+CALL DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(36400001, 'DAASI3640_UAT', 'DAAS_UAT_IT_ADHOC_COMPUTE', '', '');
+ALTER SESSION UNSET QUERY_TAG;
+
+-- C0b. If the CALL fails with "Proc_Step is not defined": that is the
+--      proc's own error handler tripping over its step variable, which
+--      is first assigned only after the setup statements have passed
+--      (a pre-existing flaw in the proc template, PROD included: any
+--      failure in USE WAREHOUSE, ALTER SESSION SET QUERY_TAG or CREATE
+--      OR REPLACE TABLE DAAS_TEMP.COMP_DETAIL_FACT_TMP crashes the
+--      catch block and the batch error log never gets the real message).
+--      The real failure is in your own query history:
+SELECT start_time, LEFT(query_text, 150) AS statement_start,
+       error_code, error_message, role_name, warehouse_name
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_USER(RESULT_LIMIT => 500))
+WHERE start_time > DATEADD(minute, -60, CURRENT_TIMESTAMP())
+  AND error_code IS NOT NULL
+ORDER BY start_time DESC;
+
+-- C1. No fact row carries the test batch id.
+SELECT COUNT(*) AS rows_with_test_batch
+FROM DAAS_CORE.COMP_DETAIL_FACT
+WHERE BATCH_ID = 36400001;
+
+-- C2. Nothing failed under the proc's query tag (run again after part E).
+SELECT start_time, LEFT(query_text, 120) AS statement_start,
+       error_code, error_message, ROUND(total_elapsed_time / 1000) AS seconds
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(RESULT_LIMIT => 10000))
+WHERE query_tag = '36400001_HETCMS_COMP_DETAIL_FACT_LOAD_PROC'
+  AND error_code IS NOT NULL
+ORDER BY start_time;
+
+-- C3. Proof the CALL ran, and how long it took: one row per CALL so far.
+--     No rows means the smoke run has not happened yet.
+SELECT start_time, ROUND(total_elapsed_time / 1000) AS seconds, execution_status
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(RESULT_LIMIT => 10000))
+WHERE query_text ILIKE 'CALL DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(36400001%'
+ORDER BY start_time;
+
+
+/* ---------------------------------------------------------------------
+   D. THE BUMP: one UPDATE on the raw comp table
+   Adds 1 to REPLAY_COUNTER on the latest version of each comp in the
+   slice. The stream records each as an update; the proc reads the new
+   image as an INSERT and rebuilds the comp from raw with the v1.14 joins.
+   No business column changes.
+   --------------------------------------------------------------------- */
+UPDATE DAAS_RAW_HETCMS.CMPRW_RAW R
+SET REPLAY_COUNTER = COALESCE(R.REPLAY_COUNTER, 0) + 1
+FROM DAAS_TEMP_WORK.DAASI3640_RP_SLICE S
+WHERE R.CNUMRW                 = S.CNUMRW
+  AND R.ISHDRW                 = S.ISHDRW
+  AND R.COTLRW                 = S.COTLRW
+  AND R.PROPERTY_CODE          = S.PROPERTY_CODE
+  AND R.OPERATION_DATE         = S.OPERATION_DATE
+  AND R.OPERATION_SEQUENCE_NBR = S.OPERATION_SEQUENCE_NBR
+  AND R.CREATED_DATE IS NOT DISTINCT FROM S.CREATED_DATE;
+
+-- "number of rows updated" should equal RAW_ROWS_TO_BUMP. Then:
+SELECT SYSTEM$STREAM_HAS_DATA('DAAS_RAW_HETCMS.CMPRW_RAW_COMP_DETAIL_STREAM') AS has_data;   -- TRUE
+SELECT COUNT(*) AS rows_in_stream FROM DAAS_RAW_HETCMS.CMPRW_RAW_COMP_DETAIL_STREAM;         -- 2 x the bump (delete + insert per row)
+
+
+/* ---------------------------------------------------------------------
+   E. RUN THE LOAD
+   UAT has no task for the daily proc, so call it directly. The third
+   argument is the warehouse the proc switches to with USE WAREHOUSE, so
+   it must be one your role can use: DAAS_UAT_IT_ADHOC_COMPUTE is what
+   UAT's own task uses, DAAS_PROD_IT_COMPUTE is what the worksheet is on.
+   Use the largest one you can: the comment and remark subqueries read
+   all 462M raw comp rows and the merge runs against a 190M-row fact.
+   Note the clock when it starts and when it returns, and the warehouse
+   size (SHOW WAREHOUSES LIKE '...'), since the PROD estimate scales
+   from both. The shard name only goes into batch-control bookkeeping.
+   --------------------------------------------------------------------- */
+CALL DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(36400001, 'DAASI3640_UAT', 'DAAS_UAT_IT_ADHOC_COMPUTE', '', '');
+
+-- The proc sets the session's query tag and never clears it, so without
+-- this every later statement in the worksheet would carry the tag too.
+ALTER SESSION UNSET QUERY_TAG;
+
+/* Reading the return value:
+     SUCCESS
+         everything ran, batch metrics included.
+     SOURCE COUNT METRIC STATUS: ... FAILURE RETURNED FROM METRICS
+         the load committed; only the batch-control procs did not
+         recognise batch 36400001. Fine for this test.
+     FAILURE
+         an exception. If it happened in the data step the proc rolled
+         everything back; if in the metrics step the data stayed. C2 shows
+         the failing statement and message either way. A FAILURE that
+         comes back within a second or two is the USE WAREHOUSE line: pick
+         a warehouse your role can use and call again.                    */
+
+
+/* ---------------------------------------------------------------------
+   F. CHECK THE RESULT
+   --------------------------------------------------------------------- */
+
+-- F1. Fact against the answer key. COMMENT_MISMATCHES and REMARK_MISMATCHES
+--     must be 0. ROWS_REWRITTEN will equal COMPS: MD5_CHECKSUM now includes
+--     the remarks, so every replayed row's checksum changed and the merge
+--     rewrote it, which is expected on this first pass. ACTIVE_ROW_MISSING
+--     counts comps whose active row was soft-deleted because raw's latest
+--     guest differs from the fact's (the guest-change step); expect 0 or
+--     close to it, and a new row for each under the new guest.
+SELECT COUNT(*)                                                           AS comps,
+       COUNT_IF(f.COMP_COMMENTS_DESC IS DISTINCT FROM e.NEW_COMMENT)      AS comment_mismatches,
+       COUNT_IF(f.COMMENTS_EXTENDED  IS DISTINCT FROM e.NEW_REMARKS)      AS remark_mismatches,
+       COUNT_IF(f.UPDATED_DTTM > e.OLD_UPDATED_DTTM)                      AS rows_rewritten,
+       COUNT_IF(f.COMP_NBR IS NULL)                                       AS active_row_missing
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+LEFT JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_NBR         = e.COMP_NBR
+  AND f.ISHDRW           = e.ISHDRW
+  AND f.PROPERTY_CD      = e.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD
+  AND f.DELETE_IND       = 'N';
+
+-- F2. The mismatches themselves, if F1 shows any.
+SELECT e.COMP_NBR, e.PROPERTY_CD, e.GUEST_ID, e.ISSUE_DT,
+       e.OLD_COMMENT, e.NEW_COMMENT AS EXPECTED_COMMENT, f.COMP_COMMENTS_DESC AS FACT_COMMENT,
+       e.OLD_REMARKS, e.NEW_REMARKS AS EXPECTED_REMARKS, f.COMMENTS_EXTENDED  AS FACT_REMARKS
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+LEFT JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_NBR = e.COMP_NBR AND f.ISHDRW = e.ISHDRW AND f.PROPERTY_CD = e.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND f.DELETE_IND = 'N'
+WHERE f.COMP_COMMENTS_DESC IS DISTINCT FROM e.NEW_COMMENT
+   OR f.COMMENTS_EXTENDED  IS DISTINCT FROM e.NEW_REMARKS
+LIMIT 100;
+
+-- F2b. Ten comps that gained remarks, old and new side by side, to read
+--      with your own eyes. For you and Pete, not the ticket: the text can
+--      carry guest names.
+SELECT e.COMP_NBR, e.ISSUE_DT,
+       e.OLD_COMMENT, f.COMP_COMMENTS_DESC AS NEW_COMMENT, f.COMMENTS_EXTENDED AS NEW_REMARKS
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_NBR = e.COMP_NBR AND f.ISHDRW = e.ISHDRW AND f.PROPERTY_CD = e.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND f.DELETE_IND = 'N'
+WHERE e.NEW_REMARKS IS NOT NULL
+ORDER BY LENGTH(e.NEW_REMARKS) DESC
+LIMIT 10;
+
+-- F2c. Ten comps whose old comment moved or went away: the reuse defect
+--      being undone (the old text belonged to another guest's comp on the
+--      same number).
+SELECT e.COMP_NBR, e.GUEST_ID, e.ISSUE_DT,
+       e.OLD_COMMENT, f.COMP_COMMENTS_DESC AS NEW_COMMENT
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_NBR = e.COMP_NBR AND f.ISHDRW = e.ISHDRW AND f.PROPERTY_CD = e.PROPERTY_CD
+  AND f.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND f.DELETE_IND = 'N'
+WHERE e.OLD_COMMENT IS NOT NULL
+  AND e.NEW_COMMENT IS DISTINCT FROM e.OLD_COMMENT
+LIMIT 10;
+
+-- F3. Drift: a replayed comp is rebuilt entirely under today's logic, so
+--     any column whose logic changed since the row was last loaded moves
+--     too. This counts the ones that matter against the backup. Nonzero
+--     is information, not failure; it tells you what else the PROD run
+--     will touch. (In UAT, where the fact may be well behind raw, expect
+--     more of this than PROD will show.)
+SELECT COUNT(*)                                                      AS comps,
+       COUNT_IF(f.GUEST_ID          <> b.GUEST_ID)                    AS guest_changed,
+       COUNT_IF(f.DELETE_IND        <> b.DELETE_IND)                  AS delete_ind_changed,
+       COUNT_IF(f.COMP_CATEGORY     IS DISTINCT FROM b.COMP_CATEGORY) AS comp_category_changed,
+       COUNT_IF(f.COMPOR_NAME       IS DISTINCT FROM b.COMPOR_NAME)   AS compor_name_changed,
+       COUNT_IF(f.ISSUE_COMP_WORTH_AMT IS DISTINCT FROM b.ISSUE_COMP_WORTH_AMT) AS worth_changed,
+       COUNT_IF(f.REDEEM_DTTM       IS DISTINCT FROM b.REDEEM_DTTM)   AS redeem_dttm_changed
+FROM DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+JOIN DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+  ON  e.COMP_NBR = b.COMP_NBR AND e.ISHDRW = b.ISHDRW AND e.PROPERTY_CD = b.PROPERTY_CD
+  AND e.CASINO_OUTLET_CD = b.CASINO_OUTLET_CD
+JOIN DAAS_CORE.COMP_DETAIL_FACT f
+  ON  f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK;
+
+-- F4. Runtime. (a) One row per CALL: the smoke run (part C) and the
+--     slice run (part E); SECONDS is the whole proc.
+--     (slice SECONDS - smoke SECONDS) / 60 = minutes for the slice;
+--     COMPS / that = comps per minute. PROD has about 7.7 million to do,
+--     on top of the fixed cost.
+SELECT start_time                          AS started,
+       end_time                            AS finished,
+       ROUND(total_elapsed_time / 1000)    AS seconds,
+       execution_status,
+       LEFT(query_text, 80)                AS call_text
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(RESULT_LIMIT => 10000))
+WHERE query_text ILIKE 'CALL DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(36400001%'
+ORDER BY start_time;
+
+--     (b) The two heavy statements of each run, with the warehouse and
+--     size they ran on (what the PROD estimate scales from). By text,
+--     not tag, so it works for the task route and the 06b route alike.
+SELECT start_time, LEFT(LTRIM(query_text, ' \t\n\r'), 60) AS statement_start,
+       warehouse_name, warehouse_size,
+       ROUND(total_elapsed_time / 1000)    AS seconds,
+       rows_produced, execution_status
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_USER(RESULT_LIMIT => 2000))
+WHERE start_time > DATEADD(hour, -12, CURRENT_TIMESTAMP())
+  AND query_type <> 'SELECT'
+  AND (query_text ILIKE '%INSERT INTO DAAS_TEMP%COMP_DETAIL_FACT_TMP%'
+       OR query_text ILIKE '%MERGE INTO DAAS_CORE.COMP_DETAIL_FACT%')
+ORDER BY start_time;
+
+-- F5. Tracy's UTU comp, only meaningful if the slice is UTU and holds it.
+--     Expect comment "$95" and remarks "$95 BASED ON PLAY|PER HUAIBI LI".
+SELECT COMP_NBR, GUEST_ID, ISSUE_DT, COMP_COMMENTS_DESC, COMMENTS_EXTENDED, UPDATED_DTTM, BATCH_ID
+FROM DAAS_CORE.COMP_DETAIL_FACT
+WHERE PROPERTY_CD = 'UTU' AND COMP_NBR = 7009616 AND DELETE_IND = 'N'
+ORDER BY ISSUE_DT;
+
+-- F6. The dynamic table against the same answer key. Both counts 0.
+--     This one can run right after B2, before the bump: the DT reads raw,
+--     not the fact.
+ALTER DYNAMIC TABLE DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT REFRESH;
+SELECT COUNT(*)                                                      AS comps,
+       COUNT_IF(d.COMP_COMMENTS_DESC IS DISTINCT FROM e.NEW_COMMENT) AS comment_mismatches,
+       COUNT_IF(d.COMMENTS_EXTENDED  IS DISTINCT FROM e.NEW_REMARKS) AS remark_mismatches
+FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+LEFT JOIN DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT d
+  ON  d.COMP_NBR = e.COMP_NBR AND d.ISHDRW = e.ISHDRW AND d.PROPERTY_CD = e.PROPERTY_CD
+  AND d.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND d.DELETE_IND = 'N';
+
+
+/* ---------------------------------------------------------------------
+   G. UNDO (UAT only; not part of the test)
+   Puts the slice back exactly as it was from the backup clone.
+   ---------------------------------------------------------------------
+UPDATE DAAS_CORE.COMP_DETAIL_FACT f
+SET COMP_COMMENTS_DESC = b.COMP_COMMENTS_DESC,
+    COMMENTS_EXTENDED  = b.COMMENTS_EXTENDED,
+    UPDATED_DTTM       = b.UPDATED_DTTM,
+    UPDATED_BY         = b.UPDATED_BY,
+    BATCH_ID           = b.BATCH_ID,
+    LAST_DML_CD        = b.LAST_DML_CD,
+    MD5_CHECKSUM       = b.MD5_CHECKSUM
+FROM DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+JOIN DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+  ON  e.COMP_NBR = b.COMP_NBR AND e.ISHDRW = b.ISHDRW AND e.PROPERTY_CD = b.PROPERTY_CD
+  AND e.CASINO_OUTLET_CD = b.CASINO_OUTLET_CD
+WHERE f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK;
+--------------------------------------------------------------------- */
