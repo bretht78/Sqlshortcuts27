@@ -14,8 +14,10 @@
    before PROD.
 
    Use: once as the smoke run (stream empty, nothing written), then
-   after the bump (06 part D) as the slice run. Then 06 parts F1-F3,
-   F5, F6 as written; timing from part 4 below instead of F4(a).
+   after the bump (06 part D) as the slice run, from step 2 if the
+   worksheet session is the same, from step 1 if not. Then 06 parts
+   F1-F3, F5, F6 as written; timing from part 4 below instead of F4(a).
+   (10/26: smoke run passed as DAAS_TEAM: four statements, 0 rows, COMMIT.)
 
    Run it in one worksheet, top to bottom, with "Run all" or one
    statement at a time in order; the BEGIN ... COMMIT must stay in one
@@ -965,16 +967,23 @@ WHERE BATCH_ID = 36400001;
 
 ALTER SESSION UNSET QUERY_TAG;
 
---    One row per run of this file (runs split on the TMP rebuild), with
---    the time from the TMP rebuild to the COMMIT. Smoke run first, slice
---    run second; slice minus smoke is the per-slice cost.
+--    Timing, from your own query history and by statement text, so it
+--    works whether or not the tag took. Text matches carry a leading
+--    wildcard because Snowsight sends the comment line above a
+--    statement along with it. One row per run of this file; runs
+--    split on the TMP rebuild. Smoke run first, slice run second;
+--    slice minus smoke is the per-slice cost.
 WITH q AS (
     SELECT start_time, end_time, query_text, warehouse_name, warehouse_size,
-           SUM(IFF(query_text ILIKE 'CREATE OR REPLACE TABLE DAAS_TEMP_WORK.COMP_DETAIL_FACT_TMP_DAASI3640%', 1, 0))
+           SUM(IFF(query_text ILIKE '%CREATE OR REPLACE TABLE DAAS_TEMP_WORK.COMP_DETAIL_FACT_TMP_DAASI3640%', 1, 0))
                OVER (ORDER BY start_time ROWS UNBOUNDED PRECEDING) AS run_nbr
-    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(RESULT_LIMIT => 10000))
-    WHERE query_tag = '36400001_HETCMS_COMP_DETAIL_FACT_LOAD_PROC'
-      AND start_time > DATEADD(hour, -12, CURRENT_TIMESTAMP())
+    FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_USER(RESULT_LIMIT => 2000))
+    WHERE start_time > DATEADD(hour, -12, CURRENT_TIMESTAMP())
+      AND query_type <> 'SELECT'                   -- keeps these timing queries out of their own result
+      AND (query_text ILIKE '%CREATE OR REPLACE TABLE DAAS_TEMP_WORK.COMP_DETAIL_FACT_TMP_DAASI3640%'
+           OR query_text ILIKE '%INSERT INTO DAAS_TEMP_WORK.COMP_DETAIL_FACT_TMP_DAASI3640%'
+           OR query_text ILIKE '%UPDATE DAAS_CORE.COMP_DETAIL_FACT%'
+           OR query_text ILIKE '%MERGE INTO DAAS_CORE.COMP_DETAIL_FACT%')
 )
 SELECT run_nbr,
        MIN(start_time)                                   AS started,
@@ -988,12 +997,17 @@ WHERE run_nbr > 0
 GROUP BY run_nbr
 ORDER BY run_nbr;
 
---    The two heavy statements of each run on their own.
-SELECT start_time, LEFT(LTRIM(query_text, ' \t\n\r'), 45) AS statement_start,
-       ROUND(total_elapsed_time / 1000) AS seconds, rows_inserted, rows_updated
-FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(RESULT_LIMIT => 10000))
-WHERE query_tag = '36400001_HETCMS_COMP_DETAIL_FACT_LOAD_PROC'
-  AND (query_text ILIKE '%INSERT INTO DAAS_TEMP_WORK.COMP_DETAIL_FACT_TMP_DAASI3640%'
+--    Each statement of each run on its own: seconds and rows. The
+--    INSERT's seconds on the smoke run is the fixed cost of a run.
+SELECT start_time, LEFT(LTRIM(query_text, ' \t\n\r'), 60) AS statement_start,
+       ROUND(total_elapsed_time / 1000)                  AS seconds,
+       rows_produced, execution_status, warehouse_size
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_USER(RESULT_LIMIT => 2000))
+WHERE start_time > DATEADD(hour, -12, CURRENT_TIMESTAMP())
+  AND query_type <> 'SELECT'
+  AND (query_text ILIKE '%CREATE OR REPLACE TABLE DAAS_TEMP_WORK.COMP_DETAIL_FACT_TMP_DAASI3640%'
+       OR query_text ILIKE '%INSERT INTO DAAS_TEMP_WORK.COMP_DETAIL_FACT_TMP_DAASI3640%'
+       OR query_text ILIKE '%UPDATE DAAS_CORE.COMP_DETAIL_FACT%'
        OR query_text ILIKE '%MERGE INTO DAAS_CORE.COMP_DETAIL_FACT%')
 ORDER BY start_time;
 
