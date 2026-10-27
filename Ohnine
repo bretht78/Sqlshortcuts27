@@ -1,214 +1,157 @@
 /* =====================================================================
-   DAASI-3640 | UAT close-out: every query left to run, in order
-   All read-only. Run as DAAS_TEAM in UAT on any warehouse; the Large
-   you used last night is fine. Each part says what to expect. Send the
-   results as you get them.
+   DAASI-3640 | UAT close-out, part 2 (10/27)
+   What this morning's results settled, and what they opened.
 
-   Parts:
-     1  E5's decisive column, and the rows behind it if any
-     2  F7 and F7b: the 209 soft-deleted comps explained
-     3  F8: what kind of change the host names took
-     4  The query profile of the 333-second INSERT, as a result set
-     5  E5 in PROD, read-only: the before picture of the comment defect
-     6  The task-driven smoke run, once the admins have created the task
+   Settled:
+     E5 (UAT)   0 comps show another guest's note; no offending rows.
+     E5 (PROD)  16,780 of 49,455 UTU March 2026 comps show another
+                guest's note in the report today (34%). The before picture.
+     F7         the 209 soft-deleted comps are all CMS deletions
+                (operation type 0) by CMG0010 (167) and HCGC2000 (42),
+                programs outside the purge list; no guest changes.
+
+   Opened:
+     F7b        the deletions are dated 2026-03-03 to 04-03, while the
+                UAT fact's daily loads were running (its rows for the
+                month were created 03-01 to 03-30). So the loads SAW
+                the deletions and did not apply them. Part 7 shows why,
+                and sizes it in PROD.
+     F8         not formula drift: 34,459 rows went from blank to a
+                name and 14,983 to a different person's name. Part 8
+                finds the source of the new names in UAT and, more to
+                the point, computes what a PROD replay would do to
+                COMPOR_NAME without replaying anything.
+     Profile    my percentage column was wrong (the field is a fraction,
+                not a percent, and ROUND to one place flattened it).
+                The row counts still told the main story: the proc's
+                lookups turn 49,455 comps into 80,858,925 intermediate
+                rows before the final window function cuts them back,
+                a fan-out of about 1,635 per comp. Part 9 reruns the
+                profile properly and checks the two lookups that could
+                do that.
+   All read-only. Run as DAAS_TEAM on the Large.
    ===================================================================== */
 
 USE DATABASE DAAS_UAT;
 
 
 /* =====================================================================
-   1. E5: NO COMP SHOWS ANOTHER GUEST'S NOTE (decisive column first)
-   Expect: 0 | 17,406 | 49,246
+   7. WHY THE DAILY LOAD DID NOT APPLY THE 209 DELETIONS
+   From the proc text, no query needed: DELETE_IND is not among the
+   columns in MD5_CHECKSUM, and the MERGE updates an existing row only
+   WHEN MATCHED AND FACT.MD5_CHECKSUM <> SRC.MD5_CHECKSUM. The second
+   statement only reactivates (sets 'N'); the third only handles guest
+   changes. So a CMS delete row that carries the comp's unchanged
+   business columns produces the same checksum as the row already in
+   the fact, and nothing fires: the comp stays DELETE_IND = 'N'. The
+   replay applied the deletions only because v1.14 changed the checksum
+   formula, which forced every replayed row through the update.
+   This is a pre-existing defect in the load, PROD included: a comp
+   deleted in CMS stays active in the fact (and the report) unless some
+   other column changed on the same row. One line fixes it (add
+   DELETE_IND to the MD5 formula in the daily proc, the HIST proc and
+   the DT); whether that rides with v1.14 or gets its own ticket is
+   Pete's call. 7a and 7b are the evidence; 7c sizes PROD.
    ===================================================================== */
-WITH slice AS (
-    SELECT COMP_NBR, ISHDRW, PROPERTY_CD, GUEST_ID, COMP_COMMENTS_DESC
-    FROM DAAS_CORE.COMP_DETAIL_FACT
-    WHERE DELETE_IND = 'N' AND SOURCE_SYSTEM_NM = 'HETCMS'
-      AND PROPERTY_CD = 'UTU' AND ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
-),
-holders AS (     -- every guest who ever held each comp
-    SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
-    FROM DAAS_RAW_HETCMS.CMPRW_RAW
-    WHERE PROPERTY_CODE = 'UTU' AND CNUMRW IN (SELECT COMP_NBR FROM slice)
-),
-lines AS (       -- latest version of every comment line on these numbers, with the guest it was written under
-    SELECT "CMP#CM" AS CNUMRW, PROPERTY_CODE, SYIDCM, CSEQCM, CMNTCM
-    FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
-    WHERE PROPERTY_CODE = 'UTU' AND "CMP#CM" IN (SELECT COMP_NBR FROM slice)
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
-            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
-),
-own_lines AS (   -- lines under a holder of the comp
-    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
-    FROM slice s
-    JOIN lines l   ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
-    JOIN holders h ON h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM
-),
-foreign_lines AS (   -- lines under someone who never held the comp, and not also written by a holder
-    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
-    FROM slice s
-    JOIN lines l ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
-    WHERE NOT EXISTS (SELECT 1 FROM holders h
-                      WHERE h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM)
-      AND NOT EXISTS (SELECT 1 FROM own_lines o
-                      WHERE o.COMP_NBR = s.COMP_NBR AND o.ISHDRW = s.ISHDRW AND o.CMNTCM = l.CMNTCM)
-),
-fact_lines AS (  -- the comment the fact shows, one row per line
-    SELECT s.COMP_NBR, s.ISHDRW, x.VALUE::VARCHAR AS line
-    FROM slice s, LATERAL FLATTEN(INPUT => SPLIT(s.COMP_COMMENTS_DESC, '|')) x
-    WHERE s.COMP_COMMENTS_DESC IS NOT NULL
-)
-SELECT COUNT(DISTINCT fl.COMP_NBR || '-' || fl.ISHDRW)                        AS comps_showing_another_guests_line,
-       (SELECT COUNT(DISTINCT COMP_NBR || '-' || ISHDRW) FROM foreign_lines)  AS comps_whose_number_has_other_guests_lines_in_cms,
-       (SELECT COUNT(*) FROM slice)                                          AS comps_in_slice
-FROM fact_lines fl
-JOIN foreign_lines fo
-  ON  fo.COMP_NBR = fl.COMP_NBR AND fo.ISHDRW = fl.ISHDRW AND fo.CMNTCM = fl.line;
 
---    The offending rows, if the first column was not 0. Expect no rows.
-WITH slice AS (
-    SELECT COMP_NBR, ISHDRW, PROPERTY_CD, GUEST_ID, COMP_COMMENTS_DESC
-    FROM DAAS_CORE.COMP_DETAIL_FACT
-    WHERE DELETE_IND = 'N' AND SOURCE_SYSTEM_NM = 'HETCMS'
-      AND PROPERTY_CD = 'UTU' AND ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
-),
-holders AS (     -- every guest who ever held each comp
-    SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
-    FROM DAAS_RAW_HETCMS.CMPRW_RAW
-    WHERE PROPERTY_CODE = 'UTU' AND CNUMRW IN (SELECT COMP_NBR FROM slice)
-),
-lines AS (       -- latest version of every comment line on these numbers, with the guest it was written under
-    SELECT "CMP#CM" AS CNUMRW, PROPERTY_CODE, SYIDCM, CSEQCM, CMNTCM
-    FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
-    WHERE PROPERTY_CODE = 'UTU' AND "CMP#CM" IN (SELECT COMP_NBR FROM slice)
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
-            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
-),
-own_lines AS (   -- lines under a holder of the comp
-    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
-    FROM slice s
-    JOIN lines l   ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
-    JOIN holders h ON h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM
-),
-foreign_lines AS (   -- lines under someone who never held the comp, and not also written by a holder
-    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
-    FROM slice s
-    JOIN lines l ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
-    WHERE NOT EXISTS (SELECT 1 FROM holders h
-                      WHERE h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM)
-      AND NOT EXISTS (SELECT 1 FROM own_lines o
-                      WHERE o.COMP_NBR = s.COMP_NBR AND o.ISHDRW = s.ISHDRW AND o.CMNTCM = l.CMNTCM)
-),
-fact_lines AS (  -- the comment the fact shows, one row per line
-    SELECT s.COMP_NBR, s.ISHDRW, x.VALUE::VARCHAR AS line
-    FROM slice s, LATERAL FLATTEN(INPUT => SPLIT(s.COMP_COMMENTS_DESC, '|')) x
-    WHERE s.COMP_COMMENTS_DESC IS NOT NULL
-)
-SELECT fl.COMP_NBR, fl.ISHDRW, fl.line AS another_guests_line_showing
-FROM fact_lines fl
-JOIN foreign_lines fo
-  ON  fo.COMP_NBR = fl.COMP_NBR AND fo.ISHDRW = fl.ISHDRW AND fo.CMNTCM = fl.line
-ORDER BY fl.COMP_NBR
-LIMIT 20;
+-- 7a. Loads were running on the deletion days: UTU fact rows written
+--     per day through March and early April 2026, from the backup.
+--     Expect rows on every business day.
+SELECT UPDATED_DTTM::DATE AS load_day, COUNT(*) AS rows_written, COUNT(DISTINCT BATCH_ID) AS batches
+FROM DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY
+WHERE PROPERTY_CD = 'UTU' AND SOURCE_SYSTEM_NM = 'HETCMS'
+  AND UPDATED_DTTM BETWEEN '2026-03-01' AND '2026-04-10'
+GROUP BY 1
+ORDER BY 1;
 
-
-/* =====================================================================
-   2. F7 / F7b: WHY 209 COMPS LOST THEIR ACTIVE ROW
-   Expect in F7: every 'lost active row' line has RULE_DELETE_IND = 'Y',
-   OPERATION_TYPE 0 (or 5/8) and a program that is not in the purge
-   list; every 'still active' line has 'N'; GUEST_DIFFERS 0 throughout.
-   Expect in F7b: the deletion months after the UAT fact's last daily
-   load (June 2026 or later), with AFTER_FACT_ROW_CREATED equal to COMPS.
-   ===================================================================== */
--- F7. Why comps lose their active row. The proc's own DELETE_IND rule,
---     applied to the latest raw row of every comp in the slice (the row
---     the bump touched), next to what the fact shows now. Expect every
---     'lost active row' comp to come out RULE_DELETE_IND = 'Y' from a
---     delete-type operation (0, 5, 8) by a program outside
---     PURGE_PROGRAM_NM_LKP, and every 'still active' comp to come out
---     'N'. Then the replay applied deletions the pipeline would have
---     applied anyway, and the only question is why the UAT fact had not:
---     F7b answers that with dates.
-CREATE OR REPLACE TRANSIENT TABLE DAAS_TEMP_WORK.DAASI3640_RP_LATEST AS
-SELECT s.CNUMRW, s.ISHDRW, s.COTLRW, s.PROPERTY_CODE,
-       r.OPERATION_TYPE, TRIM(r.PROGRAM_NAME) AS program, r.OPERATION_DATE, r.SYIDRW,
-       CASE WHEN TRIM(r.PROGRAM_NAME) = 'QRYO04' AND r.OPERATION_TYPE IN (0, 5, 8) THEN 'N'
-            WHEN p.PROGRAM_NM IS NOT NULL                                           THEN 'N'
-            WHEN r.OPERATION_TYPE IN (0, 5, 8)                                      THEN 'Y'
-            ELSE 'N' END                                                            AS rule_delete_ind
-FROM DAAS_TEMP_WORK.DAASI3640_RP_SLICE s
-JOIN DAAS_RAW_HETCMS.CMPRW_RAW r
-  ON  r.CNUMRW = s.CNUMRW AND r.ISHDRW = s.ISHDRW AND r.COTLRW = s.COTLRW AND r.PROPERTY_CODE = s.PROPERTY_CODE
-  AND r.OPERATION_DATE = s.OPERATION_DATE AND r.OPERATION_SEQUENCE_NBR = s.OPERATION_SEQUENCE_NBR
-  AND r.CREATED_DATE IS NOT DISTINCT FROM s.CREATED_DATE
-LEFT JOIN DAAS_COMMON.PURGE_PROGRAM_NM_LKP p
-  ON  r.SOURCE_SYSTEM_NAME = p.SOURCE_SYSTEM_NM AND r.PROPERTY_CODE = p.PROPERTY_CD
-  AND UPPER(TRIM(r.PROGRAM_NAME)) = UPPER(TRIM(p.PROGRAM_NM));
-
-SELECT IFF(f.COMP_NBR IS NULL, 'lost active row', 'still active')          AS fact_now,
-       l.rule_delete_ind, l.OPERATION_TYPE, l.program,
-       COUNT(*)                                                             AS comps,
-       MIN(l.OPERATION_DATE)::DATE                                          AS earliest_raw_row,
-       MAX(l.OPERATION_DATE)::DATE                                          AS latest_raw_row,
-       COUNT_IF(l.SYIDRW <> e.GUEST_ID)                                     AS guest_differs,
-       COUNT_IF(e.NEW_COMMENT IS NOT NULL)                                  AS with_comment,
-       COUNT_IF(e.NEW_REMARKS IS NOT NULL)                                  AS with_remarks
-FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
-JOIN DAAS_TEMP_WORK.DAASI3640_RP_LATEST l
-  ON  l.CNUMRW = e.COMP_NBR AND l.ISHDRW = e.ISHDRW AND l.COTLRW = e.CASINO_OUTLET_CD AND l.PROPERTY_CODE = e.PROPERTY_CD
-LEFT JOIN DAAS_CORE.COMP_DETAIL_FACT f
-  ON  f.COMP_NBR = e.COMP_NBR AND f.ISHDRW = e.ISHDRW AND f.PROPERTY_CD = e.PROPERTY_CD
-  AND f.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND f.DELETE_IND = 'N'
-GROUP BY 1, 2, 3, 4
-ORDER BY fact_now, comps DESC;
-
--- F7b. When those deletions reached raw, by month, next to when the fact
---      row was first loaded. Deletions dated after the UAT fact's last
---      daily load (B6: June 2026) are the UAT fact being behind UAT's
---      raw, which PROD's daily loads do not let happen.
-SELECT DATE_TRUNC('month', l.OPERATION_DATE)::DATE                          AS deletion_month,
-       COUNT(*)                                                             AS comps,
-       COUNT_IF(l.OPERATION_DATE > b.CREATED_DTTM)                          AS after_fact_row_created,
-       MIN(b.CREATED_DTTM)::DATE                                            AS fact_rows_created_from,
-       MAX(b.CREATED_DTTM)::DATE                                            AS fact_rows_created_to
+-- 7b. The 209 themselves: the fact row was last written BEFORE the
+--     deletion reached raw, and never again until the replay. Expect
+--     WRITTEN_AFTER_DELETION = 0.
+SELECT COUNT(*)                                                       AS deleted_comps,
+       COUNT_IF(b.UPDATED_DTTM >= l.OPERATION_DATE)                   AS written_after_deletion,
+       COUNT_IF(b.UPDATED_DTTM <  l.OPERATION_DATE)                   AS untouched_since_before_deletion,
+       MIN(DATEDIFF(day, b.UPDATED_DTTM, l.OPERATION_DATE))           AS min_days_between,
+       MAX(DATEDIFF(day, b.UPDATED_DTTM, l.OPERATION_DATE))           AS max_days_between
 FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
 JOIN DAAS_TEMP_WORK.DAASI3640_RP_LATEST l
   ON  l.CNUMRW = e.COMP_NBR AND l.ISHDRW = e.ISHDRW AND l.COTLRW = e.CASINO_OUTLET_CD AND l.PROPERTY_CODE = e.PROPERTY_CD
 JOIN DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
   ON  b.COMP_NBR = e.COMP_NBR AND b.ISHDRW = e.ISHDRW AND b.PROPERTY_CD = e.PROPERTY_CD
   AND b.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND b.GUEST_ID = e.GUEST_ID AND b.DELETE_IND = 'N'
-WHERE l.rule_delete_ind = 'Y'
-GROUP BY 1
-ORDER BY 1;
+WHERE l.rule_delete_ind = 'Y';
+
+-- 7c. PROD: how many active comps CMS has deleted. The proc's own
+--     DELETE_IND rule on the latest raw row of every active HETCMS comp
+--     in the fact, counted where it says 'Y'. Reads all of CMPRW_RAW
+--     once (a few minutes on the Large). This is the number the replay
+--     would soft-delete if every such comp were replayed, and the size
+--     of the defect either way. The second result shows the shape by
+--     program and year.
+USE DATABASE DAAS_PROD;
+
+CREATE OR REPLACE TRANSIENT TABLE DAAS_TEMP_WORK.DAASI3640_PROD_STUCK_DELETES AS
+WITH latest AS (
+    SELECT CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE, SYIDRW, OPERATION_TYPE, TRIM(PROGRAM_NAME) AS program,
+           SOURCE_SYSTEM_NAME, OPERATION_DATE
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+)
+SELECT f.COMP_DETAIL_FACT_SK, f.COMP_NBR, f.ISHDRW, f.PROPERTY_CD, f.CASINO_OUTLET_CD, f.GUEST_ID, f.ISSUE_DT,
+       f.UPDATED_DTTM AS fact_last_written, l.OPERATION_TYPE, l.program, l.OPERATION_DATE AS deleted_at,
+       l.SYIDRW <> f.GUEST_ID AS guest_differs
+FROM DAAS_CORE.COMP_DETAIL_FACT f
+JOIN latest l
+  ON  l.CNUMRW = f.COMP_NBR AND l.ISHDRW = f.ISHDRW AND l.COTLRW = f.CASINO_OUTLET_CD AND l.PROPERTY_CODE = f.PROPERTY_CD
+LEFT JOIN DAAS_COMMON.PURGE_PROGRAM_NM_LKP p
+  ON  l.SOURCE_SYSTEM_NAME = p.SOURCE_SYSTEM_NM AND l.PROPERTY_CODE = p.PROPERTY_CD
+  AND UPPER(l.program) = UPPER(TRIM(p.PROGRAM_NM))
+WHERE f.DELETE_IND = 'N' AND f.SOURCE_SYSTEM_NM = 'HETCMS'
+  AND l.OPERATION_TYPE IN (0, 5, 8)
+  AND l.program <> 'QRYO04'
+  AND p.PROGRAM_NM IS NULL;
+
+SELECT COUNT(*)                                   AS active_comps_cms_has_deleted,
+       COUNT(DISTINCT PROPERTY_CD)                AS properties,
+       MIN(deleted_at)::DATE                      AS earliest_deletion,
+       MAX(deleted_at)::DATE                      AS latest_deletion,
+       COUNT_IF(guest_differs)                    AS guest_differs,
+       COUNT_IF(deleted_at > fact_last_written)   AS deleted_after_last_write
+FROM DAAS_TEMP_WORK.DAASI3640_PROD_STUCK_DELETES;
+
+SELECT program, OPERATION_TYPE, YEAR(deleted_at) AS deletion_year, COUNT(*) AS comps
+FROM DAAS_TEMP_WORK.DAASI3640_PROD_STUCK_DELETES
+GROUP BY 1, 2, 3
+ORDER BY comps DESC
+LIMIT 30;
+
+USE DATABASE DAAS_UAT;
+
 
 /* =====================================================================
-   3. F8: WHAT KIND OF CHANGE THE HOST NAMES TOOK (49,442 rows)
-   Expect the rows in 'same letters' or 'same words, new order' (the
-   formula changed, not the person), and few or none in 'different name'.
+   8. THE HOST NAMES (COMPOR_NAME)
+   The proc builds the name from the host master CMPHA_RAW (latest row
+   per authorizer code and property, "LAST, FIRST" with digits stripped),
+   then CMPAS_RAW, then the Teradata lookup. A rebuild therefore shows
+   today's host master. 8a says which names the UAT rebuild wrote and
+   whether one dominates (a join or default-row problem) or many appear
+   (the host master differs from what built the March rows). 8b is the
+   one that matters: the same derivation run in PROD today, against
+   PROD's fact, for the same slice. That is exactly what a PROD replay
+   would write, computed without replaying.
    ===================================================================== */
--- F8. What kind of change COMPOR_NAME took (F3: 49,442 rows). The proc
---     builds it from the host master (CMPHA_RAW, latest row per host and
---     property) as "LAST FIRST" with digits stripped, then CMPAS_RAW,
---     then the Teradata lookup, so a rebuild shows today's host master
---     under today's formula. The classes separate a formula or spacing
---     change (harmless, and PROD's older rows will take the same one)
---     from a coverage change (names appearing or vanishing) and from a
---     different person (the host record itself changed). EXAMPLE is one
---     before -> after pair per class; these are employee names, fine for
---     you and Pete.
-SELECT CASE WHEN b.COMPOR_NAME IS NULL AND f.COMPOR_NAME IS NOT NULL THEN 'blank, now a name'
-            WHEN b.COMPOR_NAME IS NOT NULL AND f.COMPOR_NAME IS NULL THEN 'name, now blank'
-            WHEN REGEXP_REPLACE(UPPER(b.COMPOR_NAME), '[^A-Z]', '')
-               = REGEXP_REPLACE(UPPER(f.COMPOR_NAME), '[^A-Z]', '')      THEN 'same letters: spacing, case or digits'
-            WHEN ARRAY_TO_STRING(ARRAY_SORT(SPLIT(UPPER(TRIM(b.COMPOR_NAME)), ' ')), ' ')
-               = ARRAY_TO_STRING(ARRAY_SORT(SPLIT(UPPER(TRIM(f.COMPOR_NAME)), ' ')), ' ') THEN 'same words, new order'
-            WHEN REGEXP_REPLACE(UPPER(b.COMPOR_NAME), '[^A-Z]', '') LIKE '%' || REGEXP_REPLACE(UPPER(f.COMPOR_NAME), '[^A-Z]', '') || '%'
-              OR REGEXP_REPLACE(UPPER(f.COMPOR_NAME), '[^A-Z]', '') LIKE '%' || REGEXP_REPLACE(UPPER(b.COMPOR_NAME), '[^A-Z]', '') || '%'
-                                                                        THEN 'one contains the other: a part dropped or added'
-            ELSE 'different name' END                                   AS change_kind,
-       COUNT(*)                                                         AS rows_,
-       COUNT(DISTINCT b.COMPOR_NAME)                                    AS distinct_names_before,
-       ANY_VALUE(COALESCE(b.COMPOR_NAME, '(blank)') || '  ->  ' || COALESCE(f.COMPOR_NAME, '(blank)')) AS example
+
+-- 8a. UAT: the names written onto the 49,442 changed rows, most common
+--     first. If the top name covers most of the rows, the join is
+--     matching a catch-all host record; if the names are many and the
+--     counts modest, the host master simply changed.
+SELECT f.COMPOR_NAME                          AS name_after,
+       COUNT(*)                               AS rows_,
+       COUNT_IF(b.COMPOR_NAME IS NULL)        AS were_blank,
+       COUNT(DISTINCT b.COMPOR_NAME)          AS distinct_names_before,
+       COUNT(DISTINCT f.COMPOR_AUTHOR_NBR)    AS authorizer_codes,
+       MIN(f.COMPOR_AUTHOR_NBR)               AS min_code,
+       MAX(f.COMPOR_AUTHOR_NBR)               AS max_code
 FROM DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
 JOIN DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
   ON  e.COMP_NBR = b.COMP_NBR AND e.ISHDRW = b.ISHDRW AND e.PROPERTY_CD = b.PROPERTY_CD
@@ -217,22 +160,237 @@ JOIN DAAS_CORE.COMP_DETAIL_FACT f
   ON  f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK
 WHERE f.COMPOR_NAME IS DISTINCT FROM b.COMPOR_NAME
 GROUP BY 1
+ORDER BY rows_ DESC
+LIMIT 15;
+
+-- 8b. PROD: what a replay would do to COMPOR_NAME on UTU March 2026,
+--     computed from today's PROD raw and lookups with the proc's own
+--     derivation, against PROD's fact. WOULD_CHANGE is the PROD
+--     counterpart of UAT's 49,442. The RESOLVED_BY columns say which
+--     source supplies the name today.
+USE DATABASE DAAS_PROD;
+
+WITH slice AS (
+    SELECT COMP_DETAIL_FACT_SK, COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD, ISSUE_DT,
+           COMPOR_NAME AS name_in_fact, COMPOR_AUTHOR_NBR, UPDATED_DTTM
+    FROM DAAS_CORE.COMP_DETAIL_FACT
+    WHERE DELETE_IND = 'N' AND SOURCE_SYSTEM_NM = 'HETCMS'
+      AND PROPERTY_CD = 'UTU' AND ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
+),
+rw AS (     -- the comp's latest raw row: CAUTRW is the authorizer code the host master is keyed on
+    SELECT CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE, CAUTRW
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+    WHERE PROPERTY_CODE = 'UTU' AND CNUMRW IN (SELECT COMP_NBR FROM slice)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+cd AS (     -- the comp's latest detail row: CAUTCD keys the second host table
+    SELECT CNUMCD, ISHDCD, COTLCD, PROPERTY_CODE, CAUTCD
+    FROM DAAS_RAW_HETCMS.CMPCD_RAW
+    WHERE PROPERTY_CODE = 'UTU' AND CNUMCD IN (SELECT COMP_NBR FROM slice)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY CNUMCD, ISHDCD, COTLCD, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+ha AS (     -- host master, latest row per authorizer and property, name built the proc's way
+    SELECT AUTHHA, PROPERTY_CODE, OPERATION_DATE AS ha_row_date,
+           CONCAT(
+           REGEXP_REPLACE (
+           concat(
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 1) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 2) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 3) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 4) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 5) end
+           ),'[0-9]',''),
+           ', ',
+           REGEXP_REPLACE (
+           concat(
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 1) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 2) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 3) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 4) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 5) end
+           ),'[0-9]','')) AS COPNM
+    FROM DAAS_RAW_HETCMS.CMPHA_RAW
+    WHERE PROPERTY_CODE = 'UTU'
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY AUTHHA, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+asr AS (    -- second host table, same treatment
+    SELECT APIDAS, PROPERTY_CODE,
+           CONCAT(
+           REGEXP_REPLACE (
+           concat(
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 1) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 2) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 3) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 4) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 5) end
+           ),'[0-9]',''),
+           ', ',
+           REGEXP_REPLACE (
+           concat(
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 1) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 2) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 3) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 4) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 5) end
+           ),'[0-9]','') ) AS COPNM
+    FROM DAAS_RAW_HETCMS.CMPAS_RAW
+    WHERE PROPERTY_CODE = 'UTU'
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY APIDAS, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+derived AS (
+    SELECT s.*, rw.CAUTRW, cd.CAUTCD, ha.ha_row_date,
+           ha.COPNM            AS from_cmpha,
+           asr.COPNM           AS from_cmpas,
+           LKP.C_COMPOR_NAME   AS from_lkp,
+           COALESCE(ha.COPNM, asr.COPNM, LKP.C_COMPOR_NAME) AS name_today
+    FROM slice s
+    LEFT JOIN rw  ON rw.CNUMRW = s.COMP_NBR AND rw.ISHDRW = s.ISHDRW AND rw.COTLRW = s.CASINO_OUTLET_CD AND rw.PROPERTY_CODE = s.PROPERTY_CD
+    LEFT JOIN cd  ON cd.CNUMCD = s.COMP_NBR AND cd.ISHDCD = s.ISHDRW AND cd.COTLCD = s.CASINO_OUTLET_CD AND cd.PROPERTY_CODE = s.PROPERTY_CD
+    LEFT JOIN ha  ON ha.AUTHHA = rw.CAUTRW AND ha.PROPERTY_CODE = s.PROPERTY_CD
+    LEFT JOIN asr ON asr.APIDAS = cd.CAUTCD AND asr.PROPERTY_CODE = s.PROPERTY_CD
+    LEFT JOIN DAAS_TERADATA_RAW.PML_COMP_DTL_COMPOR_LKP_DAAS LKP
+           ON rw.CAUTRW = TRIM(LKP.C_COMPOR_CODE) AND s.PROPERTY_CD = TRIM(LKP.C_PROP_CD)
+          AND s.ISSUE_DT BETWEEN LKP.START_DATE AND LKP.END_DATE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY s.COMP_DETAIL_FACT_SK ORDER BY LKP.START_DATE DESC NULLS LAST) = 1
+)
+SELECT COUNT(*)                                                                   AS comps,
+       COUNT_IF(name_today IS DISTINCT FROM name_in_fact)                         AS would_change,
+       COUNT_IF(name_in_fact IS NULL     AND name_today IS NOT NULL)              AS blank_now_name,
+       COUNT_IF(name_in_fact IS NOT NULL AND name_today IS NULL)                  AS name_now_blank,
+       COUNT_IF(name_in_fact IS NOT NULL AND name_today IS NOT NULL
+                AND name_today <> name_in_fact)                                   AS different_name,
+       COUNT_IF(from_cmpha IS NOT NULL)                                           AS resolved_by_cmpha,
+       COUNT_IF(from_cmpha IS NULL AND from_cmpas IS NOT NULL)                    AS resolved_by_cmpas,
+       COUNT_IF(from_cmpha IS NULL AND from_cmpas IS NULL AND from_lkp IS NOT NULL) AS resolved_by_lkp,
+       COUNT_IF(name_today IS NULL)                                               AS unresolved
+FROM derived;
+
+--     The changes themselves, by kind, with an example each (employee
+--     names; for Pete). Only meaningful if WOULD_CHANGE is not 0.
+WITH slice AS (
+    SELECT COMP_DETAIL_FACT_SK, COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD, ISSUE_DT,
+           COMPOR_NAME AS name_in_fact, COMPOR_AUTHOR_NBR, UPDATED_DTTM
+    FROM DAAS_CORE.COMP_DETAIL_FACT
+    WHERE DELETE_IND = 'N' AND SOURCE_SYSTEM_NM = 'HETCMS'
+      AND PROPERTY_CD = 'UTU' AND ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
+),
+rw AS (     -- the comp's latest raw row: CAUTRW is the authorizer code the host master is keyed on
+    SELECT CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE, CAUTRW
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+    WHERE PROPERTY_CODE = 'UTU' AND CNUMRW IN (SELECT COMP_NBR FROM slice)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY CNUMRW, ISHDRW, COTLRW, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+cd AS (     -- the comp's latest detail row: CAUTCD keys the second host table
+    SELECT CNUMCD, ISHDCD, COTLCD, PROPERTY_CODE, CAUTCD
+    FROM DAAS_RAW_HETCMS.CMPCD_RAW
+    WHERE PROPERTY_CODE = 'UTU' AND CNUMCD IN (SELECT COMP_NBR FROM slice)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY CNUMCD, ISHDCD, COTLCD, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+ha AS (     -- host master, latest row per authorizer and property, name built the proc's way
+    SELECT AUTHHA, PROPERTY_CODE, OPERATION_DATE AS ha_row_date,
+           CONCAT(
+           REGEXP_REPLACE (
+           concat(
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 1) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 2) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 3) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 4) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMHA, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(LNAMHA, ' ', 5) end
+           ),'[0-9]',''),
+           ', ',
+           REGEXP_REPLACE (
+           concat(
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 1) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 2) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 3) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 4) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMHA, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(FNAMHA, ' ', 5) end
+           ),'[0-9]','')) AS COPNM
+    FROM DAAS_RAW_HETCMS.CMPHA_RAW
+    WHERE PROPERTY_CODE = 'UTU'
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY AUTHHA, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+asr AS (    -- second host table, same treatment
+    SELECT APIDAS, PROPERTY_CODE,
+           CONCAT(
+           REGEXP_REPLACE (
+           concat(
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 1) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 2) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 3) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 4) end,
+           case when REGEXP_LIKE(SPLIT_PART(LNAMAS, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(LNAMAS, ' ', 5) end
+           ),'[0-9]',''),
+           ', ',
+           REGEXP_REPLACE (
+           concat(
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 1), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 1) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 2), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 2) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 3), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 3) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 4), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 4) end,
+           case when REGEXP_LIKE(SPLIT_PART(FNAMAS, ' ', 5), '[0-9].*') = true then ''  else SPLIT_PART(FNAMAS, ' ', 5) end
+           ),'[0-9]','') ) AS COPNM
+    FROM DAAS_RAW_HETCMS.CMPAS_RAW
+    WHERE PROPERTY_CODE = 'UTU'
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY APIDAS, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+derived AS (
+    SELECT s.*, rw.CAUTRW, cd.CAUTCD, ha.ha_row_date,
+           ha.COPNM            AS from_cmpha,
+           asr.COPNM           AS from_cmpas,
+           LKP.C_COMPOR_NAME   AS from_lkp,
+           COALESCE(ha.COPNM, asr.COPNM, LKP.C_COMPOR_NAME) AS name_today
+    FROM slice s
+    LEFT JOIN rw  ON rw.CNUMRW = s.COMP_NBR AND rw.ISHDRW = s.ISHDRW AND rw.COTLRW = s.CASINO_OUTLET_CD AND rw.PROPERTY_CODE = s.PROPERTY_CD
+    LEFT JOIN cd  ON cd.CNUMCD = s.COMP_NBR AND cd.ISHDCD = s.ISHDRW AND cd.COTLCD = s.CASINO_OUTLET_CD AND cd.PROPERTY_CODE = s.PROPERTY_CD
+    LEFT JOIN ha  ON ha.AUTHHA = rw.CAUTRW AND ha.PROPERTY_CODE = s.PROPERTY_CD
+    LEFT JOIN asr ON asr.APIDAS = cd.CAUTCD AND asr.PROPERTY_CODE = s.PROPERTY_CD
+    LEFT JOIN DAAS_TERADATA_RAW.PML_COMP_DTL_COMPOR_LKP_DAAS LKP
+           ON rw.CAUTRW = TRIM(LKP.C_COMPOR_CODE) AND s.PROPERTY_CD = TRIM(LKP.C_PROP_CD)
+          AND s.ISSUE_DT BETWEEN LKP.START_DATE AND LKP.END_DATE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY s.COMP_DETAIL_FACT_SK ORDER BY LKP.START_DATE DESC NULLS LAST) = 1
+)
+SELECT CASE WHEN name_in_fact IS NULL THEN 'blank, now a name'
+            WHEN name_today IS NULL   THEN 'name, now blank'
+            WHEN REGEXP_REPLACE(UPPER(name_in_fact), '[^A-Z]', '') = REGEXP_REPLACE(UPPER(name_today), '[^A-Z]', '')
+                                      THEN 'same letters: spacing, case or digits'
+            ELSE 'different name' END                                   AS change_kind,
+       COUNT(*)                                                         AS rows_,
+       COUNT(DISTINCT CAUTRW)                                           AS authorizer_codes,
+       ANY_VALUE(COALESCE(name_in_fact, '(blank)') || '  ->  ' || COALESCE(name_today, '(blank)')
+                 || '   [code ' || COALESCE(CAUTRW::VARCHAR, '?') || ', host row ' || COALESCE(ha_row_date::DATE::VARCHAR, 'none') || ']') AS example
+FROM derived
+WHERE name_today IS DISTINCT FROM name_in_fact
+GROUP BY 1
 ORDER BY rows_ DESC;
+
+USE DATABASE DAAS_UAT;
 
 
 /* =====================================================================
-   4. THE QUERY PROFILE OF THE 333-SECOND INSERT, AS A RESULT SET
-   GET_QUERY_OPERATOR_STATS returns what the Query Profile page draws,
-   one row per operator, for a query you ran in the last 14 days. The
-   first result picks the INSERT's query id (the one that produced
-   49,455 rows); the second lists its operators by share of the time.
-   What to read: if the top rows are TableScan / Aggregate / WindowFunction
-   over CMPRW_RAW, ECPCMPCM_RAW and CMPRM_RAW with INPUT_ROWS in the
-   hundreds of millions, the cost is mostly fixed (scanning raw) and the
-   PROD run will not be 155 times longer; if the top rows are Joins whose
-   INPUT_ROWS scale with the 49,455, the cost is per comp. Send the whole
-   second result (copy as text is fine).
+   9. THE PROFILE, PROPERLY, AND THE FAN-OUT
+   9a reruns the operator stats with the percentage multiplied up and
+   every operator listed in tree order, with its join condition, so the
+   operator that turns 51,442 rows into 80,858,925 can be named. Export
+   the result (the download arrow above the grid) rather than a
+   screenshot; it is about fifty rows and the conditions are long.
+   9b checks the two lookups joined without a latest-row filter that
+   could do it: OFFSET_CONTROL (joined on property alone) and the
+   Teradata host lookup (joined on a date range). 1,635 rows per UTU
+   comp is about the number of days since the raw history began in
+   April 2022, which is what a control table with one row per property
+   per run would produce.
    ===================================================================== */
+
+-- 9a.
 SET insert_qid = (SELECT query_id
                   FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_USER(RESULT_LIMIT => 5000))
                   WHERE query_text ILIKE '%INSERT INTO DAAS_TEMP_WORK.COMP_DETAIL_FACT_TMP_DAASI3640%'
@@ -241,124 +399,47 @@ SET insert_qid = (SELECT query_id
                   ORDER BY start_time DESC
                   LIMIT 1);
 
-SELECT $insert_qid AS insert_query_id;      -- should be the 2026-10-26 18:58 run
-
 SELECT operator_id,
-       parent_operators,
+       parent_operators[0]::NUMBER                                          AS parent,
        operator_type,
-       ROUND(execution_time_breakdown:overall_percentage::FLOAT, 1)        AS pct_of_time,
+       ROUND(execution_time_breakdown:overall_percentage::FLOAT * 100, 1)  AS pct_of_time,
        operator_statistics:input_rows::NUMBER                               AS input_rows,
        operator_statistics:output_rows::NUMBER                              AS output_rows,
        operator_statistics:pruning:partitions_scanned::NUMBER               AS partitions_scanned,
-       operator_statistics:pruning:partitions_total::NUMBER                 AS partitions_total,
        ROUND(operator_statistics:io:bytes_scanned::FLOAT / POWER(1024, 3), 1) AS gb_scanned,
-       operator_attributes:table_name::VARCHAR                              AS table_name,
-       operator_attributes:join_type::VARCHAR                               AS join_type
+       ROUND(operator_statistics:spilling:bytes_spilled_local_storage::FLOAT / POWER(1024, 3), 1) AS gb_spilled,
+       COALESCE(operator_attributes:table_name::VARCHAR,
+                operator_attributes:join_type::VARCHAR || ' ON ' || operator_attributes:equality_join_condition::VARCHAR,
+                LEFT(operator_attributes::VARCHAR, 200))                     AS what
 FROM TABLE(GET_QUERY_OPERATOR_STATS($insert_qid))
-ORDER BY pct_of_time DESC NULLS LAST
-LIMIT 30;
+ORDER BY operator_id;
 
+-- 9b. The suspects. Expect one of these to show about 1,600 rows for UTU.
+SELECT 'OFFSET_CONTROL' AS lookup, PROPERTY_CD AS key_, COUNT(*) AS rows_, COUNT(DISTINCT OFFSET) AS distinct_offsets
+FROM DAAS_COMMON.OFFSET_CONTROL
+GROUP BY 1, 2
+ORDER BY rows_ DESC
+LIMIT 5;
 
-/* =====================================================================
-   5. E5 IN PROD, READ-ONLY: THE BEFORE PICTURE
-   Same query as part 1 against PROD's fact and raw. PROD still matches
-   comments by number alone, so the first column is the number of UTU
-   March 2026 comps showing another guest's note in the report today.
-   Expect it near the second column (17,406 in UAT), not 0.
-   Switch the database back afterward.
-   ===================================================================== */
-USE DATABASE DAAS_PROD;
+SELECT 'PML_COMP_DTL_COMPOR_LKP_DAAS' AS lookup, TRIM(C_COMPOR_CODE) AS key_, COUNT(*) AS rows_,
+       MIN(START_DATE) AS from_, MAX(END_DATE) AS to_
+FROM DAAS_TERADATA_RAW.PML_COMP_DTL_COMPOR_LKP_DAAS
+WHERE TRIM(C_PROP_CD) = 'UTU'
+GROUP BY 1, 2
+ORDER BY rows_ DESC
+LIMIT 5;
 
-WITH slice AS (
-    SELECT COMP_NBR, ISHDRW, PROPERTY_CD, GUEST_ID, COMP_COMMENTS_DESC
-    FROM DAAS_CORE.COMP_DETAIL_FACT
-    WHERE DELETE_IND = 'N' AND SOURCE_SYSTEM_NM = 'HETCMS'
-      AND PROPERTY_CD = 'UTU' AND ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
-),
-holders AS (     -- every guest who ever held each comp
-    SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
-    FROM DAAS_RAW_HETCMS.CMPRW_RAW
-    WHERE PROPERTY_CODE = 'UTU' AND CNUMRW IN (SELECT COMP_NBR FROM slice)
-),
-lines AS (       -- latest version of every comment line on these numbers, with the guest it was written under
-    SELECT "CMP#CM" AS CNUMRW, PROPERTY_CODE, SYIDCM, CSEQCM, CMNTCM
-    FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
-    WHERE PROPERTY_CODE = 'UTU' AND "CMP#CM" IN (SELECT COMP_NBR FROM slice)
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
-            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
-),
-own_lines AS (   -- lines under a holder of the comp
-    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
-    FROM slice s
-    JOIN lines l   ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
-    JOIN holders h ON h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM
-),
-foreign_lines AS (   -- lines under someone who never held the comp, and not also written by a holder
-    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
-    FROM slice s
-    JOIN lines l ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
-    WHERE NOT EXISTS (SELECT 1 FROM holders h
-                      WHERE h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM)
-      AND NOT EXISTS (SELECT 1 FROM own_lines o
-                      WHERE o.COMP_NBR = s.COMP_NBR AND o.ISHDRW = s.ISHDRW AND o.CMNTCM = l.CMNTCM)
-),
-fact_lines AS (  -- the comment the fact shows, one row per line
-    SELECT s.COMP_NBR, s.ISHDRW, x.VALUE::VARCHAR AS line
-    FROM slice s, LATERAL FLATTEN(INPUT => SPLIT(s.COMP_COMMENTS_DESC, '|')) x
-    WHERE s.COMP_COMMENTS_DESC IS NOT NULL
-)
-SELECT COUNT(DISTINCT fl.COMP_NBR || '-' || fl.ISHDRW)                        AS comps_showing_another_guests_line,
-       (SELECT COUNT(DISTINCT COMP_NBR || '-' || ISHDRW) FROM foreign_lines)  AS comps_whose_number_has_other_guests_lines_in_cms,
-       (SELECT COUNT(*) FROM slice)                                          AS comps_in_slice
-FROM fact_lines fl
-JOIN foreign_lines fo
-  ON  fo.COMP_NBR = fl.COMP_NBR AND fo.ISHDRW = fl.ISHDRW AND fo.CMNTCM = fl.line;
-
-USE DATABASE DAAS_UAT;
-
-
-/* =====================================================================
-   6. THE TASK-DRIVEN SMOKE RUN (once the admins have created the task)
-   The by-hand run proved the SQL; this proves the proc's JavaScript
-   wrapper: query tag, transaction, batch-control metrics, error
-   handling. Stream empty, nothing bumped, nothing written.
-   The ask to the admins is in 06 C0c:
-     CREATE TASK DAAS_UAT.DAAS_COMMON.DAASI3640_UAT_REPLAY_TASK
-       WAREHOUSE = DAAS_UAT_IT_ADHOC_COMPUTE
-       COMMENT = 'DAASI-3640 UAT replay, manual runs only; drop after the test'
-     AS CALL DAAS_COMMON.HETCMS_COMP_DETAIL_FACT_LOAD_PROC(36400001, 'DAASI3640_UAT', 'DAAS_UAT_IT_ADHOC_COMPUTE', '', '');
-     GRANT OPERATE ON TASK DAAS_UAT.DAAS_COMMON.DAASI3640_UAT_REPLAY_TASK TO ROLE DAAS_TEAM;
-     -- plus, if OPERATE alone does not let DAAS_TEAM fire it:
-     -- GRANT EXECUTE TASK ON ACCOUNT TO ROLE DAAS_TEAM;
-   ===================================================================== */
-
--- 6a. The stream is still empty (TRUE here means a load is wanted first).
-SELECT SYSTEM$STREAM_HAS_DATA('DAAS_RAW_HETCMS.CMPRW_RAW_COMP_DETAIL_STREAM') AS has_data;   -- FALSE
-
--- 6b. Fire it, then watch it finish. STATE goes SCHEDULED -> EXECUTING -> SUCCEEDED;
---     RETURN_VALUE is the proc's output: SUCCESS, or the metrics complaint
---     about the unknown batch 36400001 (fine: the data step committed),
---     or FAILURE with the message.
-EXECUTE TASK DAAS_UAT.DAAS_COMMON.DAASI3640_UAT_REPLAY_TASK;
-
-SELECT name, state, return_value, scheduled_time, query_start_time, completed_time, error_message
-FROM TABLE(DAAS_UAT.INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME => 'DAASI3640_UAT_REPLAY_TASK',
-                                                     SCHEDULED_TIME_RANGE_START => DATEADD(hour, -2, CURRENT_TIMESTAMP())))
-ORDER BY scheduled_time DESC;
-
--- 6c. Nothing written (0), and the four statements ran under the task's
---     batch tag with no errors. The task's queries ran under
---     APP_SERVICE_UAT, so if the second query returns nothing to
---     DAAS_TEAM, run it as DAAS_SNOWFLAKE_ACCTUSAGE against
---     SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY instead (same columns, up to
---     45 minutes behind).
-SELECT COUNT(*) AS rows_with_test_batch_since_the_slice_run
-FROM DAAS_CORE.COMP_DETAIL_FACT
-WHERE BATCH_ID = 36400001 AND UPDATED_DTTM > '2026-10-27';
-
-SELECT start_time, LEFT(LTRIM(query_text, ' \t\n\r'), 60) AS statement_start,
-       ROUND(total_elapsed_time / 1000) AS seconds, execution_status, error_message
-FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(RESULT_LIMIT => 10000))
-WHERE query_tag = '36400001_HETCMS_COMP_DETAIL_FACT_LOAD_PROC'
-  AND start_time > '2026-10-27'
-ORDER BY start_time;
+--     And the PROD daily load's own numbers, for the same question: how
+--     long its INSERT takes and how many rows it produces on a normal
+--     day. The replay's cost scales from these. (Needs the account usage
+--     view; run as DAAS_SNOWFLAKE_ACCTUSAGE if DAAS_TEAM cannot read it.)
+SELECT start_time::DATE AS run_day, warehouse_size,
+       ROUND(total_elapsed_time / 1000)           AS insert_seconds,
+       rows_produced                               AS comps_rebuilt,
+       ROUND(bytes_spilled_to_local_storage / POWER(1024, 3), 1) AS gb_spilled
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE database_name = 'DAAS_PROD'
+  AND query_tag LIKE '%HETCMS_COMP_DETAIL_FACT_LOAD_PROC'
+  AND query_text ILIKE '%INSERT INTO DAAS_TEMP.COMP_DETAIL_FACT_TMP%'
+  AND start_time > DATEADD(day, -14, CURRENT_TIMESTAMP())
+ORDER BY start_time DESC;
