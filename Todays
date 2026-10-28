@@ -1,0 +1,249 @@
+-- DAASI-3641: PROD repair through the pipeline, with TRIP_MERGE_CHECK_PROC v1.4. One write statement: R3.
+--
+-- Order
+--   0. DAASI_3641_FIX_REACH_CHECK.sql on PROD (read-only), before the deploy. Its BEM and WLM rows are what R3 repairs;
+--      its other rows (property grains, ENTERPRISE) are what v1.4 will re-cut on its own as normal flow touches them
+--      (touched_last_30d says how many in the first month). Nothing changes on deploy alone.
+--   1. Deploy v1.4 to PROD (GitHub Actions, from main), just after an hourly run has finished (R4a shows).
+--   2. R0, R1, R2: version check, the target list with before-pictures (four scratch tables), the preview.
+--   3. R3, just after an hourly run has finished: the UPDATE. The next run (TRIP_ROOT_TASK, :15 past every hour, Pacific)
+--      does the rest in one pass: ratings step → merge check (v1.4 nominates) → merge (re-windows) → summaries → comp worth.
+--   4. R4b: watch the run finish. Then the post-check file.
+--
+-- How the replay reaches the trips. An UPDATE on RATINGS_FACT lands in RATINGS_FACT_STREAM. TRIP_RATING_DOMAIN_PIPELINE_PROC
+-- takes every rating in the stream through TRIP_IDENTIFIER_PROC again (its step 9 no longer filters out ratings that are
+-- already on a trip), finds the trip each one sits on at every grain (property, market, enterprise) and rewrites that
+-- TRIP_MASTER row (step 11: end date, UPDATED_DTTM, BATCH_ID, LAST_DML_CD). Those rewritten rows are what merge check's
+-- stream shows v1.4. Same route as the August replay; what differs is what merge check now does with an over-cap trip.
+-- (In UAT the ratings step could not be run, so the proof touched TRIP_DETAIL and TRIP_MASTER directly to the same effect.)
+--
+-- Scope. Every live BEM/WLM market trip longer than its cap with no hotel night, measured the way v1.4 measures it, reached
+-- through its ratings. The same ratings also sit on the property twin (IBE/IWA) and on the enterprise trip, so those
+-- masters are rewritten too and go through the same rule: a twin within its cap is left alone; R2b counts anything at
+-- those grains that is over cap today and so will be re-cut in the same run.
+--
+-- Batches. All of one guest's trips go in the same batch, so back-to-back over-cap trips are re-cut together (UAT C12).
+-- The number of batches is the literal in R1 (1 to start). Raise it if R2 shows more rating rows than you want one hourly
+-- run to carry (the UAT run carried 5,616 touched trips for 4 guests without trouble; a PROD run normally handles a few
+-- hundred thousand rows), and run R3 once per batch, one hourly run apart, changing BATCH_NO each time.
+--
+-- Roles: DAAS_TEAM for the reads and the scratch tables; R3 needs UPDATE on DAAS_PROD.DAAS_CORE.RATINGS_FACT (Pete, or
+-- whoever holds it). The scratch tables can be dropped after sign-off.
+
+USE ROLE DAAS_TEAM;
+USE SECONDARY ROLES ALL;
+
+
+-- R0. Is v1.4 what PROD runs? Expect 'v1.4 is live in PROD'. (UAT's proof ran on this exact text.)
+SELECT IFF(CONTAINS(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_MERGE_CHECK_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)'),
+                    'my_sql_command_3A'),
+           'v1.4 is live in PROD', 'PROD still runs the old version: deploy v1.4 first') AS merge_check_version;
+
+
+-- R1. The targets, with their before-picture. Four scratch tables in DAAS_TEMP_WORK:
+--     _P14_TRIPS      one row per target trip (live BEM/WLM market trip, over its cap, no hotel night) with its batch number
+--     _P14_TD_BEFORE  every TRIP_DETAIL row of those trips (the ratings R3 replays, and the SK-level evidence for the post-check)
+--     _P14_TS_BEFORE  their TRIP_SUMMARY rows (theo before, for the post-check)
+--     _P14_MARKS      the highest trip id and batch id before the run: everything the run builds sits above them
+--     Same measure as the reach check and as v1.4 itself: TRIP_END_DT - TRIP_START_DT + 1 > cap, cap from the market config
+--     function for the trip's start date, the enterprise cap as the fallback, trips holding a live HOTEL detail row exempt.
+CREATE OR REPLACE TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS AS
+WITH ent AS (
+    SELECT MAX(VALUE) AS MAX_TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+    WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y'
+),
+multi AS (   -- only a multi-day trip can be over any cap
+    SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, MARKET_CD, TRIP_START_DT, TRIP_END_DT, UPDATED_DTTM,
+           TRIP_END_DT - TRIP_START_DT + 1 AS TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+    WHERE DELETE_IND = 'N'
+      AND TRIP_TYPE = 'MARKET'
+      AND MARKET_CD IN ('BEM', 'WLM')
+      AND TRIP_END_DT > TRIP_START_DT
+),
+caps AS (    -- one config-function call per market and start date
+    SELECT MARKET_CD, TRIP_START_DT,
+           DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT) AS CAP
+    FROM (SELECT DISTINCT MARKET_CD, TRIP_START_DT FROM multi)
+),
+over_cap AS (
+    SELECT m.*, COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS)) AS MAX_TRIP_DAYS
+    FROM multi m
+    JOIN caps c ON c.MARKET_CD = m.MARKET_CD AND c.TRIP_START_DT = m.TRIP_START_DT
+    CROSS JOIN ent e
+    WHERE m.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS))
+      AND NOT EXISTS (SELECT 1
+                      FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                      WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID
+                        AND d.DELETE_IND = 'N'
+                        AND d.TRANSACTION_TYPE = 'HOTEL')
+),
+ratings AS (   -- the live ratings each target holds: what R3 replays
+    SELECT d.TRIP_MASTER_ID, COUNT(DISTINCT d.TRANSACTION_TABLE_SK) AS RATING_ROWS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+    JOIN over_cap o ON o.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+    WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
+    GROUP BY d.TRIP_MASTER_ID
+)
+SELECT o.TRIP_MASTER_ID, o.GUEST_UNIQUE_ID, o.MARKET_CD, o.TRIP_START_DT, o.TRIP_END_DT, o.TRIP_DAYS, o.MAX_TRIP_DAYS,
+       o.UPDATED_DTTM AS UPDATED_DTTM_BEFORE,
+       COALESCE(r.RATING_ROWS, 0) AS RATING_ROWS,
+       MOD(DENSE_RANK() OVER (ORDER BY o.GUEST_UNIQUE_ID) - 1, 1) + 1 AS BATCH_NO   /* the 1 is the number of batches */
+FROM over_cap o
+LEFT JOIN ratings r ON r.TRIP_MASTER_ID = o.TRIP_MASTER_ID;
+
+CREATE OR REPLACE TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TD_BEFORE AS
+SELECT d.*
+FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+JOIN DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS t ON t.TRIP_MASTER_ID = d.TRIP_MASTER_ID;
+
+CREATE OR REPLACE TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TS_BEFORE AS
+SELECT s.*
+FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY s
+JOIN DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS t ON t.TRIP_MASTER_ID = s.TRIP_MASTER_ID;
+
+CREATE OR REPLACE TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_MARKS (
+    mark VARCHAR, value NUMBER, noted_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP());
+INSERT INTO DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_MARKS (mark, value)
+SELECT 'max_trip_master_id_before', MAX(TRIP_MASTER_ID) FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER;
+INSERT INTO DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_MARKS (mark, value)
+SELECT 'max_batch_id_before', MAX(BATCH_ID) FROM DAAS_PROD.DAAS_COMMON.BATCH_S02;
+
+
+-- R2. Preview, per batch and in total: what R3 will replay. Expect trips and guests to agree with the reach check's BEM
+--     and WLM rows, and no_rating_trips 0 (a target with no live rating cannot be reached by a ratings replay; if any,
+--     send them over). Decide the batch count here; to change it, edit the literal in R1 and re-run R1 only.
+SELECT COALESCE(TO_VARCHAR(BATCH_NO), 'all') AS batch,
+       COUNT(*)                                  AS trips,
+       COUNT(DISTINCT GUEST_UNIQUE_ID)           AS guests,
+       COUNT_IF(MARKET_CD = 'BEM')               AS bem_trips,
+       COUNT_IF(MARKET_CD = 'WLM')               AS wlm_trips,
+       SUM(RATING_ROWS)                          AS rating_rows_to_replay,
+       COUNT_IF(RATING_ROWS = 0)                 AS no_rating_trips,
+       MAX(TRIP_DAYS)                            AS longest_days,
+       MIN(TRIP_START_DT)                        AS earliest_start,
+       MAX(TRIP_START_DT)                        AS latest_start
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS
+GROUP BY ROLLUP (BATCH_NO)
+ORDER BY BATCH_NO NULLS LAST;
+
+-- R2b. What else the run will re-cut: the target guests' other live trips (property and enterprise grains, any market)
+--      that are over their cap with no hotel night today. The ratings step rewrites every master holding a replayed
+--      rating, and v1.4 applies the same rule to each. Expect the IBE/IWA property rows at 0 (the twins were corrected
+--      earlier); the ENTERPRISE row is the one to read before sign-off. For Pete's record either way.
+WITH g AS (SELECT DISTINCT GUEST_UNIQUE_ID FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS),
+ent AS (
+    SELECT MAX(VALUE) AS MAX_TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+    WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y'
+),
+multi AS (
+    SELECT m.TRIP_MASTER_ID, m.GUEST_UNIQUE_ID, m.TRIP_TYPE, m.PROPERTY_CD, m.MARKET_CD, m.TRIP_START_DT, m.TRIP_END_DT,
+           m.TRIP_END_DT - m.TRIP_START_DT + 1 AS TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER m
+    JOIN g ON g.GUEST_UNIQUE_ID = m.GUEST_UNIQUE_ID
+    WHERE m.DELETE_IND = 'N'
+      AND m.TRIP_END_DT > m.TRIP_START_DT
+      AND NOT (m.TRIP_TYPE = 'MARKET' AND m.MARKET_CD IN ('BEM', 'WLM'))
+),
+caps AS (
+    SELECT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT,
+           CASE WHEN TRIP_TYPE = 'PROPERTY' THEN DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', PROPERTY_CD, TRIP_START_DT)
+                WHEN TRIP_TYPE = 'MARKET'   THEN DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT)
+           END AS CAP
+    FROM (SELECT DISTINCT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT FROM multi)
+),
+over_cap AS (
+    SELECT m.*, COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS)) AS MAX_TRIP_DAYS
+    FROM multi m
+    JOIN caps c
+      ON c.TRIP_TYPE = m.TRIP_TYPE
+     AND EQUAL_NULL(c.PROPERTY_CD, m.PROPERTY_CD)
+     AND EQUAL_NULL(c.MARKET_CD, m.MARKET_CD)
+     AND c.TRIP_START_DT = m.TRIP_START_DT
+    CROSS JOIN ent e
+    WHERE m.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS))
+      AND NOT EXISTS (SELECT 1
+                      FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                      WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID
+                        AND d.DELETE_IND = 'N'
+                        AND d.TRANSACTION_TYPE = 'HOTEL')
+)
+SELECT TRIP_TYPE,
+       CASE TRIP_TYPE WHEN 'PROPERTY' THEN PROPERTY_CD WHEN 'MARKET' THEN MARKET_CD ELSE 'ENTERPRISE' END AS CODE,
+       MAX_TRIP_DAYS,
+       COUNT(*)                        AS over_cap_trips,
+       COUNT(DISTINCT GUEST_UNIQUE_ID) AS guests,
+       MAX(TRIP_DAYS)                  AS longest_days
+FROM over_cap
+GROUP BY ALL
+ORDER BY over_cap_trips DESC;
+
+
+-- R4a. Just before R3 (and before the deploy): is a trip run in progress? Expect no rows. The root task fires at :15; a
+--      run usually ends well before the next one, so the clean moment is right after the last job of a run has finished.
+SELECT j.JOB_NAME, b.BATCH_ID, b.BATCH_STATUS, b.BATCH_START_DATE, b.UPDATED_DTTM
+FROM DAAS_PROD.DAAS_COMMON.BATCH_S02 b
+JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
+WHERE j.JOB_NAME LIKE 'TRIP%'
+  AND b.BATCH_STATUS NOT IN ('SUCCESS', 'FAILURE')
+  AND b.BATCH_START_DATE >= DATEADD(hour, -3, CURRENT_TIMESTAMP())
+ORDER BY b.BATCH_ID;
+
+
+-- R3. THE ONE WRITE. The replay: every live rating of the batch's target trips is marked on RATINGS_FACT, which puts it in
+--     RATINGS_FACT_STREAM for the next hourly run. Rows updated should equal rating_rows_to_replay for the batch in R2.
+--     The platform's replay pattern (REPLAY_COUNTER up by one, UPDATED_DTTM and UPDATED_BY stamped); the pipeline's own
+--     rating step copies UPDATED_DTTM into TRIP_DETAIL.TRANSACTION_MODIFIED_DTTM, as it does on any replay.
+UPDATE DAAS_PROD.DAAS_CORE.RATINGS_FACT RF
+SET RF.REPLAY_COUNTER = COALESCE(RF.REPLAY_COUNTER, 0) + 1,
+    RF.UPDATED_DTTM   = CURRENT_TIMESTAMP(),
+    RF.UPDATED_BY     = CURRENT_USER()
+WHERE RF.RATINGS_FACT_SK IN (
+    SELECT d.TRANSACTION_TABLE_SK
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TD_BEFORE d
+    JOIN DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS t ON t.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+    WHERE t.BATCH_NO = 1                                  /* the batch being replayed */
+      AND d.TRANSACTION_TABLE = 'RATINGS_FACT'
+      AND d.DELETE_IND = 'N'
+      AND d.TRANSACTION_SUB_TYPE = 'OPENED'
+);
+
+-- R3b. Right after R3: the stream has the rows and the root task will fire at :15. Expect TRUE and rows = rows updated.
+SELECT SYSTEM$STREAM_HAS_DATA('DAAS_PROD.DAAS_CORE.RATINGS_FACT_STREAM') AS ratings_stream_has_data;
+SELECT COUNT(*) AS replayed_rows_waiting
+FROM DAAS_PROD.DAAS_CORE.RATINGS_FACT_STREAM
+WHERE METADATA$ACTION = 'INSERT' AND METADATA$ISUPDATE;
+
+
+-- R4b. Watching the run: the trip jobs' batches since R1, in order. The run is done when TRIP_COMP_WORTH (and the two
+--      after it) show SUCCESS. Expect every step SUCCESS; the ratings step and merge check will take longer than usual.
+--      Then the post-check file.
+SELECT j.JOB_NAME, b.BATCH_ID, b.BATCH_STATUS, b.BATCH_START_DATE, b.UPDATED_DTTM AS last_update,
+       ROUND(DATEDIFF(second, b.BATCH_START_DATE, b.UPDATED_DTTM) / 60, 1) AS minutes
+FROM DAAS_PROD.DAAS_COMMON.BATCH_S02 b
+JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
+WHERE j.JOB_NAME LIKE 'TRIP%'
+  AND b.BATCH_ID > (SELECT value FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_MARKS WHERE mark = 'max_batch_id_before')
+ORDER BY b.BATCH_ID;
+
+-- R4c. (Only if a step shows FAILURE.) The pipeline's own error log for those batches.
+SELECT j.JOB_NAME, e.*
+FROM DAAS_PROD.DAAS_COMMON.BATCH_ERROR_LOG_S02 e
+JOIN DAAS_PROD.DAAS_COMMON.BATCH_S02 b ON b.BATCH_ID = e.BATCH_ID
+JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
+WHERE e.BATCH_ID > (SELECT value FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_MARKS WHERE mark = 'max_batch_id_before')
+ORDER BY e.BATCH_ID, e.CREATED_DTTM;
+
+-- R4d. First look, before the post-check: of the batch's targets, how many are retired, and how many trips the run built
+--      for those guests. Expect retired = the batch's trips, and 0 still live over the cap.
+SELECT COUNT(*)                                            AS targets_in_batch,
+       COUNT_IF(m.DELETE_IND = 'Y')                        AS retired,
+       COUNT_IF(m.DELETE_IND = 'N')                        AS still_live_over_cap,
+       (SELECT COUNT(*) FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER n
+         WHERE n.TRIP_MASTER_ID > (SELECT value FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_MARKS WHERE mark = 'max_trip_master_id_before')
+           AND n.GUEST_UNIQUE_ID IN (SELECT GUEST_UNIQUE_ID FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS WHERE BATCH_NO = 1)) AS trips_built_for_these_guests
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS t
+JOIN DAAS_PROD.DAAS_CORE.TRIP_MASTER m ON m.TRIP_MASTER_ID = t.TRIP_MASTER_ID
+WHERE t.BATCH_NO = 1;
