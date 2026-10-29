@@ -65,6 +65,43 @@ UNION ALL
 SELECT 'in UAT, not so in PROD', * FROM (SELECT * FROM u MINUS SELECT * FROM p)
 ORDER BY 1, 2, 3, 4, 5;
 
+-- L0b2. (Only if L0b returned 'in PROD, not so in UAT' rows — on 29 Oct it did: property HOK and market OKM, both
+--       keys, which PROD has and UAT never received.) Copies those config rows from PROD into UAT, column by name,
+--       and only where UAT has no row at all for that subtype/code/key, so a row UAT has with a different value is
+--       left alone and reported. Then run L0b again: expect no rows. With the rows missing, UAT's config function
+--       returns NULL for those codes: v1.4 falls back to the enterprise cap (30, the same value PROD holds for them),
+--       but the gap rule would compare with NULL, so UAT would not cut those codes quite the way PROD does.
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_cols VARCHAR;
+    v_sql  VARCHAR;
+    v_n    INTEGER;
+    v_left INTEGER;
+BEGIN
+    v_cols := (SELECT LISTAGG(u.COLUMN_NAME, ', ') WITHIN GROUP (ORDER BY u.ORDINAL_POSITION)
+               FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS u
+               JOIN DAAS_PROD.INFORMATION_SCHEMA.COLUMNS p
+                 ON p.TABLE_SCHEMA = u.TABLE_SCHEMA AND p.TABLE_NAME = u.TABLE_NAME AND p.COLUMN_NAME = u.COLUMN_NAME
+               WHERE u.TABLE_SCHEMA = 'DAAS_CORE' AND u.TABLE_NAME = 'TRIP_CONFIG');
+    v_sql := 'INSERT INTO DAAS_UAT.DAAS_CORE.TRIP_CONFIG (' || v_cols || ') ' ||
+             'SELECT ' || v_cols || ' FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG p ' ||
+             'WHERE p.ACTIVE_FLG = ''Y'' AND p.KEY IN (''MAX_TRIP_DAYS'', ''TRIP_GAP_DAYS'') ' ||
+             '  AND NOT EXISTS (SELECT 1 FROM DAAS_UAT.DAAS_CORE.TRIP_CONFIG u ' ||
+             '                  WHERE u.ACTIVE_FLG = ''Y'' AND u.KEY = p.KEY AND u.CONFIG_SUBTYPE = p.CONFIG_SUBTYPE ' ||
+             '                    AND EQUAL_NULL(u.PROPERTY_CD, p.PROPERTY_CD) AND EQUAL_NULL(u.MARKET_CD, p.MARKET_CD))';
+    EXECUTE IMMEDIATE v_sql;
+    v_n := SQLROWCOUNT;
+    v_left := (SELECT COUNT(*) FROM (
+                 SELECT CONFIG_SUBTYPE, PROPERTY_CD, MARKET_CD, KEY, VALUE FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+                 WHERE ACTIVE_FLG = 'Y' AND KEY IN ('MAX_TRIP_DAYS', 'TRIP_GAP_DAYS')
+                 MINUS
+                 SELECT CONFIG_SUBTYPE, PROPERTY_CD, MARKET_CD, KEY, VALUE FROM DAAS_UAT.DAAS_CORE.TRIP_CONFIG
+                 WHERE ACTIVE_FLG = 'Y' AND KEY IN ('MAX_TRIP_DAYS', 'TRIP_GAP_DAYS')));
+    RETURN v_n || ' config row(s) copied from PROD into UAT; ' || v_left
+           || ' PROD row(s) still differ from UAT (0 expected; if not 0, UAT holds the same key with another value: look at L0b)';
+END;
+$$;
+
 -- L0c. v1.4 is live in UAT, and no trip job is running. Expect 'v1.4 is live in UAT' and 0.
 SELECT IFF(CONTAINS(GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_MERGE_CHECK_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)'),
                     'my_sql_command_3A'), 'v1.4 is live in UAT', 'UAT runs the old version: deploy v1.4 first') AS merge_check_version,
@@ -93,10 +130,9 @@ CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS (mark VARCHA
 INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L1_START', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'week 2026-09-28..2026-10-04; window 2026-06-30..2027-01-02');
 
 -- L1a. The guests: WEEK (every guest with a rating in the week, from the PROD sizing) and EXPOSURE (the reach check's
---      draw). A guest in both is EXPOSURE (whole history loaded). Batches: the EXPOSURE guests and a tenth of the WEEK
---      guests in batch 1, the rest spread over batches 2-10 by a hash of the guest id, so part 2 can replay the week
---      a slice at a time (each slice is one pass of the chain, as PROD runs it hourly). Change the 10 to use fewer,
---      bigger slices once batch 1 has shown how long a pass takes.
+--      draw). A guest in both is EXPOSURE (whole history loaded). Batches: two. The EXPOSURE guests and half of the
+--      WEEK guests in batch 1, the other half in batch 2, split by a hash of the guest id; each batch is one pass of
+--      the chain. (The 2 in MOD(..., 2) is the number of batches; part 2 takes the batch range to run.)
 CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP AS
 WITH wk AS (SELECT GUEST_UNIQUE_ID FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_WK_GUESTS),
 ex AS (SELECT GUEST_UNIQUE_ID, LISTAGG(DISTINCT TRIP_TYPE || ' ' || CODE, ', ') WITHIN GROUP (ORDER BY TRIP_TYPE || ' ' || CODE) AS exposure_codes,
@@ -107,7 +143,7 @@ SELECT COALESCE(ex.GUEST_UNIQUE_ID, wk.GUEST_UNIQUE_ID)         AS GUEST_UNIQUE_
        ex.exposure_codes                                        AS EXPOSURE_CODES,
        COALESCE(ex.over_cap_trips, 0)                           AS EXPECTED_OVER_CAP_TRIPS,
        IFF(ex.GUEST_UNIQUE_ID IS NOT NULL, 1,
-           MOD(ABS(HASH(COALESCE(ex.GUEST_UNIQUE_ID, wk.GUEST_UNIQUE_ID))), 10) + 1) AS BATCH_NO
+           MOD(ABS(HASH(COALESCE(ex.GUEST_UNIQUE_ID, wk.GUEST_UNIQUE_ID))), 2) + 1) AS BATCH_NO
 FROM wk
 FULL OUTER JOIN ex ON ex.GUEST_UNIQUE_ID = wk.GUEST_UNIQUE_ID;
 
@@ -134,7 +170,7 @@ BEGIN
     v_ts := (SELECT TO_VARCHAR(DATEADD(minute, -2, CURRENT_TIMESTAMP()), 'YYYY-MM-DD"T"HH24:MI:SS.FF3TZH:TZM'));
     DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS WHERE mark = 'snapshot_epoch';
     INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS (mark, value) SELECT 'snapshot_epoch', DATE_PART(epoch_second, :v_ts::TIMESTAMP_TZ);
-    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L2_SNAPSHOT_AT', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_ts);
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG SELECT 'L2_SNAPSHOT_AT', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_ts;
 
     -- TRIP_MASTER
     v_sql := 'CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM AS
@@ -170,12 +206,25 @@ BEGIN
     v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_DAS);
     v_log := v_log || 'DAILY_ACTIVITY_SUMMARY~|~' || v_n || '#ROW#';
 
-    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L2_COPIED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, REPLACE(REPLACE(:v_log, '~|~', ' '), '#ROW#', '; '));
+    -- (INSERT ... SELECT, not VALUES: Snowflake refuses a function over a bind variable inside a VALUES clause.)
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG SELECT 'L2_COPIED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, REPLACE(REPLACE(:v_log, '~|~', ' '), '#ROW#', '; ');
     res := (SELECT SPLIT_PART(t.value, '~|~', 1) AS table_copied, SPLIT_PART(t.value, '~|~', 2)::NUMBER AS rows_copied, :v_ts AS snapshot_at
             FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
     RETURN TABLE(res);
 END;
 $$;
+
+-- L2b. (Only if the first run of L2 stopped on its last line, 29 Oct: the four copies had already landed and only the
+--      log line failed.) Writes that log line from the tables themselves — it errors if any of the four is missing,
+--      in which case run L2 again — and shows the sizes: expect about 9.6M, 165M, 9.6M and 14.5M.
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG
+SELECT 'L2_COPIED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+       'TRIP_MASTER '              || (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM)
+    || '; TRIP_DETAIL '            || (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD)
+    || '; TRIP_SUMMARY '           || (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TS)
+    || '; DAILY_ACTIVITY_SUMMARY ' || (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_DAS)
+    || ' (written after the block)';
+SELECT step, logged_at, note FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG ORDER BY logged_at;
 
 
 -- ===================================================================================================
@@ -354,8 +403,8 @@ BEGIN
     DELETE FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER            WHERE TRIP_MASTER_ID IN (SELECT TRIP_MASTER_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_OUT);
     v_c := SQLROWCOUNT;
     v_log := v_log || '3 deleted~|~ok~|~TRIP_MASTER ' || v_c || ', TRIP_DETAIL ' || v_k || ', TRIP_SUMMARY ' || v_m || ', DAILY_ACTIVITY_SUMMARY ' || v_n || '#ROW#';
-    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L4_DELETED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
-        'TRIP_MASTER ' || :v_c || ', TRIP_DETAIL ' || :v_k || ', TRIP_SUMMARY ' || :v_m || ', DAILY_ACTIVITY_SUMMARY ' || :v_n);
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG SELECT 'L4_DELETED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+        'TRIP_MASTER ' || :v_c || ', TRIP_DETAIL ' || :v_k || ', TRIP_SUMMARY ' || :v_m || ', DAILY_ACTIVITY_SUMMARY ' || :v_n;
 
     -- 4. Insert, column by name (the common columns of the UAT table and the copy), parents first.
     LET rs_t RESULTSET := (SELECT column1 AS tbl, column2 AS src
@@ -377,13 +426,13 @@ BEGIN
         EXECUTE IMMEDIATE v_sql;
         v_n := SQLROWCOUNT;
         v_log := v_log || '4 loaded ' || v_tbl || '~|~ok~|~' || v_n || ' rows#ROW#';
-        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L4_LOADED_' || :v_tbl, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_n || ' rows');
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG SELECT 'L4_LOADED_' || :v_tbl, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_n || ' rows';
     END FOR;
 
     -- 5. The high-water mark: everything the replay builds will carry a higher trip id.
     v_max_tm := (SELECT MAX(TRIP_MASTER_ID) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER);
     DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS WHERE mark = 'max_trip_master_id_before';
-    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS (mark, value) VALUES ('max_trip_master_id_before', :v_max_tm);
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS (mark, value) SELECT 'max_trip_master_id_before', :v_max_tm;
     v_log := v_log || '5 mark~|~ok~|~highest trip id in UAT now ' || v_max_tm || '#ROW#';
 
     -- 6. Move the streams past the load. Each: a holder table of the stream's shape, then an INSERT reading the stream
@@ -419,7 +468,7 @@ BEGIN
         END;
     END FOR;
 
-    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L4_DONE', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'loaded and streams moved');
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG SELECT 'L4_DONE', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'loaded and streams moved';
     v_log := v_log || 'END~|~done~|~next: L5, then part 2#ROW#';
     res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
             FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
