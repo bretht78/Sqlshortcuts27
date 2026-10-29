@@ -1,0 +1,504 @@
+-- DAASI-3641: the full-week UAT test, part 2 of 3 — the replay, a batch at a time.
+--
+-- The week is replayed in slices (WT_POP.BATCH_NO: batch 1 holds the EXPOSURE guests and a tenth of the WEEK guests,
+-- batches 2-10 the rest), each slice one pass of the chain the way PROD runs it hourly: the touch, then merge check
+-- (v1.4) → merge → customer merge check → summaries → comp worth → non-gaming revenue, each started through its
+-- on-demand task and watched in the pipeline's batch log. Run batch 1 alone first (v_batch_from = v_batch_to = 1):
+-- it exercises the rule on the exposure guests and shows how long one pass takes; then run 2 to 10 in one go.
+--
+-- The touch is what the ratings step writes for a replay (the proof's B1): the batch's rating rows marked in
+-- TRIP_DETAIL on every live trip holding them (UPDATED_DTTM, UPDATED_BY, BATCH_ID, LAST_DML_CD 'U'), and each of
+-- those trips rewritten in TRIP_MASTER. Tag: UPDATED_BY 'DAASI-3641 week test', BATCH_ID -36415.
+--
+-- Known UAT behaviour the block handles on its own: the merge step's last statement (recreating merge check's stream)
+-- fails on privileges in UAT after its data is committed, so a TRIP_MERGE 'FAILURE' whose work is in
+-- TRIP_MERGE_PROCESSED is treated as done and the stream is moved past the merge's own changes (kept in
+-- DAASI_3641_WT_MERGE_CHANGES), exactly what that statement was for. UAT's POS summary code is switched off for step 5
+-- and back on after. The customer merge itself is never run (privileges); its queue rows are counted and left.
+--
+--   R1   the block (parameters at the top of DECLARE)
+--   R2   progress, from another worksheet
+--   R3   if a step stopped: the error log, and the merge-committed check
+--   R4   POS switch back on by hand, if R1 says to
+--   R5   what has been nominated so far, by batch and class
+
+USE ROLE DAAS_TEAM;
+USE SECONDARY ROLES ALL;
+
+
+-- R0. Once, before the first batch: the two tables the block appends to (what merge check nominated, by batch; and the
+--     merge's own stream changes it moves past). Creating the second one reads merge check's stream with no rows kept.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE (
+    batch_no INTEGER, merge_check_batch_id NUMBER(38,0), trip_master_id NUMBER(38,0), why VARCHAR,
+    trip_type VARCHAR, code VARCHAR, trip_days NUMBER(38,0), max_trip_days NUMBER(38,0), has_hotel_stay VARCHAR, grp VARCHAR);
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES AS
+SELECT 0::INTEGER AS batch_no, 0::NUMBER(38,0) AS merge_batch_id, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ AS kept_at, s.*
+FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM s
+WHERE 0 = 1;
+
+
+-- R1. The block.
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_batch_from INTEGER DEFAULT 1;     -- first batch to replay in this run
+    v_batch_to   INTEGER DEFAULT 1;     -- last batch to replay in this run (1 first; then 2 to 10)
+    v_resume_at  INTEGER DEFAULT 0;     -- 0: fresh (touch, then steps 2-7) for v_batch_from; 2..7: that batch was touched, resume at this step
+    v_skip_pos   BOOLEAN DEFAULT TRUE;  -- step 5 runs with UAT's broken POS summary sub-step switched off
+    v_max_wait   INTEGER DEFAULT 10800; -- longest wait for one step, seconds (3 hours)
+    v_tag        VARCHAR DEFAULT 'DAASI-3641 week test';
+    v_bid        INTEGER DEFAULT -36415;
+    v_log        VARCHAR DEFAULT '';
+    v_txt        VARCHAR;
+    v_out        VARCHAR;
+    v_job        VARCHAR;
+    v_task       VARCHAR;
+    v_cmd        VARCHAR;
+    v_wait       VARCHAR;
+    v_who        VARCHAR DEFAULT '';
+    v_status     VARCHAR;
+    v_has        BOOLEAN;
+    v_can_read   BOOLEAN DEFAULT TRUE;
+    v_grants     BOOLEAN DEFAULT TRUE;
+    v_n          INTEGER;
+    v_m          INTEGER;
+    v_k          INTEGER;
+    v_c          INTEGER;
+    v_step       INTEGER;
+    v_waited     INTEGER;
+    v_mark       NUMBER(38,0);
+    v_batchid    NUMBER(38,0);
+    v_max_tm     NUMBER(38,0);
+    v_b          INTEGER;
+    v_touch      INTEGER;
+    v_expect     INTEGER;
+    v_marked     INTEGER;
+    v_pos_id     INTEGER;
+    v_pos_off    BOOLEAN DEFAULT FALSE;
+    v_first      BOOLEAN DEFAULT TRUE;
+    v_start      INTEGER;
+    v_t0         TIMESTAMP_NTZ;
+    res          RESULTSET;
+    test_stop    EXCEPTION (-20645, 'DAASI-3641 week test stopped, see the rows');
+BEGIN
+    ---------------------------------------------------------------- preflight, once
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
+             WHERE j.JOB_NAME LIKE 'TRIP%' AND b.BATCH_STATUS = 'IN PROGRESS'
+               AND b.BATCH_START_DATE >= DATEADD(hour, -6, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ));
+    IF (v_n > 0) THEN
+        v_log := v_log || 'P0 runs~|~STOP~|~' || v_n || ' trip job(s) IN PROGRESS: let them finish, then run this block again#ROW#';
+        RAISE test_stop;
+    END IF;
+    v_has := (SELECT CONTAINS(GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_MERGE_CHECK_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)'), 'my_sql_command_3A'));
+    IF (NOT v_has) THEN
+        v_log := v_log || 'P1 version~|~STOP~|~UAT runs the old TRIP_MERGE_CHECK_PROC: deploy v1.4 first#ROW#';
+        RAISE test_stop;
+    END IF;
+    v_max_tm := (SELECT value FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS WHERE mark = 'max_trip_master_id_before');
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG WHERE step = 'L4_DONE');
+    IF (v_max_tm IS NULL OR v_n = 0) THEN
+        v_log := v_log || 'P1 load~|~STOP~|~part 1 has not finished (no L4_DONE in the log): run part 1 first#ROW#';
+        RAISE test_stop;
+    END IF;
+    v_log := v_log || 'P1 setup~|~ok~|~v1.4 live; load done; batches ' || v_batch_from || ' to ' || v_batch_to
+                   || IFF(v_resume_at > 0, ', resuming batch ' || v_batch_from || ' at step ' || v_resume_at, '')
+                   || '; role ' || CURRENT_ROLE() || ', warehouse ' || COALESCE(CURRENT_WAREHOUSE(), '(none)') || '#ROW#';
+
+    -- the on-demand tasks (the proof's P5 lookup), and their timeouts for the record
+    SHOW TASKS IN SCHEMA DAAS_UAT.DAAS_COMMON;
+    CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TASKS AS
+    WITH steps AS (
+        SELECT column1 AS step_no, column2 AS job_name, column3 AS stream_name
+        FROM VALUES (2, 'TRIP_MERGE_CHECK',                      'DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'),
+                    (3, 'TRIP_MERGE',                            'DAAS_CORE.TRIP_MERGE_QUEUE_STREAM'),
+                    (4, 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER', 'DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM'),
+                    (5, 'TRIP_SUMMARY_WRAPPER',                  'DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'),
+                    (6, 'TRIP_COMP_WORTH',                       NULL),
+                    (7, 'TRIP_NG_REVENUE_SUMMARY',               NULL)),
+    tasks AS (
+        SELECT "name"::VARCHAR AS task_name, "state"::VARCHAR AS task_state, "definition"::VARCHAR AS task_definition,
+               REPLACE(UPPER("definition"::VARCHAR), ' ', '') AS def_n,
+               COALESCE(ARRAY_SIZE("predecessors"), 0) AS predecessor_count
+        FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+        WHERE "name" ILIKE '%ONDEMAND%')
+    SELECT s.step_no, s.job_name, s.stream_name, t.task_name, t.task_state, t.task_definition, t.predecessor_count,
+           COUNT(t.task_name) OVER (PARTITION BY s.step_no) AS candidates,
+           (t.def_n ILIKE ('%BATCH_CONTROL_DATA_LOAD_WRAPPER_PROC(''' || s.job_name || '''%')
+            AND (s.stream_name IS NULL OR REGEXP_COUNT(t.def_n, ',') = 2 OR t.def_n ILIKE ('%' || s.stream_name || '''%'))) AS definition_ok
+    FROM steps s
+    LEFT JOIN tasks t ON t.task_definition ILIKE ('%''' || s.job_name || '''%')
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY s.step_no ORDER BY t.task_name) = 1;
+    v_txt := (SELECT COALESCE(LISTAGG('step ' || step_no || ' ' || job_name || ': '
+                                      || CASE WHEN task_name IS NULL THEN 'no on-demand task calls this job'
+                                              WHEN candidates > 1 THEN candidates || ' on-demand tasks call this job'
+                                              WHEN predecessor_count > 0 THEN task_name || ' runs after another task'
+                                              WHEN NOT definition_ok THEN task_name || ' calls something else: ' || task_definition
+                                              ELSE task_name || ' is ' || task_state || ', so it runs on its own schedule' END, '; ')
+                              WITHIN GROUP (ORDER BY step_no), '')
+              FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TASKS
+              WHERE task_name IS NULL OR candidates > 1 OR predecessor_count > 0 OR NOT definition_ok OR task_state <> 'suspended');
+    IF (v_txt <> '') THEN
+        v_log := v_log || 'P2 tasks~|~STOP~|~' || REPLACE(REPLACE(v_txt, '#ROW#', ''), '~|~', '') || '#ROW#';
+        RAISE test_stop;
+    END IF;
+    v_txt := '';
+    LET rs_to RESULTSET := (SELECT step_no, task_name FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TASKS ORDER BY step_no);
+    LET c_to CURSOR FOR rs_to;
+    FOR r IN c_to DO
+        v_task := r.task_name;
+        BEGIN
+            v_cmd := 'SHOW PARAMETERS LIKE ''USER_TASK_TIMEOUT_MS'' IN TASK DAAS_UAT.DAAS_COMMON.' || v_task;
+            EXECUTE IMMEDIATE v_cmd;
+            v_out := (SELECT MAX("value"::VARCHAR) FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+            v_txt := v_txt || r.step_no || ' ' || v_task || ' ' || ROUND(TRY_TO_NUMBER(v_out) / 60000) || ' min; ';
+        EXCEPTION
+            WHEN OTHER THEN
+                v_txt := v_txt || r.step_no || ' ' || v_task || ' (timeout not visible); ';
+        END;
+    END FOR;
+    v_log := v_log || 'P2 tasks~|~ok~|~task timeouts: ' || v_txt || 'a step that runs past its timeout is cancelled by Snowflake and rolled back#ROW#';
+
+    -- the POS switch row
+    IF (v_skip_pos) THEN
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG
+                WHERE transaction_type = 'POS' AND active_flg = 'Y' AND stored_procedure_name ILIKE '%TRIP_POS_SUMMARY_LOAD_PROC');
+        v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG WHERE transaction_type = 'POS' AND active_flg = 'N');
+        IF (v_n = 0 AND v_m > 0) THEN
+            v_log := v_log || 'P3 POS switch~|~STOP~|~UAT''s POS summary row is already switched off: run R4, then this block again#ROW#';
+            RAISE test_stop;
+        END IF;
+        IF (v_n <> 1) THEN
+            v_log := v_log || 'P3 POS switch~|~STOP~|~expected one active POS row in TRIP_SUMMARY_CONFIG, found ' || v_n || '#ROW#';
+            RAISE test_stop;
+        END IF;
+        v_pos_id := (SELECT MIN(trip_summary_config_id) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG
+                     WHERE transaction_type = 'POS' AND active_flg = 'Y' AND stored_procedure_name ILIKE '%TRIP_POS_SUMMARY_LOAD_PROC');
+    END IF;
+
+    -- may this session write the touch, and read merge check's stream row by row?
+    UPDATE DAAS_UAT.DAAS_CORE.TRIP_DETAIL SET last_dml_cd = last_dml_cd WHERE 1 = 0;
+    UPDATE DAAS_UAT.DAAS_CORE.TRIP_MASTER SET last_dml_cd = last_dml_cd WHERE 1 = 0;
+    BEGIN
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM WHERE METADATA$ACTION = 'INSERT' AND 1 = 0);
+        v_can_read := TRUE;
+    EXCEPTION
+        WHEN OTHER THEN
+            v_can_read := FALSE;
+    END;
+    v_log := v_log || 'P3 session~|~ok~|~may update TRIP_DETAIL and TRIP_MASTER; merge check''s stream '
+                   || IFF(v_can_read, 'readable row by row', 'checked with SYSTEM$STREAM_HAS_DATA only') || '#ROW#';
+
+    ---------------------------------------------------------------- the batches
+    v_b := v_batch_from;
+    WHILE (v_b <= v_batch_to) DO
+        v_t0 := (SELECT CURRENT_TIMESTAMP()::TIMESTAMP_NTZ);
+        v_start := (SELECT IFF(:v_first AND :v_resume_at > 0, :v_resume_at, 0));
+        v_first := FALSE;
+        v_touch  := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT WHERE BATCH_NO = :v_b);
+        v_expect := (SELECT COUNT_IF(EXPECT_NOMINATION) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT WHERE BATCH_NO = :v_b);
+        IF (v_touch = 0) THEN
+            v_log := v_log || 'B' || v_b || ' batch~|~STOP~|~batch ' || v_b || ' has no trips to touch (WT_EXPECT): check WT_POP.BATCH_NO#ROW#';
+            RAISE test_stop;
+        END IF;
+
+        -- the streams must hold nothing but ours before a touch
+        IF (v_start = 0) THEN
+            IF (v_can_read) THEN
+                v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM WHERE METADATA$ACTION = 'INSERT');
+            ELSE
+                v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'));
+                v_n := IFF(v_has, 1, 0);
+            END IF;
+            v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM WHERE METADATA$ACTION = 'INSERT');
+            v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM WHERE METADATA$ACTION = 'INSERT');
+            IF (v_n > 0 OR v_m > 0) THEN
+                v_log := v_log || 'B' || v_b || ' streams~|~STOP~|~before touching batch ' || v_b || ' the streams are not empty: merge check '
+                               || v_n || ', detail summary ' || v_m
+                               || '. If the previous batch stopped mid-way, resume it (v_resume_at); otherwise run R2 and R3 to see whose rows they are#ROW#';
+                RAISE test_stop;
+            END IF;
+            IF (v_k > 0) THEN
+                v_log := v_log || 'B' || v_b || ' streams~|~note~|~the merge queue already holds ' || v_k
+                               || ' row(s) (a single nomination the previous batch''s merge left waiting, as PROD would); they merge with this batch''s#ROW#';
+            END IF;
+
+            ---------------------------------------------------------------- the touch
+            UPDATE DAAS_UAT.DAAS_CORE.TRIP_DETAIL d
+               SET updated_dttm = CURRENT_TIMESTAMP(), updated_by = :v_tag, batch_id = :v_bid, last_dml_cd = 'U'
+              FROM (SELECT t.TRIP_MASTER_ID, t.TRANSACTION_TABLE_SK
+                    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TOUCH_DETAIL t
+                    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT e ON e.TRIP_MASTER_ID = t.TRIP_MASTER_ID
+                    WHERE e.BATCH_NO = :v_b) x
+             WHERE d.trip_master_id = x.TRIP_MASTER_ID
+               AND d.transaction_table_sk = x.TRANSACTION_TABLE_SK
+               AND d.transaction_table = 'RATINGS_FACT'
+               AND d.delete_ind = 'N';
+            v_marked := SQLROWCOUNT;
+            UPDATE DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+               SET updated_dttm = CURRENT_TIMESTAMP(), updated_by = :v_tag, batch_id = :v_bid, last_dml_cd = 'U'
+              FROM (SELECT TRIP_MASTER_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT WHERE BATCH_NO = :v_b) x
+             WHERE m.trip_master_id = x.TRIP_MASTER_ID
+               AND m.delete_ind = 'N';
+            v_n := SQLROWCOUNT;
+            v_txt := 'batch ' || v_b || ': ' || v_marked || ' TRIP_DETAIL rows marked, ' || v_n || ' TRIP_MASTER rows rewritten (' || v_touch || ' expected), '
+                  || v_expect || ' of them over the cap with no stay';
+            INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('B' || :v_b || '_TOUCHED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_txt);
+            IF (v_n <> v_touch) THEN
+                v_log := v_log || 'B' || v_b || ' touch~|~STOP~|~' || v_txt || ': the master count is off, no step started. '
+                               || 'Some trips of the batch are no longer live in UAT (an earlier batch merged them?): run R5 and send it#ROW#';
+                RAISE test_stop;
+            END IF;
+            IF (v_can_read) THEN
+                v_m := (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM
+                        WHERE METADATA$ACTION = 'INSERT' AND batch_id = :v_bid AND updated_by = :v_tag);
+                v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM WHERE METADATA$ACTION = 'INSERT');
+                IF (v_m <> v_touch OR v_k > v_m) THEN
+                    v_log := v_log || 'B' || v_b || ' touch~|~STOP~|~' || v_txt || '; merge check''s stream shows ' || v_m || ' of our trips and '
+                                   || (v_k - v_m) || ' other rows. No step started#ROW#';
+                    RAISE test_stop;
+                END IF;
+            END IF;
+            v_log := v_log || 'B' || v_b || ' touch~|~ok~|~' || v_txt || '#ROW#';
+        ELSE
+            v_log := v_log || 'B' || v_b || ' touch~|~skipped~|~resuming at step ' || v_start || '#ROW#';
+        END IF;
+
+        ---------------------------------------------------------------- the steps
+        v_step := GREATEST(v_start, 2);
+        WHILE (v_step <= 7) DO
+            v_job  := (SELECT job_name  FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TASKS WHERE step_no = :v_step);
+            v_task := (SELECT task_name FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TASKS WHERE step_no = :v_step);
+
+            v_has := TRUE;
+            IF (v_job = 'TRIP_MERGE_CHECK') THEN
+                v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'));
+            ELSEIF (v_job = 'TRIP_MERGE') THEN
+                v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM'));
+            ELSEIF (v_job = 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER') THEN
+                v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM'));
+            ELSEIF (v_job = 'TRIP_SUMMARY_WRAPPER') THEN
+                v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM'));
+            ELSEIF (v_job = 'TRIP_NG_REVENUE_SUMMARY') THEN
+                BEGIN
+                    v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_NG_VW_STREAM'));
+                EXCEPTION
+                    WHEN OTHER THEN v_has := FALSE;
+                END;
+            END IF;
+
+            IF (NOT v_has) THEN
+                IF (v_job = 'TRIP_MERGE_CHECK') THEN
+                    v_log := v_log || 'B' || v_b || ' S2 TRIP_MERGE_CHECK~|~STOP~|~merge check''s stream is empty: nothing to evaluate#ROW#';
+                    RAISE test_stop;
+                END IF;
+                v_log := v_log || 'B' || v_b || ' S' || v_step || ' ' || v_job || '~|~'
+                               || IFF(v_job = 'TRIP_MERGE', IFF(v_expect = 0, 'ok', 'LOOK'), 'skipped') || '~|~'
+                               || IFF(v_job = 'TRIP_MERGE', 'merge check nominated nothing (' || v_expect || ' re-cuts were expected in this batch)',
+                                      'its stream is empty, so the job has no work') || '#ROW#';
+            ELSE
+                IF (v_job = 'TRIP_SUMMARY_WRAPPER' AND v_skip_pos) THEN
+                    UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'N' WHERE trip_summary_config_id = :v_pos_id AND active_flg = 'Y';
+                    v_n := SQLROWCOUNT;
+                    v_pos_off := (v_n > 0);
+                    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('B' || :v_b || '_POS_OFF', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_n || ' row(s)');
+                    IF (v_n <> 1) THEN
+                        v_log := v_log || 'B' || v_b || ' S5 POS switch~|~STOP~|~switching the POS sub-step off changed ' || v_n || ' rows instead of 1; step 5 not started#ROW#';
+                        RAISE test_stop;
+                    END IF;
+                END IF;
+
+                v_mark := (SELECT COALESCE(MAX(batch_id), 0) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02);
+                BEGIN
+                    v_cmd := 'EXECUTE TASK DAAS_UAT.DAAS_COMMON.' || v_task;
+                    EXECUTE IMMEDIATE v_cmd;
+                EXCEPTION
+                    WHEN OTHER THEN
+                        v_log := v_log || 'B' || v_b || ' S' || v_step || ' ' || v_job || '~|~STOP~|~could not start ' || v_task || ': '
+                                       || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '') || '#ROW#';
+                        RAISE test_stop;
+                END;
+
+                v_waited := 0;
+                v_status := NULL;
+                WHILE (v_waited < v_max_wait) DO
+                    v_wait := (SELECT SYSTEM$WAIT(20));
+                    v_waited := v_waited + 20;
+                    v_status := (SELECT MAX_BY(b.batch_status, b.batch_id) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+                                 JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+                                 WHERE j.job_name = :v_job AND b.batch_id > :v_mark);
+                    IF (v_status IS NOT NULL AND v_status <> 'IN PROGRESS') THEN BREAK; END IF;
+                    IF (v_status IS NULL AND v_waited >= 900) THEN BREAK; END IF;
+                END WHILE;
+                IF (v_pos_off) THEN
+                    UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y' WHERE trip_summary_config_id = :v_pos_id AND active_flg = 'N';
+                    v_pos_off := FALSE;
+                    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('B' || :v_b || '_POS_ON', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'POS row back on');
+                END IF;
+                IF (v_status IS NULL) THEN
+                    v_log := v_log || 'B' || v_b || ' S' || v_step || ' ' || v_job || '~|~STOP~|~' || v_task
+                                   || ' was started but logged no run within 15 minutes; its TASK_HISTORY says why (a SKIPPED run means its WHEN condition was false). '
+                                   || 'Then rerun with v_batch_from = ' || v_b || ', v_resume_at = ' || v_step || '#ROW#';
+                    RAISE test_stop;
+                END IF;
+                v_batchid := (SELECT MAX(b.batch_id) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+                              WHERE j.job_name = :v_job AND b.batch_id > :v_mark);
+                v_txt := 'b' || v_b || '_' || LOWER(v_job) || '_batch';
+                DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS WHERE mark = :v_txt;
+                INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS (mark, value) VALUES (:v_txt, :v_batchid);
+                IF (v_status = 'IN PROGRESS') THEN
+                    v_log := v_log || 'B' || v_b || ' S' || v_step || ' ' || v_job || '~|~STOP~|~still running after ' || (v_max_wait / 60)::INTEGER
+                                   || ' minutes (batch ' || v_batchid || '). Let it finish (R2), then rerun with v_batch_from = ' || v_b
+                                   || ', v_resume_at = ' || (v_step + 1) || '#ROW#';
+                    RAISE test_stop;
+                END IF;
+
+                -- what it did
+                IF (v_job = 'TRIP_MERGE_CHECK') THEN
+                    IF (NOT STARTSWITH(v_status, 'SUCCESS')) THEN
+                        v_log := v_log || 'B' || v_b || ' S2 TRIP_MERGE_CHECK~|~STOP~|~' || LEFT(v_status, 400) || ' (batch ' || v_batchid || '). Send R3#ROW#';
+                        RAISE test_stop;
+                    END IF;
+                    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE
+                    SELECT :v_b, :v_batchid, q.trip_master_id,
+                           CASE WHEN e.EXPECT_NOMINATION THEN 'over cap, no stay: the new rule'
+                                WHEN e.TRIP_MASTER_ID IS NOT NULL THEN 'touched, within cap or with a stay: nominated by a join rule'
+                                ELSE 'not touched: partner of a join' END,
+                           e.TRIP_TYPE, e.CODE, e.TRIP_DAYS, e.MAX_TRIP_DAYS, e.HAS_HOTEL_STAY, e.GRP
+                    FROM (SELECT DISTINCT trip_master_id FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE WHERE batch_id = :v_batchid) q
+                    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT e ON e.TRIP_MASTER_ID = q.trip_master_id;
+                    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE WHERE batch_no = :v_b AND why LIKE 'over cap, no stay%');
+                    v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE WHERE batch_no = :v_b AND why LIKE 'touched, within%');
+                    v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE WHERE batch_no = :v_b AND why LIKE 'not touched%');
+                    v_log := v_log || 'B' || v_b || ' S2 TRIP_MERGE_CHECK~|~' || IFF(v_n = v_expect, 'ok', 'LOOK') || '~|~' || LEFT(v_status, 60)
+                                   || ' (batch ' || v_batchid || ', ' || DATEDIFF(minute, v_t0, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ) || ' min into the batch); new rule: '
+                                   || v_n || ' of ' || v_expect || ' expected; join rules: ' || v_m || ' touched trips and ' || v_k || ' untouched partners#ROW#';
+                ELSEIF (v_job = 'TRIP_MERGE') THEN
+                    v_c := (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_CORE.TRIP_MERGE_PROCESSED WHERE batch_id = :v_batchid);
+                    v_m := (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE WHERE batch_no = :v_b);
+                    IF (NOT (STARTSWITH(v_status, 'SUCCESS') OR STARTSWITH(v_status, 'Alert'))) THEN
+                        IF (v_c > 0 AND v_c >= v_m) THEN
+                            -- UAT's known failure: the data is committed, only the closing stream reset failed. Do what it was for.
+                            BEGIN
+                                INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES
+                                SELECT :v_b, :v_batchid, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, * FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM;
+                                v_n := SQLROWCOUNT;
+                                v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~ok~|~UAT''s expected FAILURE (stream reset, privileges) after committing: '
+                                               || v_c || ' trips processed; merge check''s stream moved past the merge''s ' || v_n || ' changes (kept)#ROW#';
+                            EXCEPTION
+                                WHEN OTHER THEN
+                                    v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~STOP~|~merge committed (' || v_c || ' processed) but its stream could not be moved by this session: '
+                                                   || REPLACE(REPLACE(LEFT(SQLERRM, 160), '#ROW#', ''), '~|~', '') || '. Run R3b by hand, then rerun with v_batch_from = ' || v_b || ', v_resume_at = 4#ROW#';
+                                    RAISE test_stop;
+                            END;
+                        ELSE
+                            v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~STOP~|~' || LEFT(v_status, 400) || ' (batch ' || v_batchid || '), '
+                                           || v_c || ' of ' || v_m || ' nominated trips processed: the merge did not commit. Send R3#ROW#';
+                            RAISE test_stop;
+                        END IF;
+                    ELSEIF (STARTSWITH(v_status, 'Alert')) THEN
+                        v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~note~|~' || LEFT(v_status, 80) || ' (batch ' || v_batchid
+                                       || '): a single nomination waits in the merge queue until another arrives, as in PROD; it rides along with the next batch#ROW#';
+                    ELSE
+                        v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~ok~|~' || LEFT(v_status, 60) || ' (batch ' || v_batchid || '); ' || v_c || ' trips processed#ROW#';
+                    END IF;
+                    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT e JOIN DAAS_UAT.DAAS_CORE.TRIP_MASTER m ON m.trip_master_id = e.TRIP_MASTER_ID
+                            WHERE e.BATCH_NO = :v_b AND e.EXPECT_NOMINATION AND m.delete_ind = 'Y');
+                    v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT e JOIN DAAS_UAT.DAAS_CORE.TRIP_MASTER m ON m.trip_master_id = e.TRIP_MASTER_ID
+                            WHERE e.BATCH_NO = :v_b AND NOT e.EXPECT_NOMINATION AND m.delete_ind = 'Y');
+                    v_log := v_log || 'B' || v_b || ' S3 outcome~|~' || IFF(v_n = v_expect, 'ok', 'LOOK') || '~|~' || v_n || ' of ' || v_expect
+                                   || ' over-cap no-stay trips retired; ' || v_k || ' other touched trips retired by the join rules (part 3 lists them with their partners)#ROW#';
+                ELSEIF (v_job = 'TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER') THEN
+                    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_CUSTOMER_MERGE_QUEUE_STREAM WHERE METADATA$ACTION = 'INSERT');
+                    v_log := v_log || 'B' || v_b || ' S4 TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER~|~' || IFF(STARTSWITH(v_status, 'SUCCESS'), 'ok', 'note') || '~|~'
+                                   || LEFT(v_status, 120) || '; ' || v_n || ' guest-merge rows waiting in the customer-merge queue (left; that step cannot run in UAT)#ROW#';
+                ELSEIF (v_job = 'TRIP_SUMMARY_WRAPPER') THEN
+                    IF (NOT STARTSWITH(v_status, 'SUCCESS')) THEN
+                        v_log := v_log || 'B' || v_b || ' S5 TRIP_SUMMARY_WRAPPER~|~STOP~|~' || LEFT(v_status, 400) || ' (batch ' || v_batchid
+                                       || '). The trip records of this batch are complete and checkable; its summary rows are not. Send R3, then rerun with v_batch_from = '
+                                       || v_b || ', v_resume_at = 5#ROW#';
+                        RAISE test_stop;
+                    END IF;
+                    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY WHERE batch_id = :v_batchid);
+                    v_log := v_log || 'B' || v_b || ' S5 TRIP_SUMMARY_WRAPPER~|~ok~|~' || LEFT(v_status, 60) || ' (batch ' || v_batchid || '); ' || v_n || ' summary rows written'
+                                   || IFF(v_skip_pos, '; POS sub-step off, by design', '') || '#ROW#';
+                ELSE
+                    v_log := v_log || 'B' || v_b || ' S' || v_step || ' ' || v_job || '~|~' || IFF(STARTSWITH(v_status, 'SUCCESS'), 'ok', 'note') || '~|~'
+                                   || LEFT(v_status, 200) || ' (batch ' || v_batchid || ')#ROW#';
+                END IF;
+            END IF;
+            v_step := v_step + 1;
+        END WHILE;
+
+        v_txt := 'batch ' || v_b || ' done in ' || DATEDIFF(minute, v_t0, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ) || ' minutes';
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('B' || :v_b || '_DONE', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_txt);
+        v_log := v_log || 'B' || v_b || ' done~|~ok~|~' || v_txt || '#ROW#';
+        v_b := v_b + 1;
+    END WHILE;
+
+    v_n := (SELECT MAX(BATCH_NO) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP);
+    v_log := v_log || 'END~|~done~|~' || IFF(v_batch_to >= v_n, 'all batches replayed: next, part 3', 'next: batches ' || (v_batch_to + 1) || ' to ' || v_n || ', then part 3') || '#ROW#';
+    res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+            FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+    RETURN TABLE(res);
+EXCEPTION
+    WHEN test_stop THEN
+        IF (v_pos_off) THEN
+            BEGIN
+                UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y' WHERE trip_summary_config_id = :v_pos_id AND active_flg = 'N';
+                v_log := v_log || 'POS switch~|~ok~|~UAT''s POS summary sub-step switched back on#ROW#';
+            EXCEPTION
+                WHEN OTHER THEN
+                    v_log := v_log || 'POS switch~|~STOP~|~could not switch the POS sub-step back on: run R4 now#ROW#';
+            END;
+        END IF;
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+    WHEN OTHER THEN
+        v_log := v_log || 'error~|~STOP~|~' || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '') || '#ROW#';
+        IF (v_pos_off) THEN
+            BEGIN
+                UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y' WHERE trip_summary_config_id = :v_pos_id AND active_flg = 'N';
+                v_log := v_log || 'POS switch~|~ok~|~UAT''s POS summary sub-step switched back on#ROW#';
+            EXCEPTION
+                WHEN OTHER THEN
+                    v_log := v_log || 'POS switch~|~STOP~|~could not switch the POS sub-step back on: run R4 now#ROW#';
+            END;
+        END IF;
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+END;
+$$;
+
+
+-- R2. Progress, from another worksheet: the trip jobs' batches since the load, newest last.
+SELECT j.job_name, b.batch_id, b.batch_status, b.batch_start_date, b.updated_dttm AS last_update,
+       ROUND(DATEDIFF(second, b.batch_start_date, b.updated_dttm) / 60, 1) AS minutes
+FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b
+JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+WHERE j.job_name LIKE 'TRIP%'
+  AND b.batch_start_date >= (SELECT MIN(logged_at) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG WHERE step = 'L4_DONE')
+ORDER BY b.batch_id;
+
+-- R3. (If a step stopped.) The pipeline's error log for the batches of this test.
+SELECT j.job_name, e.*
+FROM DAAS_UAT.DAAS_COMMON.BATCH_ERROR_LOG_S02 e
+JOIN DAAS_UAT.DAAS_COMMON.BATCH_S02 b ON b.batch_id = e.batch_id
+JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
+WHERE b.batch_start_date >= (SELECT MIN(logged_at) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG WHERE step = 'L4_DONE')
+ORDER BY e.batch_id, e.created_dttm;
+
+-- R3b. (Only if R1 said so: the merge committed but its stream could not be moved.) Keep and move, by hand.
+-- INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES
+-- SELECT <batch_no>, <merge batch id>, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, * FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM;
+
+-- R4. (Only if R1 says to.) UAT's POS summary sub-step back on by hand.
+UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y'
+WHERE transaction_type = 'POS' AND active_flg = 'N' AND stored_procedure_name ILIKE '%TRIP_POS_SUMMARY_LOAD_PROC';
+
+-- R5. What has been nominated so far, by batch and class.
+SELECT batch_no, why, grp, trip_type, COUNT(*) AS trips, MIN(trip_days) AS shortest_days, MAX(trip_days) AS longest_days
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE
+GROUP BY ALL
+ORDER BY 1, 2, 3, 4;
