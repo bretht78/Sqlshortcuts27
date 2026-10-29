@@ -1,0 +1,330 @@
+/* =====================================================================
+   DAASI-3640 | Read-only test of the bridge rule, before it goes into
+   the procs and the dynamic table (v1.15)
+
+   THE RULE UNDER TEST
+   v1.14 attaches a comment line to a comp when the line's guest id ever
+   held that comp in the comp table history. That keeps a note through a
+   merge only when the old guest id is still in the history. For comps
+   merged before the history starts (April 2022) the old id never
+   appears, so the note is dropped: 540 comps in PROD on 10/20.
+   The bridge rule adds a second way for a line to attach:
+     the line's guest never held any comp on that number at that
+     property, AND the comp's holder is the same person, meaning both
+     local accounts map to the same primary account in
+     DAAS_CORE.GUEST_XREF_BRIDGE_LKP, AND the line did not enter the
+     feed before the comp's issue date (one day's allowance for clock
+     differences). The guard is what keeps the same person's note on
+     an earlier comp with the same number from coming back.
+   The local account number is the property id from PROPERTY_DIM
+   followed by the guest id padded to eight digits, e.g. guest 91688 at
+   UBA (property id 153) is 15300091688. Where the comp's own holder
+   also wrote a line with the same line number, the holder's line wins.
+
+   WHAT "WORKS" LOOKS LIKE
+     A4  the decoder finds 99%+ of comp guests in the bridge. If not,
+         the account-number construction is wrong and nothing else
+         counts.
+     B2  comps rescued is close to 540 (10/20 figure; small drift is
+         fine), nearly all of them showing that note today (these are
+         exactly the notes v1.14 would drop), and the displace count
+         is 0 or close to it.
+     B3  the rescued comps were issued before April 2022, when the
+         history starts. If many are recent, the rule is catching
+         something other than pre-history merges and we stop to look.
+     B5  what the guard blocks: the same person's note on an earlier
+         comp with the same number. Without the guard those would
+         come back.
+     C2  0 of the rescued comps are in the UAT slice (UTU, March 2026),
+         so v1.15 leaves the four March validations as they are. The
+         UAT proof for v1.15 is a replay of the UAT rescue list (C1).
+
+   HOW TO RUN
+   PROD, read-only, DAAS_TEAM. Use a Large warehouse: B1 reads the whole
+   comment table and comp history once (minutes). B1 is the only heavy
+   query; run the SET line straight after it, with nothing in between,
+   and B2-B5 read B1's result back in seconds. Part C repeats B1 in UAT.
+   Lines of comment text appear in B4/B5 and can carry host names:
+   keep those screenshots off the ticket.
+   ===================================================================== */
+
+USE DATABASE DAAS_PROD;
+
+
+/* ---------------------------------------------------------------------
+   PART A. THE DECODER AND THE BRIDGE ITSELF
+   --------------------------------------------------------------------- */
+
+--  A1. One property id per property code (the decoder needs that).
+--  Expect: 0
+SELECT 'A1 property codes with more than one id' AS check_, COUNT(*) AS codes
+FROM (SELECT PROPERTY_CD FROM DAAS_CORE.PROPERTY_DIM
+      GROUP BY 1 HAVING COUNT(DISTINCT PROPERTY_ID) > 1);
+
+--  A2. The shape of the bridge: account numbers should all be 11 long
+--  (3-digit property id + 8-digit guest id). Expect one row, length 11.
+SELECT LENGTH(XREF_ACCOUNT_NBR)              AS account_length,
+       COUNT(*)                              AS rows_,
+       COUNT(DISTINCT XREF_ACCOUNT_NBR)      AS accounts,
+       COUNT(DISTINCT PRIMARY_ACCOUNT_NBR)   AS primaries,
+       LISTAGG(DISTINCT SOURCE_SYSTEM_NM, ', ') AS sources
+FROM DAAS_CORE.GUEST_XREF_BRIDGE_LKP
+GROUP BY 1 ORDER BY 1;
+
+--  A3. One primary account per local account. If the second number is
+--  not 0, the rule takes the lowest primary (MIN), as the test below does.
+SELECT 'A3 accounts in the bridge' AS check_,
+       COUNT(*)                   AS accounts,
+       COUNT_IF(primaries > 1)    AS with_more_than_one_primary
+FROM (SELECT XREF_ACCOUNT_NBR, COUNT(DISTINCT PRIMARY_ACCOUNT_NBR) AS primaries
+      FROM DAAS_CORE.GUEST_XREF_BRIDGE_LKP GROUP BY 1);
+
+--  A4. The decoder: every guest who ever held a comp, turned into an
+--  account number and looked up in the bridge. Expect pct_found 99+.
+WITH prop AS (
+    SELECT PROPERTY_CD, MIN(PROPERTY_ID)::VARCHAR AS property_id
+    FROM DAAS_CORE.PROPERTY_DIM GROUP BY 1
+),
+comp_guests AS (
+    SELECT DISTINCT PROPERTY_CODE, SYIDRW
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+),
+bridge AS (
+    SELECT DISTINCT XREF_ACCOUNT_NBR FROM DAAS_CORE.GUEST_XREF_BRIDGE_LKP
+)
+SELECT 'A4 comp guests found in the bridge' AS check_,
+       COUNT(*)                              AS comp_guests,
+       COUNT_IF(p.property_id IS NULL)       AS property_not_in_dim,
+       COUNT(b.XREF_ACCOUNT_NBR)             AS found_in_bridge,
+       ROUND(100 * found_in_bridge / comp_guests, 2) AS pct_found
+FROM comp_guests g
+LEFT JOIN prop   p ON p.PROPERTY_CD = g.PROPERTY_CODE
+LEFT JOIN bridge b ON b.XREF_ACCOUNT_NBR = p.property_id || LPAD(g.SYIDRW::VARCHAR, 8, '0');
+
+--  A4b. The same by property, worst ten. A property near 0 means its
+--  id or its guest-id width differs from the pattern.
+WITH prop AS (
+    SELECT PROPERTY_CD, MIN(PROPERTY_ID)::VARCHAR AS property_id
+    FROM DAAS_CORE.PROPERTY_DIM GROUP BY 1
+),
+comp_guests AS (
+    SELECT DISTINCT PROPERTY_CODE, SYIDRW
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+),
+bridge AS (
+    SELECT DISTINCT XREF_ACCOUNT_NBR FROM DAAS_CORE.GUEST_XREF_BRIDGE_LKP
+)
+SELECT g.PROPERTY_CODE, p.property_id,
+       COUNT(*)                  AS comp_guests,
+       COUNT(b.XREF_ACCOUNT_NBR) AS found_in_bridge,
+       ROUND(100 * found_in_bridge / comp_guests, 2) AS pct_found
+FROM comp_guests g
+LEFT JOIN prop   p ON p.PROPERTY_CD = g.PROPERTY_CODE
+LEFT JOIN bridge b ON b.XREF_ACCOUNT_NBR = p.property_id || LPAD(g.SYIDRW::VARCHAR, 8, '0')
+GROUP BY 1, 2
+ORDER BY pct_found, comp_guests DESC
+LIMIT 10;
+
+--  A5. The issue-date conversion the guard uses (the dynamic table's
+--  own expression) agrees with the fact's ISSUE_DT. Expect: 0
+SELECT 'A5 issue date from ISHDRW vs the fact' AS check_,
+       COUNT(*) AS comps_checked,
+       COUNT_IF(ISSUE_DT <> DECODE(ISHDRW, 0, '1899-12-31'::DATE, ISHDRW + '1899-12-31'::DATE)) AS mismatches
+FROM DAAS_CORE.COMP_DETAIL_FACT
+WHERE SOURCE_SYSTEM_NM = 'HETCMS' AND ISSUE_DT >= '2025-01-01';
+
+
+/* ---------------------------------------------------------------------
+   PART B. THE RULE, APPLIED TO THE WHOLE COMMENT TABLE
+   B1 is the rule itself, written the way the proc will carry it, and
+   returns one row per comment line the bridge would attach, with the
+   facts needed to judge it. Everything after B1 reads this result.
+   --------------------------------------------------------------------- */
+
+--  B1. One row per (comp, comment line) the bridge rule reaches.
+--  passes_guard = FALSE rows are the ones the issue-date guard blocks.
+WITH prop AS (
+    SELECT PROPERTY_CD, MIN(PROPERTY_ID)::VARCHAR AS property_id
+    FROM DAAS_CORE.PROPERTY_DIM GROUP BY 1
+),
+bridge AS (                      -- one primary account per local account
+    SELECT XREF_ACCOUNT_NBR, MIN(PRIMARY_ACCOUNT_NBR) AS primary_nbr
+    FROM DAAS_CORE.GUEST_XREF_BRIDGE_LKP GROUP BY 1
+),
+holders AS (                     -- every guest id that ever held each comp (the v1.14 rule)
+    SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+),
+held_numbers AS (                -- every guest id that ever held any comp on a number
+    SELECT DISTINCT CNUMRW, PROPERTY_CODE, SYIDRW
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+),
+comps AS (                       -- when each comp first appeared in the feed
+    SELECT CNUMRW, ISHDRW, PROPERTY_CODE, MIN(OPERATION_DATE) AS comp_first_seen
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW GROUP BY 1, 2, 3
+),
+lines AS (                       -- latest version of each comment line, and when the line first appeared
+    SELECT SYIDCM, "CMP#CM" AS CNUMCM, CSEQCM, CMNTCM, PROPERTY_CODE,
+           OPERATION_DATE, OPERATION_SEQUENCE_NBR, CREATED_DATE,
+           MIN(OPERATION_DATE) OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE) AS line_first_seen
+    FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+                               ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+orphans AS (                     -- lines whose guest never held any comp on that number at that property
+    SELECT l.*
+    FROM lines l
+    WHERE NOT EXISTS (SELECT 1 FROM held_numbers n
+                      WHERE n.CNUMRW = l.CNUMCM AND n.PROPERTY_CODE = l.PROPERTY_CODE
+                        AND n.SYIDRW = l.SYIDCM)
+),
+bridged AS (                     -- orphan line x comp on its number whose holder is the same person
+    SELECT DISTINCT
+           h.PROPERTY_CODE, h.CNUMRW, h.ISHDRW,
+           DECODE(h.ISHDRW, 0, '1899-12-31'::DATE, h.ISHDRW + '1899-12-31'::DATE) AS issue_dt,
+           h.SYIDRW AS comp_guest, o.SYIDCM AS note_guest, bl.primary_nbr,
+           o.CSEQCM, o.CMNTCM, o.line_first_seen, c.comp_first_seen,
+           o.line_first_seen::DATE >= DATEADD(DAY, -1, DECODE(h.ISHDRW, 0, '1899-12-31'::DATE, h.ISHDRW + '1899-12-31'::DATE))
+                                                                                         AS passes_guard
+    FROM orphans o
+    JOIN holders h  ON h.CNUMRW = o.CNUMCM AND h.PROPERTY_CODE = o.PROPERTY_CODE
+    JOIN comps   c  ON c.CNUMRW = h.CNUMRW AND c.ISHDRW = h.ISHDRW AND c.PROPERTY_CODE = h.PROPERTY_CODE
+    JOIN prop    p  ON p.PROPERTY_CD = h.PROPERTY_CODE
+    JOIN bridge  bl ON bl.XREF_ACCOUNT_NBR = p.property_id || LPAD(o.SYIDCM::VARCHAR, 8, '0')
+    JOIN bridge  bh ON bh.XREF_ACCOUNT_NBR = p.property_id || LPAD(h.SYIDRW::VARCHAR, 8, '0')
+                   AND bh.primary_nbr = bl.primary_nbr
+),
+bridged_comps AS (
+    SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE FROM bridged
+),
+own AS (                         -- those comps' own lines under the v1.14 rule, one text per line number
+    SELECT h.CNUMRW, h.ISHDRW, h.PROPERTY_CODE, l.CSEQCM, l.CMNTCM
+    FROM bridged_comps k
+    JOIN holders h ON h.CNUMRW = k.CNUMRW AND h.ISHDRW = k.ISHDRW AND h.PROPERTY_CODE = k.PROPERTY_CODE
+    JOIN lines   l ON l.SYIDCM = h.SYIDRW AND l.CNUMCM = h.CNUMRW AND l.PROPERTY_CODE = h.PROPERTY_CODE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY h.CNUMRW, h.ISHDRW, h.PROPERTY_CODE, l.CSEQCM
+                               ORDER BY l.OPERATION_DATE DESC, l.OPERATION_SEQUENCE_NBR DESC, l.CREATED_DATE DESC) = 1
+),
+fact AS (                        -- what the fact holds for those comps today
+    SELECT f.COMP_NBR, f.ISHDRW, f.PROPERTY_CD,
+           MAX(IFF(f.DELETE_IND = 'N', 1, 0))   AS active_in_fact,
+           MAX(f.COMP_COMMENTS_DESC)            AS fact_note_today
+    FROM bridged_comps k
+    JOIN DAAS_CORE.COMP_DETAIL_FACT f
+      ON f.COMP_NBR = k.CNUMRW AND f.ISHDRW = k.ISHDRW AND f.PROPERTY_CD = k.PROPERTY_CODE
+    WHERE f.SOURCE_SYSTEM_NM = 'HETCMS'
+    GROUP BY 1, 2, 3
+)
+SELECT b.PROPERTY_CODE, b.CNUMRW AS comp_nbr, b.ISHDRW, b.issue_dt,
+       b.comp_guest, b.note_guest, b.primary_nbr,
+       b.CSEQCM AS line_nbr, b.CMNTCM AS line_text,
+       b.line_first_seen, b.comp_first_seen, b.passes_guard,
+       o.CMNTCM AS own_line_same_nbr,
+       COALESCE(f.active_in_fact, 0) AS active_in_fact,
+       IFF(f.fact_note_today IS NOT NULL AND POSITION(b.CMNTCM IN f.fact_note_today) > 0, 1, 0) AS fact_shows_line_today
+FROM bridged b
+LEFT JOIN own  o ON o.CNUMRW = b.CNUMRW AND o.ISHDRW = b.ISHDRW AND o.PROPERTY_CODE = b.PROPERTY_CODE
+                AND o.CSEQCM = b.CSEQCM
+LEFT JOIN fact f ON f.COMP_NBR = b.CNUMRW AND f.ISHDRW = b.ISHDRW AND f.PROPERTY_CD = b.PROPERTY_CODE
+ORDER BY b.PROPERTY_CODE, b.CNUMRW, b.ISHDRW, b.CSEQCM;
+
+--  Run this line right after B1 finishes, with nothing in between.
+SET bridge_detail = LAST_QUERY_ID();
+
+
+--  B2. The rule, sized. Expect comps_rescued near 540, rescued_showing_today
+--  close to it, lines_that_would_displace_own_text 0 or close to it.
+WITH d AS (
+    SELECT *, PROPERTY_CODE || '-' || comp_nbr || '-' || ISHDRW AS comp_key
+    FROM TABLE(RESULT_SCAN($bridge_detail))
+)
+SELECT 'B2 the bridge rule, sized' AS check_,
+       COUNT(DISTINCT IFF(passes_guard, comp_key, NULL))                                  AS comps_rescued,
+       COUNT(DISTINCT IFF(passes_guard, comp_key || '-' || note_guest || '-' || line_nbr, NULL)) AS lines_rescued,
+       COUNT(DISTINCT IFF(passes_guard, primary_nbr, NULL))                               AS people,
+       COUNT(DISTINCT IFF(passes_guard AND active_in_fact = 1, comp_key, NULL))           AS rescued_active_in_fact,
+       COUNT(DISTINCT IFF(passes_guard AND fact_shows_line_today = 1, comp_key, NULL))    AS rescued_showing_today,
+       COUNT(DISTINCT comp_key) - comps_rescued                                           AS comps_blocked_by_guard,
+       COUNT_IF(passes_guard AND own_line_same_nbr IS NOT NULL AND own_line_same_nbr <> line_text)
+                                                                                          AS lines_that_would_displace_own_text,
+       COUNT_IF(passes_guard AND own_line_same_nbr = line_text)                           AS lines_already_there_under_own_id
+FROM d;
+
+--  B3. When the rescued comps were issued, and when they entered the
+--  feed. Expect issue years before 2022 and first_seen at the April
+--  2022 history start: that is what "merged before the history" means.
+SELECT YEAR(issue_dt)                                                        AS issue_year,
+       COUNT(DISTINCT PROPERTY_CODE || '-' || comp_nbr || '-' || ISHDRW)     AS comps_rescued,
+       MIN(comp_first_seen)::DATE                                            AS entered_feed_earliest,
+       MAX(comp_first_seen)::DATE                                            AS entered_feed_latest
+FROM TABLE(RESULT_SCAN($bridge_detail))
+WHERE passes_guard
+GROUP BY 1 ORDER BY 1;
+
+--  B4. Twenty rescued lines, to read: the comp's holder today, the old
+--  guest id the note sits under, the primary account they share, and
+--  whether the report shows the line today. (Host names may appear.)
+SELECT PROPERTY_CODE, comp_nbr, issue_dt, comp_guest, note_guest, primary_nbr,
+       line_nbr, line_text,
+       line_first_seen::DATE AS line_first_seen, comp_first_seen::DATE AS comp_first_seen,
+       active_in_fact, fact_shows_line_today
+FROM TABLE(RESULT_SCAN($bridge_detail))
+WHERE passes_guard
+ORDER BY issue_dt DESC NULLS LAST, comp_nbr, line_nbr
+LIMIT 20;
+
+--  B5. Ten lines the guard blocks: the note entered the feed before the
+--  comp was issued, so it was written for an earlier comp on the same
+--  number, the same person's. Without the guard these would attach.
+SELECT PROPERTY_CODE, comp_nbr, issue_dt, comp_guest, note_guest, primary_nbr,
+       line_nbr, line_text,
+       line_first_seen::DATE AS line_first_seen, comp_first_seen::DATE AS comp_first_seen,
+       own_line_same_nbr
+FROM TABLE(RESULT_SCAN($bridge_detail))
+WHERE NOT passes_guard
+ORDER BY comp_first_seen DESC, comp_nbr, line_nbr
+LIMIT 10;
+
+
+/* ---------------------------------------------------------------------
+   PART C. THE SAME RULE IN UAT
+   Switch to UAT and run B1 again as it is, then the SET line, then
+   C1-C3. C1 is the UAT rescue list, the comps the v1.15 UAT run will
+   replay to prove the rule inside the proc and the dynamic table.
+   --------------------------------------------------------------------- */
+
+USE DATABASE DAAS_UAT;
+
+--  (run B1 here, then:)
+--  SET bridge_detail = LAST_QUERY_ID();
+
+--  C1. The UAT rescue list, sized (same shape as B2).
+WITH d AS (
+    SELECT *, PROPERTY_CODE || '-' || comp_nbr || '-' || ISHDRW AS comp_key
+    FROM TABLE(RESULT_SCAN($bridge_detail))
+)
+SELECT 'C1 the bridge rule in UAT' AS check_,
+       COUNT(DISTINCT IFF(passes_guard, comp_key, NULL))                                  AS comps_rescued,
+       COUNT(DISTINCT IFF(passes_guard, comp_key || '-' || note_guest || '-' || line_nbr, NULL)) AS lines_rescued,
+       COUNT(DISTINCT IFF(passes_guard, primary_nbr, NULL))                               AS people,
+       COUNT(DISTINCT IFF(passes_guard AND active_in_fact = 1, comp_key, NULL))           AS rescued_active_in_fact,
+       COUNT(DISTINCT IFF(passes_guard AND fact_shows_line_today = 1, comp_key, NULL))    AS rescued_showing_today,
+       COUNT(DISTINCT comp_key) - comps_rescued                                           AS comps_blocked_by_guard,
+       COUNT_IF(passes_guard AND own_line_same_nbr IS NOT NULL AND own_line_same_nbr <> line_text)
+                                                                                          AS lines_that_would_displace_own_text
+FROM d;
+
+--  C2. None of them in the March slice, so the four validations in 15
+--  do not move under v1.15. Expect: 0
+SELECT 'C2 rescued comps inside the UTU March 2026 slice' AS check_,
+       COUNT(DISTINCT PROPERTY_CODE || '-' || comp_nbr || '-' || ISHDRW) AS comps
+FROM TABLE(RESULT_SCAN($bridge_detail))
+WHERE passes_guard
+  AND PROPERTY_CODE = 'UTU' AND issue_dt BETWEEN '2026-03-01' AND '2026-03-31';
+
+--  C3. The two tables the rule reads, and who may read them. The load
+--  proc runs as the task's owner (APP_SERVICE_UAT per 07 A3) and the
+--  dynamic table refreshes as its owner; both need SELECT here. The
+--  proc already reads DAAS_CORE lookups, so this is a confirmation.
+SHOW GRANTS ON TABLE DAAS_CORE.GUEST_XREF_BRIDGE_LKP;
+SHOW GRANTS ON TABLE DAAS_CORE.PROPERTY_DIM;
