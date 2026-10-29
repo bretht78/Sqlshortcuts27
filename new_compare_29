@@ -16,8 +16,8 @@
 --   C4  every kept trip that differs from PROD (expect no rows)
 --   C5  touched trips retired by the join rules, each with its nominated partner; C5b/C5c why the pairs met the
 --       original pairing rule, and where
---   C6  the EXPOSURE guests' re-cuts, by market and property, with the SK-level and theo checks
---   C7  figures for the kept trips: theo in UAT after the run against PROD's
+--   C6  the EXPOSURE guests' re-cuts, by market and property, with the SK-level and theo checks; C6c theo conserved
+--   C7  figures for the kept trips: theo in UAT after the run against PROD's; C7b the few that differ, explained
 --   C8  how long each batch and step took
 
 USE ROLE DAAS_TEAM;
@@ -200,8 +200,10 @@ board AS (
     UNION ALL SELECT 10, '   ... changed in place (dates, grain, code or guest differ)', '0', (SELECT COUNT_IF(FATE = 'LOOK: changed in place') FROM f)::VARCHAR
     UNION ALL SELECT 11, '   ... gone from UAT, or retired without any nomination', '0',
            (SELECT COUNT_IF(FATE IN ('LOOK: gone from UAT', 'LOOK: retired without a nomination')) FROM f)::VARCHAR
-    UNION ALL SELECT 12, 'Live transactions of the kept trips: rows in PROD not in UAT, rows in UAT not in PROD', '0',
-           (SELECT COUNT_IF(which LIKE 'in PROD%') FROM dd) || ' / ' || (SELECT COUNT_IF(which LIKE 'in UAT%') FROM dd)
+    UNION ALL SELECT 12, 'Live transactions of the kept trips: rows in PROD not in UAT / rows in UAT not in PROD', '0 / 0',
+           (SELECT COUNT(*) FROM dd WHERE which LIKE 'in PROD%') || ' / ' || (SELECT COUNT(*) FROM dd WHERE which LIKE 'in UAT%')
+           -- (COUNT(*), not COUNT_IF: over an empty table COUNT_IF came back NULL on 29 Oct and the row showed null/LOOK
+           --  while the diff table was in fact empty)
     UNION ALL SELECT 13, 'New trips in UAT for guests and grains where nothing was retired (trips from nowhere)', '0',
            (SELECT COUNT_IF(NOT REPLACES_A_RETIRED_TRIP) FROM b WHERE DELETE_IND = 'N')::VARCHAR
     UNION ALL SELECT 14, 'Touched trips retired by the pre-existing join rules, with a nominated neighbour (replay behaviour v1.3 shares; C5 lists them)', NULL,
@@ -319,9 +321,9 @@ pairs AS (
            r.TRIP_START_DT AS R_START, r.TRIP_END_DT AS R_END, DATEDIFF(day, r.TRIP_START_DT, r.TRIP_END_DT) + 1 AS R_DAYS,
            COALESCE(TRY_TO_NUMBER(g.GAP), e.gap) AS GAP, r.MAX_TRIP_DAYS AS CAP,
            p.TRIP_MASTER_ID AS PARTNER, p.TRIP_START_DT AS P_START, p.TRIP_END_DT AS P_END,
+           DATEDIFF(day, p.TRIP_START_DT, p.TRIP_END_DT) + 1 AS P_DAYS,
            (h.TRIP_MASTER_ID IS NOT NULL) AS PARTNER_HAS_STAY, q.why AS PARTNER_NOMINATED_AS,
-           ROW_NUMBER() OVER (PARTITION BY r.TRIP_MASTER_ID
-                              ORDER BY LEAST(ABS(DATEDIFF(day, r.TRIP_END_DT, p.TRIP_START_DT)), ABS(DATEDIFF(day, p.TRIP_END_DT, r.TRIP_START_DT)))) AS RN
+           LEAST(ABS(DATEDIFF(day, r.TRIP_END_DT, p.TRIP_START_DT)), ABS(DATEDIFF(day, p.TRIP_END_DT, r.TRIP_START_DT))) AS DISTANCE_DAYS
     FROM ret r
     LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_JOIN_GAPS g
            ON g.TRIP_TYPE = r.TRIP_TYPE AND EQUAL_NULL(g.PROPERTY_CD, r.PROPERTY_CD) AND EQUAL_NULL(g.MARKET_CD, r.MARKET_CD) AND g.TRIP_START_DT = r.TRIP_START_DT
@@ -331,15 +333,21 @@ pairs AS (
       ON p.TRIP_MASTER_ID = q.trip_master_id AND p.GUEST_UNIQUE_ID = r.GUEST_UNIQUE_ID AND p.TRIP_TYPE = r.TRIP_TYPE
      AND EQUAL_NULL(p.PROPERTY_CD, r.PROPERTY_CD) AND EQUAL_NULL(p.MARKET_CD, r.MARKET_CD)
     LEFT JOIN hotel h ON h.TRIP_MASTER_ID = p.TRIP_MASTER_ID
+),
+classed AS (
+    SELECT *,
+           CASE WHEN P_START <= R_END AND P_END >= R_START                                   THEN 'overlapping trips'
+                WHEN DATEADD(day, GAP, R_END) BETWEEN P_START AND P_END
+                 AND (PARTNER_HAS_STAY OR R_DAYS - 1 + GAP < CAP)                            THEN 'it ends gap days before the partner (earlier-trip side)'
+                WHEN DATEADD(day, GAP, P_END) BETWEEN R_START AND R_END
+                 AND (HAS_HOTEL_STAY = 'Y' OR P_DAYS - 1 + GAP < CAP)                        THEN 'the partner ends gap days before it (later-trip side)'
+                ELSE 'other: no rule of the pairing statement fits (look)' END AS RELATION
+    FROM pairs
 )
-SELECT *,
-       CASE WHEN P_START <= R_END AND P_END >= R_START                                   THEN 'overlapping trips'
-            WHEN DATEADD(day, GAP, R_END) BETWEEN P_START AND P_END
-             AND (PARTNER_HAS_STAY OR R_DAYS - 1 + GAP < CAP)                            THEN 'it ends gap days before the partner (earlier-trip side)'
-            WHEN DATEADD(day, GAP, P_END) BETWEEN R_START AND R_END                       THEN 'the partner ends gap days before it (later-trip side)'
-            ELSE 'other: no rule of the pairing statement fits (look)' END AS RELATION
-FROM pairs
-WHERE RN = 1;
+-- one row per retired trip: the partner that best fits the rule (any fit before 'other'), the nearest among those
+SELECT *
+FROM classed
+QUALIFY ROW_NUMBER() OVER (PARTITION BY TRIP_MASTER_ID ORDER BY IFF(RELATION LIKE 'other%', 1, 0), DISTANCE_DAYS, PARTNER) = 1;
 
 SELECT RELATION, PARTNER_NOMINATED_AS,
        COUNT(*)                                            AS retired_trips,
@@ -364,6 +372,20 @@ SELECT TRIP_TYPE, CODE, COUNT(*) AS retired_by_join_rules,
 FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_JOIN_PAIRS
 GROUP BY 1, 2
 ORDER BY 3 DESC;
+
+
+-- C5d. The join-rule retirements no rule fits by my reading (expect none; if any, their nominated partners, for a look).
+SELECT j.TRIP_TYPE, j.CODE, j.GUEST_UNIQUE_ID, j.TRIP_MASTER_ID, j.R_START, j.R_END, j.R_DAYS, j.GAP, j.CAP, j.HAS_HOTEL_STAY, j.GRP, j.BATCH_NO,
+       LISTAGG(p.TRIP_MASTER_ID || ' [' || p.TRIP_START_DT || '..' || p.TRIP_END_DT || ', ' || q.why || ']', ' | ')
+           WITHIN GROUP (ORDER BY p.TRIP_START_DT) AS nominated_trips_of_the_guest_at_this_grain
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_JOIN_PAIRS j
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE q ON q.trip_master_id <> j.TRIP_MASTER_ID
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM p
+  ON p.TRIP_MASTER_ID = q.trip_master_id AND p.GUEST_UNIQUE_ID = j.GUEST_UNIQUE_ID AND p.TRIP_TYPE = j.TRIP_TYPE
+ AND CASE p.TRIP_TYPE WHEN 'PROPERTY' THEN p.PROPERTY_CD WHEN 'MARKET' THEN p.MARKET_CD ELSE 'ENTERPRISE' END = j.CODE
+WHERE j.RELATION LIKE 'other%'
+GROUP BY ALL
+ORDER BY 1, 2, 3, 5;
 
 
 -- C6. The EXPOSURE guests' re-cuts, by market and property: expected, retired, replacements built within cap, and
@@ -446,6 +468,31 @@ GROUP BY 1, 2
 ORDER BY 3 DESC;
 
 
+-- C6c. Theo conserved across the re-cut, by market and property: the retired trips' theo in PROD's snapshot against the
+--      theo of every live replacement the run built for the same guests at the same grain and code. The nights are on
+--      exactly one live trip each (C6), so the totals must agree to the cent wherever UAT's ratings carry PROD's values.
+WITH retired AS (
+    SELECT f.TRIP_TYPE, f.CODE, COUNT(*) AS retired_trips, ROUND(SUM(s.TOTAL_THEO_WIN_AMT), 2) AS retired_theo
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE f
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TS s ON s.TRIP_MASTER_ID = f.TRIP_MASTER_ID
+    WHERE f.GRP = 'EXPOSURE' AND f.FATE IN ('re-cut by the new rule (expected)', 'retired by the join rules (nominated as a pair)')
+    GROUP BY 1, 2
+),
+built AS (
+    SELECT b.TRIP_TYPE, b.CODE, COUNT(*) AS replacements, ROUND(SUM(s.TOTAL_THEO_WIN_AMT), 2) AS replacement_theo
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_BUILT b
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_TS s ON s.TRIP_MASTER_ID = b.TRIP_MASTER_ID
+    WHERE b.GRP = 'EXPOSURE' AND b.DELETE_IND = 'N'
+    GROUP BY 1, 2
+)
+SELECT r.TRIP_TYPE, r.CODE, r.retired_trips, r.retired_theo, COALESCE(b.replacements, 0) AS replacements, COALESCE(b.replacement_theo, 0) AS replacement_theo,
+       ROUND(COALESCE(b.replacement_theo, 0) - r.retired_theo, 2) AS difference,
+       IFF(ROUND(COALESCE(b.replacement_theo, 0) - r.retired_theo, 2) = 0, 'ok', 'LOOK') AS verdict
+FROM retired r
+LEFT JOIN built b ON b.TRIP_TYPE = r.TRIP_TYPE AND b.CODE = r.CODE
+ORDER BY r.retired_trips DESC;
+
+
 -- C7. Figures for the kept trips: theo in UAT after the run against PROD's snapshot, for the kept trips the replay
 --     touched (their summaries were rewritten by the run) and for the ones it did not (their summaries were loaded and
 --     must be untouched). 'info': UAT computes theo from its own RATINGS_FACT, so a difference here is an environment
@@ -461,6 +508,68 @@ JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_TS  u ON u.TRIP_MASTER_ID = f.TRI
 WHERE f.FATE = 'kept, identical to PROD'
 GROUP BY 1
 ORDER BY 1;
+
+
+-- C7b. The touched kept trips whose theo came out different (311 of 1,226,660 on 29 Oct): is it the ratings table or the
+--      pipeline? UAT's summary step sums UAT's RATINGS_FACT over the trip's rating keys; PROD's figure came from PROD's.
+--      For each such trip: its live rating keys, how many are missing from UAT's RATINGS_FACT, and how many carry
+--      different values in the two tables (the block compares them column by column, audit stamps aside). A trip with
+--      at least one missing or differing rating is the environment, not the pipeline; a trip with none is a LOOK.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF AS
+SELECT f.TRIP_MASTER_ID, f.GUEST_UNIQUE_ID, f.TRIP_TYPE, f.CODE, f.BATCH_NO,
+       ROUND(p.TOTAL_THEO_WIN_AMT, 2) AS prod_theo, ROUND(u.TOTAL_THEO_WIN_AMT, 2) AS uat_theo
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE f
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TS p ON p.TRIP_MASTER_ID = f.TRIP_MASTER_ID
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_TS  u ON u.TRIP_MASTER_ID = f.TRIP_MASTER_ID
+WHERE f.FATE = 'kept, identical to PROD' AND f.TOUCHED
+  AND ROUND(u.TOTAL_THEO_WIN_AMT, 2) <> ROUND(p.TOTAL_THEO_WIN_AMT, 2);
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF_KEYS AS
+SELECT t.TRIP_MASTER_ID, d.TRANSACTION_TABLE_SK
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF t
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD d ON d.TRIP_MASTER_ID = t.TRIP_MASTER_ID
+WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED';
+
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_cols VARCHAR;
+    v_sql  VARCHAR;
+BEGIN
+    v_cols := (SELECT LISTAGG(u.COLUMN_NAME, ', ') WITHIN GROUP (ORDER BY u.ORDINAL_POSITION)
+               FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS u
+               JOIN DAAS_PROD.INFORMATION_SCHEMA.COLUMNS p
+                 ON p.TABLE_SCHEMA = u.TABLE_SCHEMA AND p.TABLE_NAME = u.TABLE_NAME AND p.COLUMN_NAME = u.COLUMN_NAME
+               WHERE u.TABLE_SCHEMA = 'DAAS_CORE' AND u.TABLE_NAME = 'RATINGS_FACT'
+                 AND u.COLUMN_NAME NOT IN ('CREATED_DTTM', 'CREATED_BY', 'UPDATED_DTTM', 'UPDATED_BY', 'BATCH_ID', 'REPLAY_COUNTER', 'LAST_DML_CD'));
+    v_sql := 'CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF_RF AS '
+          || 'WITH k AS (SELECT DISTINCT TRANSACTION_TABLE_SK FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF_KEYS), '
+          || 'p AS (SELECT ' || v_cols || ' FROM DAAS_PROD.DAAS_CORE.RATINGS_FACT r JOIN k ON k.TRANSACTION_TABLE_SK = r.RATINGS_FACT_SK), '
+          || 'u AS (SELECT ' || v_cols || ' FROM DAAS_UAT.DAAS_CORE.RATINGS_FACT r JOIN k ON k.TRANSACTION_TABLE_SK = r.RATINGS_FACT_SK) '
+          || 'SELECT ''in PROD, not so in UAT'' AS which, * FROM (SELECT * FROM p MINUS SELECT * FROM u) '
+          || 'UNION ALL SELECT ''in UAT, not so in PROD'', * FROM (SELECT * FROM u MINUS SELECT * FROM p)';
+    EXECUTE IMMEDIATE v_sql;
+    RETURN 'ratings compared on: ' || v_cols;
+END;
+$$;
+
+WITH per_trip AS (
+    SELECT t.TRIP_MASTER_ID, t.TRIP_TYPE, t.CODE, t.GRP_CODE, t.prod_theo, t.uat_theo,
+           COUNT(k.TRANSACTION_TABLE_SK)                                   AS rating_rows,
+           COUNT_IF(k.TRANSACTION_TABLE_SK IS NOT NULL AND u.RATINGS_FACT_SK IS NULL) AS missing_in_uat_ratings_fact,
+           COUNT_IF(d.RATINGS_FACT_SK IS NOT NULL)                         AS differing_between_the_two_ratings_tables
+    FROM (SELECT *, TRIP_TYPE || ' ' || CODE AS GRP_CODE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF) t
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF_KEYS k ON k.TRIP_MASTER_ID = t.TRIP_MASTER_ID
+    LEFT JOIN DAAS_UAT.DAAS_CORE.RATINGS_FACT u ON u.RATINGS_FACT_SK = k.TRANSACTION_TABLE_SK
+    LEFT JOIN (SELECT DISTINCT RATINGS_FACT_SK FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF_RF) d ON d.RATINGS_FACT_SK = k.TRANSACTION_TABLE_SK
+    GROUP BY ALL
+)
+SELECT COUNT(*)                                                                        AS touched_kept_trips_with_a_different_theo,
+       COUNT_IF(missing_in_uat_ratings_fact > 0)                                       AS with_a_rating_missing_from_uat,
+       COUNT_IF(missing_in_uat_ratings_fact = 0 AND differing_between_the_two_ratings_tables > 0) AS with_a_rating_valued_differently_in_uat,
+       COUNT_IF(missing_in_uat_ratings_fact = 0 AND differing_between_the_two_ratings_tables = 0) AS unexplained_look,
+       ROUND(SUM(prod_theo), 2) AS prod_theo, ROUND(SUM(uat_theo), 2) AS uat_theo,
+       COUNT(DISTINCT GRP_CODE) AS codes
+FROM per_trip;
 
 
 -- C8. How long it took: each batch, and each step's batch in the pipeline's log.
