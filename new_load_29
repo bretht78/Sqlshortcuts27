@@ -1,0 +1,493 @@
+-- DAASI-3641: the full-week UAT test, part 1 of 3 — population, PROD snapshot, UAT load.
+--
+-- The test (Pete, 28 Oct): a random week for all properties, replayed through UAT's pipeline on TRIP_MERGE_CHECK_PROC
+-- v1.4, and UAT's trip records compared with PROD's. Week: 2026-09-28 to 2026-10-04 (random pick 1 of 16).
+--
+-- Population (PROD): every guest with a live rating in the week at any property (299,204 guests, 50 properties, the
+-- "WEEK" guests, loaded for the trips within 90 days of the week), plus the 34 "EXPOSURE" guests drawn by the reach
+-- check — the holders of over-cap no-stay trips in every market and property that has any (BEM, WLM, IPM, COM, SNM,
+-- ACM; WCL, UIN, UHA), loaded with their whole history so the rule has something to re-cut in UAT beyond BEM/WLM.
+--
+-- What this part does, in order (each step says what it writes; nothing outside DAAS_UAT is written):
+--   L0  preflight in UAT: same table shapes as PROD, same trip caps as PROD, v1.4 live, no trip job running, and the
+--       session may delete from and insert into the four UAT trip tables
+--   L1  the population and the touch set, in DAAS_UAT.DAAS_TEMP_WORK, read from the PROD scratch tables
+--   L2  one block: PROD's trip records for the population copied into DAAS_UAT.DAAS_TEMP_WORK at one instant
+--       (TRIP_MASTER, TRIP_DETAIL, TRIP_SUMMARY, DAILY_ACTIVITY_SUMMARY) — the load source and the truth to compare with
+--   L3  the expectation: every trip the replay will touch, classed the way v1.4 classes it, with UAT's caps
+--   L4  one block: UAT's rows for the population in that window removed (and any other-guest rows whose trip ids
+--       collide), PROD's rows loaded, the pipeline's streams moved past the load so the replay is the only thing they see
+--   L5  the loaded state equals the snapshot; rating keys resolve in UAT (whether UAT can compute theo for them)
+-- Then part 2 (the replay) and part 3 (the comparison).
+--
+-- Sizes to expect: ~9.6M TRIP_MASTER, ~165M TRIP_DETAIL, ~9.6M TRIP_SUMMARY, ~14.5M DAILY_ACTIVITY_SUMMARY rows. On a
+-- Large warehouse L2 is 15-30 minutes and L4 the better part of an hour. Run each statement or block on its own.
+--
+-- Roles: DAAS_TEAM with secondary roles (DAAS_UAT_DEVELOPER holds the UAT write privileges). The PROD scratch tables
+-- (DAASI_3641_WK_*, DAASI_3641_RC_*) are read from DAAS_PROD.DAAS_TEMP_WORK.
+
+USE ROLE DAAS_TEAM;
+USE SECONDARY ROLES ALL;
+-- USE WAREHOUSE <the Large warehouse you have been using>;
+
+
+-- ===================================================================================================
+-- L0. Preflight (reads only)
+-- ===================================================================================================
+
+-- L0a. The four tables have the same columns in UAT and PROD (the load copies column by column, by name; extra UAT
+--      columns would load as NULL, and a column missing in UAT would stop the load). Expect every row 'same'.
+WITH c AS (
+    SELECT 'PROD' AS env, TABLE_NAME, LISTAGG(COLUMN_NAME || ':' || DATA_TYPE, ', ') WITHIN GROUP (ORDER BY COLUMN_NAME) AS cols
+    FROM DAAS_PROD.INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = 'DAAS_CORE' AND TABLE_NAME IN ('TRIP_MASTER', 'TRIP_DETAIL', 'TRIP_SUMMARY', 'DAILY_ACTIVITY_SUMMARY')
+    GROUP BY 1, 2
+    UNION ALL
+    SELECT 'UAT', TABLE_NAME, LISTAGG(COLUMN_NAME || ':' || DATA_TYPE, ', ') WITHIN GROUP (ORDER BY COLUMN_NAME)
+    FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = 'DAAS_CORE' AND TABLE_NAME IN ('TRIP_MASTER', 'TRIP_DETAIL', 'TRIP_SUMMARY', 'DAILY_ACTIVITY_SUMMARY')
+    GROUP BY 1, 2
+)
+SELECT p.TABLE_NAME, IFF(p.cols = u.cols, 'same', 'DIFFERENT') AS columns_verdict,
+       IFF(p.cols = u.cols, NULL, 'PROD: ' || p.cols || '  ||  UAT: ' || u.cols) AS detail
+FROM c p JOIN c u ON u.TABLE_NAME = p.TABLE_NAME AND u.env = 'UAT'
+WHERE p.env = 'PROD'
+ORDER BY 1;
+
+-- L0b. The trip caps and gap days UAT will cut with are PROD's. Expect no rows (any row is a config difference that
+--      would make UAT nominate differently from PROD; send it over before going on).
+WITH p AS (SELECT CONFIG_SUBTYPE, PROPERTY_CD, MARKET_CD, KEY, VALUE FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+           WHERE ACTIVE_FLG = 'Y' AND KEY IN ('MAX_TRIP_DAYS', 'TRIP_GAP_DAYS')),
+u AS (SELECT CONFIG_SUBTYPE, PROPERTY_CD, MARKET_CD, KEY, VALUE FROM DAAS_UAT.DAAS_CORE.TRIP_CONFIG
+      WHERE ACTIVE_FLG = 'Y' AND KEY IN ('MAX_TRIP_DAYS', 'TRIP_GAP_DAYS'))
+SELECT 'in PROD, not so in UAT' AS which, * FROM (SELECT * FROM p MINUS SELECT * FROM u)
+UNION ALL
+SELECT 'in UAT, not so in PROD', * FROM (SELECT * FROM u MINUS SELECT * FROM p)
+ORDER BY 1, 2, 3, 4, 5;
+
+-- L0c. v1.4 is live in UAT, and no trip job is running. Expect 'v1.4 is live in UAT' and 0.
+SELECT IFF(CONTAINS(GET_DDL('PROCEDURE', 'DAAS_UAT.DAAS_COMMON.TRIP_MERGE_CHECK_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)'),
+                    'my_sql_command_3A'), 'v1.4 is live in UAT', 'UAT runs the old version: deploy v1.4 first') AS merge_check_version,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
+         WHERE j.JOB_NAME LIKE 'TRIP%' AND b.BATCH_STATUS = 'IN PROGRESS'
+           AND b.BATCH_START_DATE >= DATEADD(hour, -6, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)) AS trip_jobs_in_progress;
+
+-- L0d. May this session delete from and insert into the four UAT tables? Eight statements that change nothing; an
+--      error on any of them is the privilege to ask for (DAAS_UAT_DEVELOPER, usually).
+DELETE FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER            WHERE 1 = 0;
+DELETE FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL            WHERE 1 = 0;
+DELETE FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY           WHERE 1 = 0;
+DELETE FROM DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY WHERE 1 = 0;
+INSERT INTO DAAS_UAT.DAAS_CORE.TRIP_MASTER            SELECT * FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER            WHERE 1 = 0;
+INSERT INTO DAAS_UAT.DAAS_CORE.TRIP_DETAIL            SELECT * FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL            WHERE 1 = 0;
+INSERT INTO DAAS_UAT.DAAS_CORE.TRIP_SUMMARY           SELECT * FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY           WHERE 1 = 0;
+INSERT INTO DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY SELECT * FROM DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY WHERE 1 = 0;
+
+
+-- ===================================================================================================
+-- L1. The population and the log
+-- ===================================================================================================
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG (step VARCHAR, logged_at TIMESTAMP_NTZ, note VARCHAR);
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS (mark VARCHAR, value NUMBER(38,0), noted_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()::TIMESTAMP_NTZ);
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L1_START', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'week 2026-09-28..2026-10-04; window 2026-06-30..2027-01-02');
+
+-- L1a. The guests: WEEK (every guest with a rating in the week, from the PROD sizing) and EXPOSURE (the reach check's
+--      draw). A guest in both is EXPOSURE (whole history loaded). Batches: the EXPOSURE guests and a tenth of the WEEK
+--      guests in batch 1, the rest spread over batches 2-10 by a hash of the guest id, so part 2 can replay the week
+--      a slice at a time (each slice is one pass of the chain, as PROD runs it hourly). Change the 10 to use fewer,
+--      bigger slices once batch 1 has shown how long a pass takes.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP AS
+WITH wk AS (SELECT GUEST_UNIQUE_ID FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_WK_GUESTS),
+ex AS (SELECT GUEST_UNIQUE_ID, LISTAGG(DISTINCT TRIP_TYPE || ' ' || CODE, ', ') WITHIN GROUP (ORDER BY TRIP_TYPE || ' ' || CODE) AS exposure_codes,
+              SUM(over_cap_no_stay_trips) AS over_cap_trips
+       FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RC_GUESTS GROUP BY 1)
+SELECT COALESCE(ex.GUEST_UNIQUE_ID, wk.GUEST_UNIQUE_ID)         AS GUEST_UNIQUE_ID,
+       IFF(ex.GUEST_UNIQUE_ID IS NOT NULL, 'EXPOSURE', 'WEEK')  AS GRP,
+       ex.exposure_codes                                        AS EXPOSURE_CODES,
+       COALESCE(ex.over_cap_trips, 0)                           AS EXPECTED_OVER_CAP_TRIPS,
+       IFF(ex.GUEST_UNIQUE_ID IS NOT NULL, 1,
+           MOD(ABS(HASH(COALESCE(ex.GUEST_UNIQUE_ID, wk.GUEST_UNIQUE_ID))), 10) + 1) AS BATCH_NO
+FROM wk
+FULL OUTER JOIN ex ON ex.GUEST_UNIQUE_ID = wk.GUEST_UNIQUE_ID;
+
+SELECT GRP, BATCH_NO, COUNT(*) AS guests, SUM(EXPECTED_OVER_CAP_TRIPS) AS over_cap_trips_to_re_cut
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP
+GROUP BY 1, 2 ORDER BY 2, 1;
+
+
+-- ===================================================================================================
+-- L2. PROD's records for the population, copied at one instant
+-- ===================================================================================================
+
+-- One block, so all four tables are read AT the same timestamp (two minutes before the block starts) and the copy is
+-- a consistent picture of PROD. WEEK guests: trips overlapping the week ±90 days; EXPOSURE guests: every trip. Live
+-- and soft-deleted rows alike, so UAT mirrors PROD exactly for those trips. 15-30 minutes.
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_ts   VARCHAR;
+    v_sql  VARCHAR;
+    v_n    INTEGER;
+    v_log  VARCHAR DEFAULT '';
+    res    RESULTSET;
+BEGIN
+    v_ts := (SELECT TO_VARCHAR(DATEADD(minute, -2, CURRENT_TIMESTAMP()), 'YYYY-MM-DD"T"HH24:MI:SS.FF3TZH:TZM'));
+    DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS WHERE mark = 'snapshot_epoch';
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS (mark, value) SELECT 'snapshot_epoch', DATE_PART(epoch_second, :v_ts::TIMESTAMP_TZ);
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L2_SNAPSHOT_AT', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_ts);
+
+    -- TRIP_MASTER
+    v_sql := 'CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM AS
+              SELECT m.* FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER AT (TIMESTAMP => ''' || v_ts || '''::TIMESTAMP_TZ) m
+              JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP p ON p.GUEST_UNIQUE_ID = m.GUEST_UNIQUE_ID
+              WHERE p.GRP = ''EXPOSURE''
+                 OR (m.TRIP_END_DT >= DATE ''2026-06-30'' AND m.TRIP_START_DT <= DATE ''2027-01-02'')';
+    EXECUTE IMMEDIATE v_sql;
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM);
+    v_log := v_log || 'TRIP_MASTER~|~' || v_n || '#ROW#';
+
+    -- TRIP_DETAIL
+    v_sql := 'CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD AS
+              SELECT d.* FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL AT (TIMESTAMP => ''' || v_ts || '''::TIMESTAMP_TZ) d
+              JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM t ON t.TRIP_MASTER_ID = d.TRIP_MASTER_ID';
+    EXECUTE IMMEDIATE v_sql;
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD);
+    v_log := v_log || 'TRIP_DETAIL~|~' || v_n || '#ROW#';
+
+    -- TRIP_SUMMARY
+    v_sql := 'CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TS AS
+              SELECT s.* FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY AT (TIMESTAMP => ''' || v_ts || '''::TIMESTAMP_TZ) s
+              JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM t ON t.TRIP_MASTER_ID = s.TRIP_MASTER_ID';
+    EXECUTE IMMEDIATE v_sql;
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TS);
+    v_log := v_log || 'TRIP_SUMMARY~|~' || v_n || '#ROW#';
+
+    -- DAILY_ACTIVITY_SUMMARY
+    v_sql := 'CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_DAS AS
+              SELECT a.* FROM DAAS_PROD.DAAS_CORE.DAILY_ACTIVITY_SUMMARY AT (TIMESTAMP => ''' || v_ts || '''::TIMESTAMP_TZ) a
+              JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM t ON t.TRIP_MASTER_ID = a.TRIP_MASTER_ID';
+    EXECUTE IMMEDIATE v_sql;
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_DAS);
+    v_log := v_log || 'DAILY_ACTIVITY_SUMMARY~|~' || v_n || '#ROW#';
+
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L2_COPIED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, REPLACE(REPLACE(:v_log, '~|~', ' '), '#ROW#', '; '));
+    res := (SELECT SPLIT_PART(t.value, '~|~', 1) AS table_copied, SPLIT_PART(t.value, '~|~', 2)::NUMBER AS rows_copied, :v_ts AS snapshot_at
+            FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+    RETURN TABLE(res);
+END;
+$$;
+
+
+-- ===================================================================================================
+-- L3. The expectation, from the snapshot, with UAT's caps
+-- ===================================================================================================
+
+-- L3a. The touch set: every live trip in the snapshot, at every grain, that the replay will mark — for WEEK guests the
+--      trips holding one of the week's live ratings; for EXPOSURE guests every live trip holding a rating that sits on
+--      one of their over-cap no-stay trips (what a ratings replay of those trips reaches at the other grains too).
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TOUCH_DETAIL AS
+WITH week_ratings AS (
+    SELECT d.TRIP_MASTER_ID, d.TRANSACTION_TABLE_SK
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD d
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM m ON m.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP p ON p.GUEST_UNIQUE_ID = m.GUEST_UNIQUE_ID
+    WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
+      AND d.BUSINESS_START_DT BETWEEN DATE '2026-09-28' AND DATE '2026-10-04'
+      AND m.DELETE_IND = 'N'
+),
+exposure_sks AS (   -- the ratings on the exposure guests' over-cap no-stay trips
+    SELECT DISTINCT d.TRANSACTION_TABLE_SK
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_RC_REACH r
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP p ON p.GUEST_UNIQUE_ID = r.GUEST_UNIQUE_ID AND p.GRP = 'EXPOSURE'
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD d ON d.TRIP_MASTER_ID = r.TRIP_MASTER_ID
+    WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
+),
+exposure_ratings AS (   -- those ratings on every live trip of those guests that holds them (all grains)
+    SELECT d.TRIP_MASTER_ID, d.TRANSACTION_TABLE_SK
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD d
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM m ON m.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP p ON p.GUEST_UNIQUE_ID = m.GUEST_UNIQUE_ID AND p.GRP = 'EXPOSURE'
+    JOIN exposure_sks x ON x.TRANSACTION_TABLE_SK = d.TRANSACTION_TABLE_SK
+    WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
+      AND m.DELETE_IND = 'N'
+)
+SELECT TRIP_MASTER_ID, TRANSACTION_TABLE_SK FROM week_ratings
+UNION
+SELECT TRIP_MASTER_ID, TRANSACTION_TABLE_SK FROM exposure_ratings;
+
+-- L3b. Each touched trip, with its cap read through UAT's config functions (what UAT's v1.4 will apply), PROD's cap
+--      beside it, the hotel test, the class, and the batch it belongs to.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT AS
+WITH touched AS (
+    SELECT DISTINCT m.TRIP_MASTER_ID, m.GUEST_UNIQUE_ID, m.TRIP_TYPE, m.PROPERTY_CD, m.MARKET_CD, m.TRIP_START_DT, m.TRIP_END_DT,
+           DATEDIFF(day, m.TRIP_START_DT, m.TRIP_END_DT) + 1 AS TRIP_DAYS,
+           CASE m.TRIP_TYPE WHEN 'PROPERTY' THEN m.PROPERTY_CD WHEN 'MARKET' THEN m.MARKET_CD ELSE 'ENTERPRISE' END AS CODE,
+           p.GRP, p.BATCH_NO
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TOUCH_DETAIL t
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM m ON m.TRIP_MASTER_ID = t.TRIP_MASTER_ID
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP p ON p.GUEST_UNIQUE_ID = m.GUEST_UNIQUE_ID
+),
+caps_uat AS (
+    SELECT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT,
+           CASE WHEN TRIP_TYPE = 'PROPERTY' THEN DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', PROPERTY_CD, TRIP_START_DT)
+                WHEN TRIP_TYPE = 'MARKET'   THEN DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT)
+           END AS CAP
+    FROM (SELECT DISTINCT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT FROM touched)
+),
+caps_prod AS (
+    SELECT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT,
+           CASE WHEN TRIP_TYPE = 'PROPERTY' THEN DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('MAX_TRIP_DAYS', PROPERTY_CD, TRIP_START_DT)
+                WHEN TRIP_TYPE = 'MARKET'   THEN DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT)
+           END AS CAP
+    FROM (SELECT DISTINCT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT FROM touched)
+),
+ent AS (
+    SELECT (SELECT TRY_TO_NUMBER(MAX(VALUE)) FROM DAAS_UAT.DAAS_CORE.TRIP_CONFIG
+             WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y') AS uat_cap,
+           (SELECT TRY_TO_NUMBER(MAX(VALUE)) FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+             WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y') AS prod_cap
+),
+hotel AS (
+    SELECT DISTINCT d.TRIP_MASTER_ID
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD d
+    JOIN touched t ON t.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+    WHERE d.TRANSACTION_TYPE = 'HOTEL' AND d.DELETE_IND = 'N'
+)
+SELECT t.*,
+       COALESCE(TRY_TO_NUMBER(cu.CAP), e.uat_cap)  AS MAX_TRIP_DAYS,
+       COALESCE(TRY_TO_NUMBER(cp.CAP), e.prod_cap) AS MAX_TRIP_DAYS_PROD,
+       IFF(h.TRIP_MASTER_ID IS NOT NULL, 'Y', 'N') AS HAS_HOTEL_STAY,
+       (h.TRIP_MASTER_ID IS NULL AND t.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(cu.CAP), e.uat_cap)) AS EXPECT_NOMINATION,
+       CASE WHEN h.TRIP_MASTER_ID IS NULL     AND t.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(cu.CAP), e.uat_cap) THEN 'over cap, no stay: the new rule re-cuts it'
+            WHEN h.TRIP_MASTER_ID IS NOT NULL AND t.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(cu.CAP), e.uat_cap) THEN 'over cap with a stay: exempt, must stay as it is'
+            ELSE 'within cap: must stay as it is' END AS EXPECTATION
+FROM touched t
+JOIN caps_uat cu ON cu.TRIP_TYPE = t.TRIP_TYPE AND EQUAL_NULL(cu.PROPERTY_CD, t.PROPERTY_CD)
+                AND EQUAL_NULL(cu.MARKET_CD, t.MARKET_CD) AND cu.TRIP_START_DT = t.TRIP_START_DT
+JOIN caps_prod cp ON cp.TRIP_TYPE = t.TRIP_TYPE AND EQUAL_NULL(cp.PROPERTY_CD, t.PROPERTY_CD)
+                 AND EQUAL_NULL(cp.MARKET_CD, t.MARKET_CD) AND cp.TRIP_START_DT = t.TRIP_START_DT
+CROSS JOIN ent e
+LEFT JOIN hotel h ON h.TRIP_MASTER_ID = t.TRIP_MASTER_ID;
+
+-- L3c. The expectation, by group and grain. Expect WEEK: 0 over cap no stay (as the sizing found), EXPOSURE: the reach
+--      check's counts for those guests, and cap_differs_from_prod 0 everywhere.
+SELECT GRP, TRIP_TYPE,
+       COUNT(*)                                                    AS trips_touched,
+       COUNT(DISTINCT GUEST_UNIQUE_ID)                             AS guests,
+       COUNT_IF(EXPECT_NOMINATION)                                 AS over_cap_no_stay_to_re_cut,
+       COUNT_IF(HAS_HOTEL_STAY = 'Y' AND TRIP_DAYS > MAX_TRIP_DAYS) AS over_cap_with_stay_exempt,
+       COUNT_IF(TRIP_DAYS <= MAX_TRIP_DAYS)                        AS within_cap,
+       COUNT_IF(NOT EQUAL_NULL(MAX_TRIP_DAYS, MAX_TRIP_DAYS_PROD)) AS cap_differs_from_prod,
+       MIN(BATCH_NO) AS first_batch, MAX(BATCH_NO) AS last_batch
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT
+GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- L3d. The EXPOSURE guests' re-cuts, by market and property: what part 3 must find retired and replaced.
+SELECT CODE, TRIP_TYPE, MAX_TRIP_DAYS AS cap, COUNT(*) AS over_cap_no_stay_to_re_cut, COUNT(DISTINCT GUEST_UNIQUE_ID) AS guests, MAX(TRIP_DAYS) AS longest_days
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT
+WHERE EXPECT_NOMINATION
+GROUP BY 1, 2, 3 ORDER BY 4 DESC;
+
+
+-- ===================================================================================================
+-- L4. The load: UAT's rows out, PROD's rows in, streams moved past it
+-- ===================================================================================================
+
+-- One block. Before it changes anything it counts the UAT rows that will go (the population's own trips, and any
+-- other guest's trips whose TRIP_MASTER_ID collides with an incoming PROD id — UAT and PROD draw ids from different
+-- sequences, so collisions are possible and must be removed or the loaded trips would be doubled). Then: delete,
+-- insert column by name, record the highest trip id, and move the pipeline's streams on TRIP_MASTER and TRIP_DETAIL
+-- past the load (an INSERT that reads each stream and keeps nothing; the proven move from the earlier cleanup), so the
+-- replay in part 2 is the only change the steps will see. Nothing is run in the chain here. The better part of an hour.
+EXECUTE IMMEDIATE $$
+DECLARE
+    v_log      VARCHAR DEFAULT '';
+    v_sql      VARCHAR;
+    v_cols     VARCHAR;
+    v_tbl      VARCHAR;
+    v_src      VARCHAR;
+    v_n        INTEGER;
+    v_m        INTEGER;
+    v_k        INTEGER;
+    v_c        INTEGER;
+    v_has      BOOLEAN;
+    v_max_tm   NUMBER(38,0);
+    res        RESULTSET;
+    load_stop  EXCEPTION (-20644, 'DAASI-3641 week test load stopped, see the rows');
+BEGIN
+    -- 1. Nothing running; v1.4 live (same as L0c, checked again at the moment of loading).
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_COMMON.BATCH_S02 b JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
+             WHERE j.JOB_NAME LIKE 'TRIP%' AND b.BATCH_STATUS = 'IN PROGRESS'
+               AND b.BATCH_START_DATE >= DATEADD(hour, -6, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ));
+    IF (v_n > 0) THEN
+        v_log := v_log || '1 runs~|~STOP~|~' || v_n || ' trip job(s) IN PROGRESS: let them finish, then run this block again#ROW#';
+        RAISE load_stop;
+    END IF;
+    v_log := v_log || '1 runs~|~ok~|~no trip job in progress#ROW#';
+
+    -- 2. The UAT rows that will go: the population guests' UAT trips in the same window the snapshot covers (every trip
+    --    for the EXPOSURE guests), and any other guest's trip whose id collides with an incoming PROD id. Older UAT
+    --    history of the WEEK guests, outside the window, stays: nothing the replay does reaches it.
+    CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_OUT AS
+    SELECT m.TRIP_MASTER_ID, m.GUEST_UNIQUE_ID,
+           CASE WHEN p.GUEST_UNIQUE_ID IS NOT NULL THEN 'population guest, in the window'
+                ELSE 'other guest, id collides with an incoming PROD trip' END AS why
+    FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP p
+           ON p.GUEST_UNIQUE_ID = m.GUEST_UNIQUE_ID
+          AND (p.GRP = 'EXPOSURE' OR (m.TRIP_END_DT >= DATE '2026-06-30' AND m.TRIP_START_DT <= DATE '2027-01-02'))
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM t ON t.TRIP_MASTER_ID = m.TRIP_MASTER_ID
+    WHERE p.GUEST_UNIQUE_ID IS NOT NULL OR t.TRIP_MASTER_ID IS NOT NULL;
+    v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_OUT WHERE why LIKE 'population%');
+    v_m := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_OUT WHERE why LIKE 'other%');
+    v_k := (SELECT COUNT(DISTINCT GUEST_UNIQUE_ID) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_OUT WHERE why LIKE 'other%');
+    v_log := v_log || '2 UAT rows out~|~ok~|~' || v_n || ' TRIP_MASTER rows of the population guests in the window, plus ' || v_m
+                   || ' rows of ' || v_k || ' other guests whose trip ids collide with incoming PROD ids (kept in DAASI_3641_WT_UAT_OUT)#ROW#';
+
+    -- 3. Delete, children first.
+    DELETE FROM DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY WHERE TRIP_MASTER_ID IN (SELECT TRIP_MASTER_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_OUT);
+    v_n := SQLROWCOUNT;
+    DELETE FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY           WHERE TRIP_MASTER_ID IN (SELECT TRIP_MASTER_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_OUT);
+    v_m := SQLROWCOUNT;
+    DELETE FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL            WHERE TRIP_MASTER_ID IN (SELECT TRIP_MASTER_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_OUT);
+    v_k := SQLROWCOUNT;
+    DELETE FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER            WHERE TRIP_MASTER_ID IN (SELECT TRIP_MASTER_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_OUT);
+    v_c := SQLROWCOUNT;
+    v_log := v_log || '3 deleted~|~ok~|~TRIP_MASTER ' || v_c || ', TRIP_DETAIL ' || v_k || ', TRIP_SUMMARY ' || v_m || ', DAILY_ACTIVITY_SUMMARY ' || v_n || '#ROW#';
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L4_DELETED', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
+        'TRIP_MASTER ' || :v_c || ', TRIP_DETAIL ' || :v_k || ', TRIP_SUMMARY ' || :v_m || ', DAILY_ACTIVITY_SUMMARY ' || :v_n);
+
+    -- 4. Insert, column by name (the common columns of the UAT table and the copy), parents first.
+    LET rs_t RESULTSET := (SELECT column1 AS tbl, column2 AS src
+                           FROM VALUES ('TRIP_MASTER',            'DAASI_3641_WT_PROD_TM'),
+                                       ('TRIP_DETAIL',            'DAASI_3641_WT_PROD_TD'),
+                                       ('TRIP_SUMMARY',           'DAASI_3641_WT_PROD_TS'),
+                                       ('DAILY_ACTIVITY_SUMMARY', 'DAASI_3641_WT_PROD_DAS'));
+    LET c_t CURSOR FOR rs_t;
+    FOR r IN c_t DO
+        v_tbl := r.tbl;
+        v_src := r.src;
+        v_cols := (SELECT LISTAGG(u.COLUMN_NAME, ', ') WITHIN GROUP (ORDER BY u.ORDINAL_POSITION)
+                   FROM DAAS_UAT.INFORMATION_SCHEMA.COLUMNS u
+                   JOIN DAAS_UAT.INFORMATION_SCHEMA.COLUMNS s
+                     ON s.TABLE_SCHEMA = 'DAAS_TEMP_WORK' AND s.TABLE_NAME = :v_src AND s.COLUMN_NAME = u.COLUMN_NAME
+                   WHERE u.TABLE_SCHEMA = 'DAAS_CORE' AND u.TABLE_NAME = :v_tbl);
+        v_sql := 'INSERT INTO DAAS_UAT.DAAS_CORE.' || v_tbl || ' (' || v_cols || ') SELECT ' || v_cols
+              || ' FROM DAAS_UAT.DAAS_TEMP_WORK.' || v_src;
+        EXECUTE IMMEDIATE v_sql;
+        v_n := SQLROWCOUNT;
+        v_log := v_log || '4 loaded ' || v_tbl || '~|~ok~|~' || v_n || ' rows#ROW#';
+        INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L4_LOADED_' || :v_tbl, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :v_n || ' rows');
+    END FOR;
+
+    -- 5. The high-water mark: everything the replay builds will carry a higher trip id.
+    v_max_tm := (SELECT MAX(TRIP_MASTER_ID) FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER);
+    DELETE FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS WHERE mark = 'max_trip_master_id_before';
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS (mark, value) VALUES ('max_trip_master_id_before', :v_max_tm);
+    v_log := v_log || '5 mark~|~ok~|~highest trip id in UAT now ' || v_max_tm || '#ROW#';
+
+    -- 6. Move the streams past the load. Each: a holder table of the stream's shape, then an INSERT reading the stream
+    --    that keeps nothing. Streams this session cannot read are reported, not fatal: part 2's preflight checks again.
+    LET rs_s RESULTSET := (SELECT column1 AS strm, column2 AS holder
+                           FROM VALUES ('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM',           'DAASI_3641_WT_DRAIN_MERGE_CHECK'),
+                                       ('DAAS_UAT.DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM',  'DAASI_3641_WT_DRAIN_CUST_MERGE_CHECK'),
+                                       ('DAAS_UAT.DAAS_CORE.TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM',      'DAASI_3641_WT_DRAIN_DAILY_SUMMARY'),
+                                       ('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM',                    'DAASI_3641_WT_DRAIN_DETAIL_SUMMARY'),
+                                       ('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_NG_VW_STREAM',                      'DAASI_3641_WT_DRAIN_NG'),
+                                       ('DAAS_UAT.DAAS_CORE.TRIP_INACTIVE_TXNS_ARCHIVAL_STREAM',            'DAASI_3641_WT_DRAIN_ARCHIVAL'));
+    LET c_s CURSOR FOR rs_s;
+    FOR r IN c_s DO
+        v_src := r.strm;
+        v_tbl := r.holder;
+        BEGIN
+            v_sql := 'CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.' || v_tbl || ' AS SELECT * FROM ' || v_src || ' WHERE 0 = 1';
+            EXECUTE IMMEDIATE v_sql;
+            v_sql := 'INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.' || v_tbl || ' SELECT * FROM ' || v_src || ' WHERE 0 = 1';
+            EXECUTE IMMEDIATE v_sql;
+            v_sql := 'SELECT SYSTEM$STREAM_HAS_DATA(''' || v_src || ''')';
+            res := (EXECUTE IMMEDIATE :v_sql);
+            LET c_h CURSOR FOR res;
+            OPEN c_h;
+            FETCH c_h INTO v_has;
+            CLOSE c_h;
+            v_log := v_log || '6 stream ' || SPLIT_PART(v_src, '.', 3) || '~|~' || IFF(v_has, 'LOOK', 'ok') || '~|~'
+                           || IFF(v_has, 'still reports data after the move (if it is only the customer-merge queue or archival, part 2 will say)', 'moved past the load') || '#ROW#';
+        EXCEPTION
+            WHEN OTHER THEN
+                v_log := v_log || '6 stream ' || SPLIT_PART(v_src, '.', 3) || '~|~note~|~could not be read or moved by this session: '
+                               || REPLACE(REPLACE(LEFT(SQLERRM, 160), '#ROW#', ''), '~|~', '') || '#ROW#';
+        END;
+    END FOR;
+
+    INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG VALUES ('L4_DONE', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'loaded and streams moved');
+    v_log := v_log || 'END~|~done~|~next: L5, then part 2#ROW#';
+    res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+            FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+    RETURN TABLE(res);
+EXCEPTION
+    WHEN load_stop THEN
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+    WHEN OTHER THEN
+        v_log := v_log || 'error~|~STOP~|~' || REPLACE(REPLACE(SQLERRM, '#ROW#', ''), '~|~', '')
+                       || '. If this came after step 3, UAT holds a partial load: run L5a to see which tables are short, then this block again '
+                       || '(it deletes the population again before loading)#ROW#';
+        res := (SELECT t.index AS n, SPLIT_PART(t.value, '~|~', 1) AS step, SPLIT_PART(t.value, '~|~', 2) AS verdict, SPLIT_PART(t.value, '~|~', 3) AS detail
+                FROM TABLE(SPLIT_TO_TABLE(:v_log, '#ROW#')) t WHERE t.value <> '' ORDER BY t.index);
+        RETURN TABLE(res);
+END;
+$$;
+
+
+-- ===================================================================================================
+-- L5. The loaded state
+-- ===================================================================================================
+
+-- L5a. UAT now holds exactly the snapshot for the population in the window: row counts per table, and TRIP_MASTER
+--      compared row by row on its business columns. Expect uat_rows = snapshot_rows on every line and 0 in the two
+--      difference columns.
+WITH pop_tm AS (SELECT m.* FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
+                JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP p
+                  ON p.GUEST_UNIQUE_ID = m.GUEST_UNIQUE_ID
+                 AND (p.GRP = 'EXPOSURE' OR (m.TRIP_END_DT >= DATE '2026-06-30' AND m.TRIP_START_DT <= DATE '2027-01-02'))),
+k_uat  AS (SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT, TRIP_END_DT, DELETE_IND FROM pop_tm),
+k_prod AS (SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT, TRIP_END_DT, DELETE_IND
+           FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM)
+SELECT 'TRIP_MASTER' AS tbl, (SELECT COUNT(*) FROM pop_tm) AS uat_rows, (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM) AS snapshot_rows,
+       (SELECT COUNT(*) FROM (SELECT * FROM k_prod MINUS SELECT * FROM k_uat)) AS in_snapshot_not_uat,
+       (SELECT COUNT(*) FROM (SELECT * FROM k_uat MINUS SELECT * FROM k_prod)) AS in_uat_not_snapshot
+UNION ALL
+SELECT 'TRIP_DETAIL',
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL d JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM t ON t.TRIP_MASTER_ID = d.TRIP_MASTER_ID),
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD), NULL, NULL
+UNION ALL
+SELECT 'TRIP_SUMMARY',
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.TRIP_SUMMARY s JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM t ON t.TRIP_MASTER_ID = s.TRIP_MASTER_ID),
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TS), NULL, NULL
+UNION ALL
+SELECT 'DAILY_ACTIVITY_SUMMARY',
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_CORE.DAILY_ACTIVITY_SUMMARY a JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM t ON t.TRIP_MASTER_ID = a.TRIP_MASTER_ID),
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_DAS), NULL, NULL;
+
+-- L5b. Can UAT value these trips? The summary step sums RATINGS_FACT through TRIP_DETAIL by rating key. If UAT's
+--      RATINGS_FACT carries PROD's keys, UAT can recompute theo for the loaded trips and part 3 can compare figures;
+--      if not, the trip records still compare (they come from TRIP_DETAIL's own dates) but theo in UAT means nothing
+--      for these trips and part 3 treats figures as 'info'. Expect close to 100%; whatever it is, it is recorded.
+SELECT COUNT(*)                                        AS week_rating_keys,
+       COUNT(r.RATINGS_FACT_SK)                        AS found_in_uat_ratings_fact,
+       ROUND(100 * COUNT(r.RATINGS_FACT_SK) / NULLIF(COUNT(*), 0), 2) AS pct_found
+FROM (SELECT DISTINCT TRANSACTION_TABLE_SK FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TOUCH_DETAIL) t
+LEFT JOIN DAAS_UAT.DAAS_CORE.RATINGS_FACT r ON r.RATINGS_FACT_SK = t.TRANSACTION_TABLE_SK;
+
+-- L5c. The streams after the load. Expect FALSE for merge check, customer-merge check, daily summary, detail summary
+--      and non-gaming; the two queues and archival as they were.
+SELECT 'merge check (TRIP_MASTER)'            AS stream, SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM')          AS holds_data
+UNION ALL SELECT 'customer-merge check (TRIP_MASTER)',  SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_TRIP_CUSTOMER_MERGE_CHECK_STREAM')
+UNION ALL SELECT 'daily summary (TRIP_MASTER)',         SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM')
+UNION ALL SELECT 'detail summary (TRIP_DETAIL)',        SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_SUMMARY_STREAM')
+UNION ALL SELECT 'non-gaming (TRIP_DETAIL_NG_VW)',      SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_DETAIL_NG_VW_STREAM')
+UNION ALL SELECT 'archival',                            SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_INACTIVE_TXNS_ARCHIVAL_STREAM')
+UNION ALL SELECT 'merge queue',                         SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_MERGE_QUEUE_STREAM')
+UNION ALL SELECT 'customer-merge queue',                SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_CUSTOMER_MERGE_QUEUE_STREAM')
+UNION ALL SELECT 'recalc queue',                        SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_CORE.TRIP_RECALC_QUEUE_STREAM');
