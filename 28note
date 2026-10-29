@@ -1,0 +1,206 @@
+/* =====================================================================
+   DAASI-3640 | Four validations that the v1.14 comp fact fix works
+   UAT, read-only, any role (the text columns are not masked). Each
+   returns one row ending in RESULT = PASS or FAIL, with the numbers
+   that decide it. Slice: UTU, issue dates March 2026, 49,455 comps,
+   rebuilt through the v1.14 logic on 10/26.
+
+   Reference tables, both built before the rebuild:
+     DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY  the fact as it was (clone)
+     DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED                     what CMS says each comp's
+                                                              comment and remarks should be
+   ===================================================================== */
+
+USE DATABASE DAAS_UAT;
+
+
+/* ---------------------------------------------------------------------
+   V1. THE MISSING TEXT IS NOW LOADED, AND IT IS CMS'S TEXT
+   The ticket: hosts type the reason for a comp into the CMS "remarks"
+   screen, which the fact never loaded, so the report showed a bare
+   amount or nothing. PASS when: no comp had remarks before; every comp
+   that has remarks in CMS has them in the fact now, identical; and
+   every remark line the fact shows exists in CMS under that comp's
+   number (a check that does not depend on the matching rule at all).
+   Expect: 49,455 | 0 | 1,465 | 1,465 | 0 | 0 | PASS
+   --------------------------------------------------------------------- */
+WITH fact_lines AS (
+    SELECT f.COMP_NBR, f.PROPERTY_CD, TRIM(x.VALUE::VARCHAR) AS line
+    FROM DAAS_CORE.COMP_DETAIL_FACT f,
+         LATERAL FLATTEN(INPUT => SPLIT(f.COMMENTS_EXTENDED, '|')) x
+    WHERE f.DELETE_IND = 'N' AND f.SOURCE_SYSTEM_NM = 'HETCMS'
+      AND f.PROPERTY_CD = 'UTU' AND f.ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
+      AND f.COMMENTS_EXTENDED IS NOT NULL
+),
+cms_lines AS (
+    SELECT DISTINCT CNUMRM, PROPERTY_CODE, TRIM(EXPLRM) AS line
+    FROM DAAS_RAW_HETCMS.CMPRM_RAW
+    WHERE PROPERTY_CODE = 'UTU'
+),
+lines_check AS (
+    SELECT COUNT(*) AS lines_in_fact,
+           COUNT_IF(c.line IS NULL) AS lines_not_found_in_cms
+    FROM fact_lines fl
+    LEFT JOIN cms_lines c ON c.CNUMRM = fl.COMP_NBR AND c.PROPERTY_CODE = fl.PROPERTY_CD AND c.line = fl.line
+),
+comps_check AS (
+    SELECT COUNT(*)                                                    AS comps,
+           COUNT_IF(b.COMMENTS_EXTENDED IS NOT NULL)                    AS had_remarks_before,
+           COUNT_IF(e.NEW_REMARKS IS NOT NULL)                          AS have_remarks_in_cms,
+           COUNT_IF(f.COMMENTS_EXTENDED IS NOT NULL)                    AS have_remarks_now,
+           COUNT_IF(f.COMMENTS_EXTENDED IS DISTINCT FROM e.NEW_REMARKS) AS differ_from_cms
+    FROM DAAS_TEMP_WORK.DAASI3640_RP_EXPECTED e
+    JOIN DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+      ON  b.COMP_NBR = e.COMP_NBR AND b.ISHDRW = e.ISHDRW AND b.PROPERTY_CD = e.PROPERTY_CD
+      AND b.CASINO_OUTLET_CD = e.CASINO_OUTLET_CD AND b.GUEST_ID = e.GUEST_ID AND b.DELETE_IND = 'N'
+    JOIN DAAS_CORE.COMP_DETAIL_FACT f
+      ON  f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK
+)
+SELECT 'V1 remarks loaded' AS check_,
+       comps, had_remarks_before, have_remarks_in_cms, have_remarks_now, differ_from_cms,
+       lines_not_found_in_cms,
+       IFF(had_remarks_before = 0 AND have_remarks_now = have_remarks_in_cms
+           AND differ_from_cms = 0 AND lines_not_found_in_cms = 0, 'PASS', 'FAIL') AS result
+FROM comps_check, lines_check;
+
+--  V1, seen: ten comps the report showed as a bare amount, with the
+--  reason the host had typed next to it. (Host names appear in the text.)
+SELECT f.COMP_NBR, f.ISSUE_DT,
+       b.COMP_COMMENTS_DESC AS report_showed_before,
+       f.COMMENTS_EXTENDED  AS reason_now_available
+FROM DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+JOIN DAAS_CORE.COMP_DETAIL_FACT f ON f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK
+WHERE b.DELETE_IND = 'N' AND b.PROPERTY_CD = 'UTU' AND b.ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
+  AND REGEXP_LIKE(b.COMP_COMMENTS_DESC, '^\\$?[0-9][0-9.,]*\\.?$')
+  AND f.COMMENTS_EXTENDED IS NOT NULL
+  AND LENGTH(f.COMMENTS_EXTENDED) > LENGTH(b.COMP_COMMENTS_DESC) + 5
+ORDER BY f.ISSUE_DT
+LIMIT 10;
+
+
+/* ---------------------------------------------------------------------
+   V2. NO COMP SHOWS ANOTHER GUEST'S NOTE
+   CMS reuses comp numbers, and the old load matched comments by number,
+   so a comp could show a note written years earlier for a different
+   guest's comp on the same number. This counts, from the raw tables
+   alone, the comps whose number carries comment lines written under a
+   guest who never held that comp, and how many of those comps show
+   such a line in the fact. PASS when the second number is 0.
+   Expect: 49,246 | 17,406 | 0 | PASS
+   (The same query with USE DATABASE DAAS_PROD gives the before picture:
+   16,780 of 49,455 on 10/27.)
+   --------------------------------------------------------------------- */
+WITH slice AS (
+    SELECT COMP_NBR, ISHDRW, PROPERTY_CD, COMP_COMMENTS_DESC
+    FROM DAAS_CORE.COMP_DETAIL_FACT
+    WHERE DELETE_IND = 'N' AND SOURCE_SYSTEM_NM = 'HETCMS'
+      AND PROPERTY_CD = 'UTU' AND ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
+),
+holders AS (     -- every guest who ever held each comp
+    SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
+    FROM DAAS_RAW_HETCMS.CMPRW_RAW
+    WHERE PROPERTY_CODE = 'UTU' AND CNUMRW IN (SELECT COMP_NBR FROM slice)
+),
+lines AS (       -- latest version of every comment line on these numbers, with the guest it was written under
+    SELECT "CMP#CM" AS CNUMRW, PROPERTY_CODE, SYIDCM, CSEQCM, CMNTCM
+    FROM DAAS_RAW_HETCMS.ECPCMPCM_RAW
+    WHERE PROPERTY_CODE = 'UTU' AND "CMP#CM" IN (SELECT COMP_NBR FROM slice)
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+            ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+),
+own_lines AS (   -- lines under a holder of the comp
+    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
+    FROM slice s
+    JOIN lines l   ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
+    JOIN holders h ON h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM
+),
+foreign_lines AS (   -- lines under someone who never held the comp, and not also written by a holder
+    SELECT DISTINCT s.COMP_NBR, s.ISHDRW, l.CMNTCM
+    FROM slice s
+    JOIN lines l ON l.CNUMRW = s.COMP_NBR AND l.PROPERTY_CODE = s.PROPERTY_CD
+    WHERE NOT EXISTS (SELECT 1 FROM holders h
+                      WHERE h.CNUMRW = s.COMP_NBR AND h.ISHDRW = s.ISHDRW AND h.PROPERTY_CODE = s.PROPERTY_CD AND h.SYIDRW = l.SYIDCM)
+      AND NOT EXISTS (SELECT 1 FROM own_lines o
+                      WHERE o.COMP_NBR = s.COMP_NBR AND o.ISHDRW = s.ISHDRW AND o.CMNTCM = l.CMNTCM)
+),
+fact_lines AS (  -- the comment the fact shows, one row per line
+    SELECT s.COMP_NBR, s.ISHDRW, x.VALUE::VARCHAR AS line
+    FROM slice s, LATERAL FLATTEN(INPUT => SPLIT(s.COMP_COMMENTS_DESC, '|')) x
+    WHERE s.COMP_COMMENTS_DESC IS NOT NULL
+),
+showing AS (
+    SELECT COUNT(DISTINCT fl.COMP_NBR || '-' || fl.ISHDRW) AS comps_showing_another_guests_line
+    FROM fact_lines fl
+    JOIN foreign_lines fo ON fo.COMP_NBR = fl.COMP_NBR AND fo.ISHDRW = fl.ISHDRW AND fo.CMNTCM = fl.line
+)
+SELECT 'V2 no borrowed comments' AS check_,
+       (SELECT COUNT(*) FROM slice)                                         AS comps,
+       (SELECT COUNT(DISTINCT COMP_NBR || '-' || ISHDRW) FROM foreign_lines) AS comps_exposed_to_reuse,
+       comps_showing_another_guests_line,
+       IFF(comps_showing_another_guests_line = 0, 'PASS', 'FAIL')           AS result
+FROM showing;
+
+
+/* ---------------------------------------------------------------------
+   V3. TWO INDEPENDENT BUILDS AGREE
+   The dynamic table DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT rebuilds from
+   the raw tables with its own copy of the v1.14 logic, under its own
+   role, with no reference to the fact. The fact was rebuilt by the
+   load's statements. If both read CMS the same way, they agree on every
+   comp. PASS when no comp differs on comment or remarks.
+   Expect: 49,246 | 0 | 0 | 0 | PASS
+   --------------------------------------------------------------------- */
+SELECT 'V3 fact = dynamic table' AS check_,
+       COUNT(*)                                                             AS comps,
+       COUNT_IF(d.COMP_NBR IS NULL)                                         AS missing_in_dt,
+       COUNT_IF(d.COMP_COMMENTS_DESC IS DISTINCT FROM f.COMP_COMMENTS_DESC) AS comment_differs,
+       COUNT_IF(d.COMMENTS_EXTENDED  IS DISTINCT FROM f.COMMENTS_EXTENDED)  AS remarks_differ,
+       IFF(COUNT_IF(d.COMP_NBR IS NULL) = 0
+           AND COUNT_IF(d.COMP_COMMENTS_DESC IS DISTINCT FROM f.COMP_COMMENTS_DESC) = 0
+           AND COUNT_IF(d.COMMENTS_EXTENDED  IS DISTINCT FROM f.COMMENTS_EXTENDED)  = 0, 'PASS', 'FAIL') AS result
+FROM DAAS_CORE.COMP_DETAIL_FACT f
+LEFT JOIN DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT d
+  ON  d.COMP_NBR = f.COMP_NBR AND d.ISHDRW = f.ISHDRW AND d.PROPERTY_CD = f.PROPERTY_CD
+  AND d.CASINO_OUTLET_CD = f.CASINO_OUTLET_CD AND d.DELETE_IND = 'N'
+WHERE f.DELETE_IND = 'N' AND f.SOURCE_SYSTEM_NM = 'HETCMS'
+  AND f.PROPERTY_CD = 'UTU' AND f.ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31';
+
+
+/* ---------------------------------------------------------------------
+   V4. NOTHING ELSE ON THE COMP MOVED
+   Every rebuilt row against its own backup copy, by surrogate key, on
+   the columns the fix must not touch: guest, dates, amounts, status,
+   category, outlet. PASS when all are 0 across all 49,455 rows.
+   Expect: 49,455 | 0 0 0 0 0 0 0 0 0 | PASS
+   Reported alongside, not part of the pass: DELETE_IND moved on 209
+   rows, which are comps CMS deleted in March that the UAT load had
+   never applied (the rebuild applied them); and the host-name columns,
+   which the 10/26 run wrote under a masked role and the architect's
+   rerun (file 14) corrects.
+   --------------------------------------------------------------------- */
+SELECT 'V4 nothing else moved' AS check_,
+       COUNT(*)                                                                   AS rows_,
+       COUNT_IF(f.GUEST_ID               <> b.GUEST_ID)                            AS guest,
+       COUNT_IF(f.ISSUE_DT               <> b.ISSUE_DT)                            AS issue_dt,
+       COUNT_IF(f.ISSUE_DTTM             IS DISTINCT FROM b.ISSUE_DTTM)            AS issue_dttm,
+       COUNT_IF(f.REDEEM_DTTM            IS DISTINCT FROM b.REDEEM_DTTM)           AS redeem_dttm,
+       COUNT_IF(f.ISSUE_COMP_WORTH_AMT   IS DISTINCT FROM b.ISSUE_COMP_WORTH_AMT)  AS issue_worth,
+       COUNT_IF(f.USED_COMP_WORTH_AMT    IS DISTINCT FROM b.USED_COMP_WORTH_AMT)   AS used_worth,
+       COUNT_IF(f.COMP_STATUS_CD         IS DISTINCT FROM b.COMP_STATUS_CD)        AS status,
+       COUNT_IF(f.COMP_CATEGORY          IS DISTINCT FROM b.COMP_CATEGORY)         AS category,
+       COUNT_IF(f.CASINO_OUTLET_CD       <> b.CASINO_OUTLET_CD)                    AS outlet,
+       IFF(COUNT_IF(f.GUEST_ID <> b.GUEST_ID) = 0
+           AND COUNT_IF(f.ISSUE_DT <> b.ISSUE_DT) = 0
+           AND COUNT_IF(f.ISSUE_DTTM IS DISTINCT FROM b.ISSUE_DTTM) = 0
+           AND COUNT_IF(f.REDEEM_DTTM IS DISTINCT FROM b.REDEEM_DTTM) = 0
+           AND COUNT_IF(f.ISSUE_COMP_WORTH_AMT IS DISTINCT FROM b.ISSUE_COMP_WORTH_AMT) = 0
+           AND COUNT_IF(f.USED_COMP_WORTH_AMT IS DISTINCT FROM b.USED_COMP_WORTH_AMT) = 0
+           AND COUNT_IF(f.COMP_STATUS_CD IS DISTINCT FROM b.COMP_STATUS_CD) = 0
+           AND COUNT_IF(f.COMP_CATEGORY IS DISTINCT FROM b.COMP_CATEGORY) = 0
+           AND COUNT_IF(f.CASINO_OUTLET_CD <> b.CASINO_OUTLET_CD) = 0, 'PASS', 'FAIL') AS result,
+       COUNT_IF(f.DELETE_IND  <> b.DELETE_IND)                                    AS delete_ind_applied_from_cms,
+       COUNT_IF(f.COMPOR_NAME IS DISTINCT FROM b.COMPOR_NAME)                      AS host_name_pending_rerun
+FROM DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UATREPLAY b
+JOIN DAAS_CORE.COMP_DETAIL_FACT f ON f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK
+WHERE b.DELETE_IND = 'N' AND b.SOURCE_SYSTEM_NM = 'HETCMS'
+  AND b.PROPERTY_CD = 'UTU' AND b.ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31';
