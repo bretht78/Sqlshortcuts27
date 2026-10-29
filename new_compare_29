@@ -14,7 +14,8 @@
 --   C2  the scoreboard
 --   C3  by property and market: the "all props" table
 --   C4  every kept trip that differs from PROD (expect no rows)
---   C5  touched trips retired by the join rules, each with its nominated partner
+--   C5  touched trips retired by the join rules, each with its nominated partner; C5b/C5c why the pairs met the
+--       original pairing rule, and where
 --   C6  the EXPOSURE guests' re-cuts, by market and property, with the SK-level and theo checks
 --   C7  figures for the kept trips: theo in UAT after the run against PROD's
 --   C8  how long each batch and step took
@@ -23,12 +24,16 @@ USE ROLE DAAS_TEAM;
 USE SECONDARY ROLES ALL;
 
 
--- C1. The after-picture: UAT's rows for the population now (every trip of those guests in UAT: the loaded ones, as the
---     run left them, and the replacements it built). The TRIP_DETAIL statement is the big one: minutes.
+-- C1. The after-picture: UAT's rows for the population now, in the window the load covered (the loaded trips, as the
+--     run left them, and the replacements it built — every trip of the EXPOSURE guests; WEEK guests' older UAT history
+--     outside the window was never loaded or touched, so it is left out). The TRIP_DETAIL statement is the big one: minutes.
 CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_TM AS
 SELECT m.*
 FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER m
-JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP p ON p.GUEST_UNIQUE_ID = m.GUEST_UNIQUE_ID;
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP p ON p.GUEST_UNIQUE_ID = m.GUEST_UNIQUE_ID
+WHERE p.GRP = 'EXPOSURE'
+   OR (m.TRIP_END_DT >= DATE '2026-06-30' AND m.TRIP_START_DT <= DATE '2027-01-02')
+   OR m.TRIP_MASTER_ID > (SELECT value FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS WHERE mark = 'max_trip_master_id_before');
 
 CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_TD AS
 SELECT d.*
@@ -288,6 +293,77 @@ LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM p
 GROUP BY ALL
 ORDER BY (nominated_partners IS NULL) DESC, 1, 2, 3, 5
 LIMIT 500;
+
+-- C5b. Why the join rules fired, pair by pair (staged in two scratch tables, then a summary). Merge check's original
+--      pairing statement nominates a touched trip with another live trip of the same guest and grain when the two
+--      overlap, or when the touched trip ends TRIP_GAP_DAYS before the other begins (for a non-hotel partner, only if
+--      the touched trip's span plus the gap is under its cap). That second test only sees the pair from the EARLIER
+--      trip's side: in the hourly flow the earlier trip is touched when its own ratings arrive, usually before the
+--      later trip exists, so the pair is never evaluated; a replay touches the earlier trip while the later one is
+--      there. partner_started_after_the_week counts the pairs the week's own hourly runs could not have seen at all.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_JOIN_GAPS AS
+SELECT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT,
+       CASE WHEN TRIP_TYPE = 'PROPERTY' THEN DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_PROPERTY('TRIP_GAP_DAYS', PROPERTY_CD, TRIP_START_DT)
+            WHEN TRIP_TYPE = 'MARKET'   THEN DAAS_UAT.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', MARKET_CD, TRIP_START_DT) END AS GAP
+FROM (SELECT DISTINCT TRIP_TYPE, PROPERTY_CD, MARKET_CD, TRIP_START_DT
+      FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE
+      WHERE FATE = 'retired by the join rules (nominated as a pair)');
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_JOIN_PAIRS AS
+WITH ent AS (SELECT TRY_TO_NUMBER(MAX(VALUE)) AS gap FROM DAAS_UAT.DAAS_CORE.TRIP_CONFIG
+             WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'TRIP_GAP_DAYS' AND ACTIVE_FLG = 'Y'),
+ret AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE WHERE FATE = 'retired by the join rules (nominated as a pair)'),
+hotel AS (SELECT DISTINCT TRIP_MASTER_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TD WHERE TRANSACTION_TYPE = 'HOTEL' AND DELETE_IND = 'N'),
+pairs AS (
+    SELECT r.TRIP_MASTER_ID, r.GUEST_UNIQUE_ID, r.TRIP_TYPE, r.CODE, r.BATCH_NO, r.GRP, r.HAS_HOTEL_STAY,
+           r.TRIP_START_DT AS R_START, r.TRIP_END_DT AS R_END, DATEDIFF(day, r.TRIP_START_DT, r.TRIP_END_DT) + 1 AS R_DAYS,
+           COALESCE(TRY_TO_NUMBER(g.GAP), e.gap) AS GAP, r.MAX_TRIP_DAYS AS CAP,
+           p.TRIP_MASTER_ID AS PARTNER, p.TRIP_START_DT AS P_START, p.TRIP_END_DT AS P_END,
+           (h.TRIP_MASTER_ID IS NOT NULL) AS PARTNER_HAS_STAY, q.why AS PARTNER_NOMINATED_AS,
+           ROW_NUMBER() OVER (PARTITION BY r.TRIP_MASTER_ID
+                              ORDER BY LEAST(ABS(DATEDIFF(day, r.TRIP_END_DT, p.TRIP_START_DT)), ABS(DATEDIFF(day, p.TRIP_END_DT, r.TRIP_START_DT)))) AS RN
+    FROM ret r
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_JOIN_GAPS g
+           ON g.TRIP_TYPE = r.TRIP_TYPE AND EQUAL_NULL(g.PROPERTY_CD, r.PROPERTY_CD) AND EQUAL_NULL(g.MARKET_CD, r.MARKET_CD) AND g.TRIP_START_DT = r.TRIP_START_DT
+    CROSS JOIN ent e
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE q ON q.trip_master_id <> r.TRIP_MASTER_ID
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TM p
+      ON p.TRIP_MASTER_ID = q.trip_master_id AND p.GUEST_UNIQUE_ID = r.GUEST_UNIQUE_ID AND p.TRIP_TYPE = r.TRIP_TYPE
+     AND EQUAL_NULL(p.PROPERTY_CD, r.PROPERTY_CD) AND EQUAL_NULL(p.MARKET_CD, r.MARKET_CD)
+    LEFT JOIN hotel h ON h.TRIP_MASTER_ID = p.TRIP_MASTER_ID
+)
+SELECT *,
+       CASE WHEN P_START <= R_END AND P_END >= R_START                                   THEN 'overlapping trips'
+            WHEN DATEADD(day, GAP, R_END) BETWEEN P_START AND P_END
+             AND (PARTNER_HAS_STAY OR R_DAYS - 1 + GAP < CAP)                            THEN 'it ends gap days before the partner (earlier-trip side)'
+            WHEN DATEADD(day, GAP, P_END) BETWEEN R_START AND R_END                       THEN 'the partner ends gap days before it (later-trip side)'
+            ELSE 'other: no rule of the pairing statement fits (look)' END AS RELATION
+FROM pairs
+WHERE RN = 1;
+
+SELECT RELATION, PARTNER_NOMINATED_AS,
+       COUNT(*)                                            AS retired_trips,
+       COUNT_IF(P_START > DATE '2026-10-04')               AS partner_started_after_the_week,
+       COUNT_IF(PARTNER_HAS_STAY)                          AS partner_has_a_stay,
+       COUNT_IF(GRP = 'EXPOSURE')                          AS of_exposure_guests,
+       COUNT(DISTINCT CODE)                                AS codes,
+       MIN(GAP) AS gap_min, MAX(GAP) AS gap_max
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_JOIN_PAIRS
+GROUP BY 1, 2
+ORDER BY 3 DESC;
+
+-- C5c. The same by grain and code (the markets and properties where the join rules fired, with the earlier-trip-side
+--      share), for the write-up.
+SELECT TRIP_TYPE, CODE, COUNT(*) AS retired_by_join_rules,
+       COUNT_IF(RELATION LIKE 'it ends gap days%')  AS earlier_trip_side,
+       COUNT_IF(RELATION LIKE 'overlapping%')        AS overlapping,
+       COUNT_IF(RELATION LIKE 'the partner ends%')   AS later_trip_side,
+       COUNT_IF(RELATION LIKE 'other%')              AS other_look,
+       COUNT_IF(P_START > DATE '2026-10-04')         AS partner_started_after_the_week,
+       MAX(GAP) AS gap, MAX(CAP) AS cap
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_JOIN_PAIRS
+GROUP BY 1, 2
+ORDER BY 3 DESC;
 
 
 -- C6. The EXPOSURE guests' re-cuts, by market and property: expected, retired, replacements built within cap, and
