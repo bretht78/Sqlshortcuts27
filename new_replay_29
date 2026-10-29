@@ -40,7 +40,7 @@ EXECUTE IMMEDIATE $$
 DECLARE
     v_batch_from INTEGER DEFAULT 1;     -- first batch to replay in this run
     v_batch_to   INTEGER DEFAULT 1;     -- last batch to replay in this run (1 first; then 2)
-    v_resume_at  INTEGER DEFAULT 0;     -- 0: fresh (touch, then steps 2-7) for v_batch_from; 2..7: that batch was touched, resume at this step
+    v_resume_at  INTEGER DEFAULT 0;     -- 0: fresh (touch, then steps 2-7) for v_batch_from; 2..7: that batch was touched, resume at this step. Back to 0 for a new batch.
     v_skip_pos   BOOLEAN DEFAULT TRUE;  -- step 5 runs with UAT's broken POS summary sub-step switched off
     v_max_wait   INTEGER DEFAULT 10800; -- longest wait for one step, seconds (3 hours)
     v_tag        VARCHAR DEFAULT 'DAASI-3641 week test';
@@ -207,6 +207,18 @@ BEGIN
         v_expect := (SELECT COUNT_IF(EXPECT_NOMINATION) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT WHERE BATCH_NO = :v_b);
         IF (v_touch = 0) THEN
             v_log := v_log || 'B' || v_b || ' batch~|~STOP~|~batch ' || v_b || ' has no trips to touch (WT_EXPECT): check WT_POP.BATCH_NO#ROW#';
+            RAISE test_stop;
+        END IF;
+        -- a resume only makes sense for a batch that was touched; a fresh batch must not skip its touch
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG WHERE step = 'B' || :v_b || '_TOUCHED');
+        IF (v_start > 0 AND v_n = 0) THEN
+            v_log := v_log || 'B' || v_b || ' batch~|~STOP~|~v_resume_at is ' || v_start || ' but batch ' || v_b
+                           || ' has not been touched yet: set v_resume_at = 0 and run again#ROW#';
+            RAISE test_stop;
+        END IF;
+        v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG WHERE step = 'B' || :v_b || '_DONE');
+        IF (v_n > 0) THEN
+            v_log := v_log || 'B' || v_b || ' batch~|~STOP~|~batch ' || v_b || ' is already done (B' || v_b || '_DONE in the log): change v_batch_from#ROW#';
             RAISE test_stop;
         END IF;
 
