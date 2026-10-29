@@ -13,7 +13,7 @@
 -- Known UAT behaviour the block handles on its own: the merge step's last statement (recreating merge check's stream)
 -- fails on privileges in UAT after its data is committed, so a TRIP_MERGE 'FAILURE' whose work is in
 -- TRIP_MERGE_PROCESSED is treated as done and the stream is moved past the merge's own changes (kept in
--- DAASI_3641_WT_MERGE_CHANGES), exactly what that statement was for. UAT's POS summary code is switched off for step 5
+-- DAASI_3641_WT_MERGE_CHANGES_B<batch>), exactly what that statement was for. UAT's POS summary code is switched off for step 5
 -- and back on after. The customer merge itself is never run (privileges); its queue rows are counted and left.
 --
 --   R1   the block (parameters at the top of DECLARE)
@@ -26,16 +26,13 @@ USE ROLE DAAS_TEAM;
 USE SECONDARY ROLES ALL;
 
 
--- R0. Once, before the first batch: the two tables the block appends to (what merge check nominated, by batch; and the
---     merge's own stream changes it moves past). Creating the second one reads merge check's stream with no rows kept.
-CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE (
+-- R0. Once, before the first batch: the table the block appends to (what merge check nominated, by batch). IF NOT
+--     EXISTS, so running it again later does not wipe what earlier batches recorded. (The merge's own stream changes
+--     go to a table per batch, DAASI_3641_WT_MERGE_CHANGES_B<n>, made from the rows themselves when the batch gets
+--     there: a holder made empty from the stream came out with a column too narrow for METADATA$ROW_ID, 29 Oct.)
+CREATE TABLE IF NOT EXISTS DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE (
     batch_no INTEGER, merge_check_batch_id NUMBER(38,0), trip_master_id NUMBER(38,0), why VARCHAR,
     trip_type VARCHAR, code VARCHAR, trip_days NUMBER(38,0), max_trip_days NUMBER(38,0), has_hotel_stay VARCHAR, grp VARCHAR);
-
-CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES AS
-SELECT 0::INTEGER AS batch_no, 0::NUMBER(38,0) AS merge_batch_id, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ AS kept_at, s.*
-FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM s
-WHERE 0 = 1;
 
 
 -- R1. The block.
@@ -98,6 +95,18 @@ BEGIN
     v_n := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG WHERE step = 'L4_DONE');
     IF (v_max_tm IS NULL OR v_n = 0) THEN
         v_log := v_log || 'P1 load~|~STOP~|~part 1 has not finished (no L4_DONE in the log): run part 1 first#ROW#';
+        RAISE test_stop;
+    END IF;
+    -- UAT's id sequences must be past every id the load brought in (part 1's L6), or the new trips would reuse ids
+    SHOW SEQUENCES IN SCHEMA DAAS_UAT.DAAS_CORE;
+    v_txt := (SELECT COALESCE(LISTAGG(s."name" || ' next value ' || s."next_value" || ' is not past the highest id in UAT ' || m.max_id, '; '), '')
+              FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) s
+              JOIN (SELECT 'TRIP_MASTER_SEQ' AS seq, MAX(TRIP_MASTER_ID) AS max_id FROM DAAS_UAT.DAAS_CORE.TRIP_MASTER
+                    UNION ALL
+                    SELECT 'TRIP_DETAIL_SEQ', MAX(TRIP_DETAIL_ID) FROM DAAS_UAT.DAAS_CORE.TRIP_DETAIL) m ON m.seq = s."name"
+              WHERE s."next_value"::NUMBER(38,0) <= m.max_id);
+    IF (v_txt <> '') THEN
+        v_log := v_log || 'P1 sequences~|~STOP~|~' || v_txt || ': run part 1 L6 first#ROW#';
         RAISE test_stop;
     END IF;
     v_log := v_log || 'P1 setup~|~ok~|~v1.4 live; load done; batches ' || v_batch_from || ' to ' || v_batch_to
@@ -328,6 +337,22 @@ BEGIN
                                  WHERE j.job_name = :v_job AND b.batch_id > :v_mark);
                     IF (v_status IS NOT NULL AND v_status <> 'IN PROGRESS') THEN BREAK; END IF;
                     IF (v_status IS NULL AND v_waited >= 900) THEN BREAK; END IF;
+                    -- every 5 minutes: has Snowflake cancelled the task's run (its timeout) while the batch row still says
+                    -- IN PROGRESS? TASK_HISTORY may not be readable by this role; then this check is simply skipped.
+                    IF (MOD(v_waited, 300) = 0) THEN
+                        v_out := NULL;
+                        BEGIN
+                            v_out := (SELECT MAX_BY(STATE || COALESCE(': ' || LEFT(ERROR_MESSAGE, 300), ''), SCHEDULED_TIME)
+                                      FROM TABLE(DAAS_UAT.INFORMATION_SCHEMA.TASK_HISTORY(
+                                               SCHEDULED_TIME_RANGE_START => DATEADD(hour, -6, CURRENT_TIMESTAMP()), TASK_NAME => :v_task)));
+                        EXCEPTION
+                            WHEN OTHER THEN v_out := NULL;
+                        END;
+                        IF (v_out IS NOT NULL AND (STARTSWITH(v_out, 'FAILED') OR STARTSWITH(v_out, 'CANCELLED') OR STARTSWITH(v_out, 'SKIPPED'))) THEN
+                            v_status := 'TASK RUN ' || v_out || ' (the batch row stayed IN PROGRESS)';
+                            BREAK;
+                        END IF;
+                    END IF;
                 END WHILE;
                 IF (v_pos_off) THEN
                     UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y' WHERE trip_summary_config_id = :v_pos_id AND active_flg = 'N';
@@ -377,19 +402,47 @@ BEGIN
                     v_m := (SELECT COUNT(DISTINCT trip_master_id) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE WHERE batch_no = :v_b);
                     IF (NOT (STARTSWITH(v_status, 'SUCCESS') OR STARTSWITH(v_status, 'Alert'))) THEN
                         IF (v_c > 0 AND v_c >= v_m) THEN
-                            -- UAT's known failure: the data is committed, only the closing stream reset failed. Do what it was for.
+                            -- UAT's known failure: the data is committed, only the closing stream reset failed. Do what it
+                            -- was for, the proof's B3c way: keep the merge's changes in a table made from the rows themselves
+                            -- (a CTAS does not move a stream), then an INSERT that reads the stream and keeps nothing (moves it).
+                            v_n := -1;
                             BEGIN
-                                INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES
-                                SELECT :v_b, :v_batchid, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, * FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM;
-                                v_n := SQLROWCOUNT;
-                                v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~ok~|~UAT''s expected FAILURE (stream reset, privileges) after committing: '
-                                               || v_c || ' trips processed; merge check''s stream moved past the merge''s ' || v_n || ' changes (kept)#ROW#';
+                                v_cmd := 'CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES_B' || v_b || ' AS '
+                                      || 'SELECT ' || v_b || '::INTEGER AS batch_no, ' || v_batchid || '::NUMBER(38,0) AS merge_batch_id, '
+                                      || 'CURRENT_TIMESTAMP()::TIMESTAMP_NTZ AS kept_at, s.* FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM s';
+                                EXECUTE IMMEDIATE v_cmd;
+                                v_cmd := 'INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES_B' || v_b
+                                      || ' SELECT ' || v_b || ', ' || v_batchid || ', CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, s.* '
+                                      || 'FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM s WHERE 0 = 1';
+                                EXECUTE IMMEDIATE v_cmd;
+                                v_cmd := 'SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES_B' || v_b;
+                                res := (EXECUTE IMMEDIATE :v_cmd);
+                                LET c_mc CURSOR FOR res;
+                                OPEN c_mc;
+                                FETCH c_mc INTO v_n;
+                                CLOSE c_mc;
                             EXCEPTION
                                 WHEN OTHER THEN
                                     v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~STOP~|~merge committed (' || v_c || ' processed) but its stream could not be moved by this session: '
                                                    || REPLACE(REPLACE(LEFT(SQLERRM, 160), '#ROW#', ''), '~|~', '') || '. Run R3b by hand, then rerun with v_batch_from = ' || v_b || ', v_resume_at = 4#ROW#';
-                                    RAISE test_stop;
                             END;
+                            IF (v_n < 0) THEN
+                                RAISE test_stop;
+                            END IF;
+                            IF (v_can_read) THEN
+                                v_k := (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM WHERE METADATA$ACTION = 'INSERT');
+                            ELSE
+                                v_has := (SELECT SYSTEM$STREAM_HAS_DATA('DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'));
+                                v_k := IFF(v_has, 1, 0);
+                            END IF;
+                            IF (v_k > 0) THEN
+                                v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~STOP~|~merge committed (' || v_c || ' processed) and ' || v_n
+                                               || ' of its changes were kept, but merge check''s stream still shows rows after the move. Run R3b by hand (its last statement must show 0), then rerun with v_batch_from = '
+                                               || v_b || ', v_resume_at = 4#ROW#';
+                                RAISE test_stop;
+                            END IF;
+                            v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~ok~|~UAT''s expected FAILURE (stream reset, privileges) after committing: '
+                                           || v_c || ' trips processed; merge check''s stream moved past the merge''s ' || v_n || ' changes (kept in DAASI_3641_WT_MERGE_CHANGES_B' || v_b || ')#ROW#';
                         ELSE
                             v_log := v_log || 'B' || v_b || ' S3 TRIP_MERGE~|~STOP~|~' || LEFT(v_status, 400) || ' (batch ' || v_batchid || '), '
                                            || v_c || ' of ' || v_m || ' nominated trips processed: the merge did not commit. Send R3#ROW#';
@@ -489,9 +542,33 @@ JOIN DAAS_UAT.DAAS_COMMON.JOB j ON j.job_id = b.job_id
 WHERE b.batch_start_date >= (SELECT MIN(logged_at) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_LOG WHERE step = 'L4_DONE')
 ORDER BY e.batch_id, e.created_dttm;
 
--- R3b. (Only if R1 said so: the merge committed but its stream could not be moved.) Keep and move, by hand.
--- INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES
--- SELECT <batch_no>, <merge batch id>, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, * FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM;
+-- R3b. (Only if R1 said so: the merge committed but its stream could not be moved — batch 1 on 29 Oct.) Keep and move
+--      by hand, the proof's B3c way, for batch 1 (for another batch change the three 1s and the mark's b1). The first
+--      statement keeps the merge's changes (a CTAS does not move a stream); the second reads the stream and keeps
+--      nothing, which moves it; the third must show stream_rows_left 0. Then R1 with v_batch_from = 1, v_batch_to = 1,
+--      v_resume_at = 4.
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES_B1 AS
+SELECT 1::INTEGER AS batch_no,
+       (SELECT MAX(value) FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MARKS WHERE mark = 'b1_trip_merge_batch')::NUMBER(38,0) AS merge_batch_id,
+       CURRENT_TIMESTAMP()::TIMESTAMP_NTZ AS kept_at,
+       s.*
+FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM s;
+
+INSERT INTO DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES_B1
+SELECT 1, 0, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, s.*
+FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM s
+WHERE 0 = 1;
+
+SELECT COUNT(*)                                        AS merge_changes_kept,
+       COUNT(DISTINCT trip_master_id)                  AS trips_in_them,
+       COUNT_IF(METADATA$ACTION = 'INSERT' AND delete_ind = 'N')  AS live_rows_written_by_the_merge,
+       COUNT_IF(METADATA$ACTION = 'INSERT' AND delete_ind = 'Y')  AS retired_rows_written_by_the_merge,
+       (SELECT COUNT(*) FROM DAAS_UAT.DAAS_TEMP.TRIP_MASTER_TRIP_MERGE_CHECK_STREAM WHERE METADATA$ACTION = 'INSERT') AS stream_rows_left_expect_0
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_MERGE_CHANGES_B1;
+
+-- R3c. The summary wrapper's task timeout, by hand (R1's P2 could not read it). "value" is milliseconds; the Snowflake
+--      default is 3600000 (60 minutes) and "level" blank means the default applies. A step that runs past it is cancelled.
+SHOW PARAMETERS LIKE 'USER_TASK_TIMEOUT_MS' IN TASK DAAS_UAT.DAAS_COMMON.TRIP_SUMMARY_WRAPPER_ONDEMAND_TASK;
 
 -- R4. (Only if R1 says to.) UAT's POS summary sub-step back on by hand.
 UPDATE DAAS_UAT.DAAS_CORE.TRIP_SUMMARY_CONFIG SET active_flg = 'Y'
