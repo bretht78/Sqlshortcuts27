@@ -1,0 +1,215 @@
+-- DAASI-3641: validations of the full-week UAT test (TRIP_MERGE_CHECK_PROC v1.4), for the Word document.
+--
+-- Five queries, each one screenshot, each reading the test's scratch tables in DAAS_UAT.DAAS_TEMP_WORK (built by
+-- parts 1-3 of the week test on 29 Oct). Run after part 3 — W4 also needs C7b's tables, W5b needs C5b's. Nothing here
+-- writes. Paragraphs for each are in DAASI_3641_WEEK_TEST_VALIDATIONS_TEXT.md.
+--
+--   W1  what the test covered and what the rule did there, by grain (Pete's ask: a random week, all properties,
+--       compared with PROD's trip records)
+--   W2  the trip records against PROD: trips and their transactions, row by row
+--   W3  where the rule fired: the re-cuts by market and property, with transactions and theo
+--   W4  the figures on everything else: theo on the kept trips, UAT after the run against PROD
+--   W5  the merges the pre-existing join rule made, batch by batch (a) and pair by pair (b)
+--
+-- The week: 2026-09-28 to 2026-10-04 (random pick 1 of 16). The snapshot: PROD's TRIP_MASTER, TRIP_DETAIL,
+-- TRIP_SUMMARY and DAILY_ACTIVITY_SUMMARY for every guest with a rating in the week, trips within 90 days of the week,
+-- read at one instant on 29 Oct (07:13 PT), plus the 34 "exposure" guests who hold the over-cap no-stay trips the rule
+-- is for, with their whole history. The replay: every live rating of the week marked on its trips at every grain, then
+-- merge check (v1.4) → merge → customer merge check → summaries → comp worth → non-gaming revenue, in two batches.
+
+USE ROLE DAAS_TEAM;
+USE SECONDARY ROLES ALL;
+
+
+-- W1. Coverage, and the rule's reach, by grain. Expect: every grain touched; over_cap_no_stay_trips (the only class
+--     the new statement nominates) 0 among the week's own trips and 7,248 among the exposure guests' (the trips the
+--     test added so the rule had something to do); re_cut_by_the_new_rule equal to it; differs_unexplained 0.
+WITH f AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE)
+SELECT COALESCE(f.TRIP_TYPE, 'ALL GRAINS')                                            AS grain,
+       COUNT(DISTINCT IFF(f.TRIP_TYPE <> 'ENTERPRISE', f.CODE, NULL))                  AS properties_and_markets,
+       COUNT(DISTINCT f.GUEST_UNIQUE_ID)                                                AS guests,
+       COUNT_IF(f.DELETE_IND_PROD = 'N')                                                AS live_trips_loaded_from_prod,
+       COUNT_IF(f.TOUCHED)                                                              AS trips_the_replay_touched,
+       COUNT_IF(f.TOUCHED AND f.GRP = 'WEEK')                                           AS of_them_the_weeks_own_trips,
+       COUNT_IF(f.TOUCHED AND f.GRP = 'WEEK' AND f.EXPECT_NOMINATION)                   AS week_trips_over_cap_no_stay,
+       COUNT_IF(f.TOUCHED AND f.GRP = 'EXPOSURE' AND f.EXPECT_NOMINATION)               AS exposure_trips_over_cap_no_stay,
+       COUNT_IF(f.FATE = 're-cut by the new rule (expected)')                           AS re_cut_by_the_new_rule,
+       COUNT_IF(f.FATE = 'kept, identical to PROD')                                     AS kept_identical_to_prod,
+       COUNT_IF(f.FATE = 'retired by the join rules (nominated as a pair)')             AS merged_by_the_pre_existing_join_rule,
+       COUNT_IF(f.FATE LIKE 'LOOK%')                                                    AS differs_unexplained
+FROM f
+GROUP BY ROLLUP (f.TRIP_TYPE)
+ORDER BY GROUPING(f.TRIP_TYPE), f.TRIP_TYPE;
+
+
+-- W2. The trip records against PROD, row by row (the underlying tables, not the summaries). Expect every verdict ok.
+WITH f AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE),
+b AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_BUILT WHERE DELETE_IND = 'N'),
+t AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TXN),
+dd AS (SELECT * FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TD_DIFF),
+board AS (
+    SELECT 1 AS n, 'Live PROD trips loaded, not in the new rule''s class (over cap, no stay)' AS check_name, NULL AS expected,
+           (SELECT COUNT(*) FROM f WHERE DELETE_IND_PROD = 'N' AND NOT EXPECT_NOMINATION)::VARCHAR AS actual
+    UNION ALL SELECT 2, '   ... still live in UAT with the same guest, grain, code and dates',
+           (SELECT COUNT(*) FROM f WHERE DELETE_IND_PROD = 'N' AND NOT EXPECT_NOMINATION AND FATE NOT LIKE 'retired by the join%')::VARCHAR,
+           (SELECT COUNT(*) FROM f WHERE FATE = 'kept, identical to PROD')::VARCHAR
+    UNION ALL SELECT 3, '   ... merged with a neighbouring trip by the pre-existing join rule (W5 lists them)', NULL,
+           (SELECT COUNT(*) FROM f WHERE FATE = 'retired by the join rules (nominated as a pair)')::VARCHAR
+    UNION ALL SELECT 4, '   ... changed in place (dates, grain, code or guest differ from PROD)', '0',
+           (SELECT COUNT(*) FROM f WHERE FATE = 'LOOK: changed in place')::VARCHAR
+    UNION ALL SELECT 5, '   ... gone from UAT, or retired without any nomination', '0',
+           (SELECT COUNT(*) FROM f WHERE FATE IN ('LOOK: gone from UAT', 'LOOK: retired without a nomination'))::VARCHAR
+    UNION ALL SELECT 6, 'Live transactions of the kept trips: rows in PROD not in UAT / rows in UAT not in PROD', '0 / 0',
+           (SELECT COUNT(*) FROM dd WHERE which LIKE 'in PROD%') || ' / ' || (SELECT COUNT(*) FROM dd WHERE which LIKE 'in UAT%')
+    UNION ALL SELECT 7, 'Transaction-nights of every retired trip now on exactly one live trip of the same grain (lost / doubled)',
+           (SELECT COUNT(*) FROM t) || ' (0 / 0)',
+           (SELECT COUNT_IF(LIVE_TRIPS_HOLDING_IT = 1) FROM t) || ' (' || (SELECT COUNT_IF(LIVE_TRIPS_HOLDING_IT = 0) FROM t)
+           || ' / ' || (SELECT COUNT_IF(LIVE_TRIPS_HOLDING_IT >= 2) FROM t) || ')'
+    UNION ALL SELECT 8, 'New trips built by the run; of them longer than their cap with no hotel night', NULL,
+           (SELECT COUNT(*) FROM b) || '; ' || (SELECT COUNT_IF(NOT HAS_STAY AND TRIP_DAYS > MAX_TRIP_DAYS) FROM b) || ' over cap'
+    UNION ALL SELECT 9, 'New trips for a guest and grain where nothing was retired (trips from nowhere)', '0',
+           (SELECT COUNT_IF(NOT REPLACES_A_RETIRED_TRIP) FROM b)::VARCHAR
+    UNION ALL SELECT 10, 'Properties and markets in the test / with any trip that differs from PROD outside the expectation', NULL,
+           (SELECT COUNT(DISTINCT CODE) FROM f WHERE TRIP_TYPE <> 'ENTERPRISE') || ' / ' || (SELECT COUNT(DISTINCT CODE) FROM f WHERE FATE LIKE 'LOOK%')
+)
+SELECT n, check_name, expected, actual,
+       CASE WHEN expected IS NULL THEN 'info' WHEN actual = expected THEN 'ok' ELSE 'LOOK' END AS verdict
+FROM board
+ORDER BY n;
+
+
+-- W3. Where the rule fired: the exposure guests' over-cap no-stay trips by market and property — re-cut, rebuilt within
+--     the cap, every transaction-night on exactly one live trip, and theo conserved. theo_before is the theo of every
+--     trip of these guests retired at that grain and code (the re-cuts and the few merged with a neighbour),
+--     theo_after the theo of every trip the run built there. Expect re_cut = over_cap_no_stay_trips, 0 over cap,
+--     lost 0, doubled 0, theo_difference 0.00 on every row.
+WITH fate AS (
+    SELECT TRIP_TYPE, CODE, MAX(MAX_TRIP_DAYS) AS cap,
+           COUNT_IF(EXPECT_NOMINATION)                               AS over_cap_no_stay_trips,
+           COUNT_IF(FATE = 're-cut by the new rule (expected)')      AS re_cut,
+           COUNT(DISTINCT IFF(EXPECT_NOMINATION, GUEST_UNIQUE_ID, NULL)) AS guests
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE
+    WHERE GRP = 'EXPOSURE' AND TOUCHED
+    GROUP BY 1, 2
+    HAVING COUNT_IF(EXPECT_NOMINATION) > 0
+),
+built AS (
+    SELECT b.TRIP_TYPE, b.CODE, COUNT(*) AS trips_built,
+           MAX(IFF(NOT b.HAS_STAY, b.TRIP_DAYS, NULL))                 AS longest_built_no_stay,
+           COUNT_IF(NOT b.HAS_STAY AND b.TRIP_DAYS > b.MAX_TRIP_DAYS)   AS built_over_cap,
+           ROUND(SUM(s.TOTAL_THEO_WIN_AMT), 2)                         AS theo_after
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_BUILT b
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_TS s ON s.TRIP_MASTER_ID = b.TRIP_MASTER_ID
+    WHERE b.GRP = 'EXPOSURE' AND b.DELETE_IND = 'N'
+    GROUP BY 1, 2
+),
+retired AS (
+    SELECT f.TRIP_TYPE, f.CODE, ROUND(SUM(s.TOTAL_THEO_WIN_AMT), 2) AS theo_before
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE f
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TS s ON s.TRIP_MASTER_ID = f.TRIP_MASTER_ID
+    WHERE f.GRP = 'EXPOSURE' AND f.FATE IN ('re-cut by the new rule (expected)', 'retired by the join rules (nominated as a pair)')
+    GROUP BY 1, 2
+),
+txn AS (
+    SELECT TRIP_TYPE, CODE, COUNT(*) AS transaction_nights,
+           COUNT_IF(LIVE_TRIPS_HOLDING_IT = 1) AS on_exactly_one_live_trip,
+           COUNT_IF(LIVE_TRIPS_HOLDING_IT = 0) AS lost,
+           COUNT_IF(LIVE_TRIPS_HOLDING_IT >= 2) AS doubled
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_TXN
+    WHERE FATE LIKE 're-cut%'
+    GROUP BY 1, 2
+)
+SELECT f.TRIP_TYPE, f.CODE, f.cap, f.guests, f.over_cap_no_stay_trips, f.re_cut,
+       COALESCE(b.trips_built, 0) AS trips_built, b.longest_built_no_stay, COALESCE(b.built_over_cap, 0) AS built_over_cap,
+       COALESCE(t.transaction_nights, 0) AS transaction_nights, COALESCE(t.on_exactly_one_live_trip, 0) AS on_exactly_one_live_trip,
+       COALESCE(t.lost, 0) AS lost, COALESCE(t.doubled, 0) AS doubled,
+       r.theo_before, b.theo_after, ROUND(COALESCE(b.theo_after, 0) - COALESCE(r.theo_before, 0), 2) AS theo_difference,
+       IFF(f.re_cut = f.over_cap_no_stay_trips AND COALESCE(b.built_over_cap, 0) = 0 AND COALESCE(t.lost, 0) = 0
+           AND COALESCE(t.doubled, 0) = 0 AND ROUND(COALESCE(b.theo_after, 0) - COALESCE(r.theo_before, 0), 2) = 0, 'ok', 'LOOK') AS verdict
+FROM fate f
+LEFT JOIN built b   ON b.TRIP_TYPE = f.TRIP_TYPE AND b.CODE = f.CODE
+LEFT JOIN retired r ON r.TRIP_TYPE = f.TRIP_TYPE AND r.CODE = f.CODE
+LEFT JOIN txn t     ON t.TRIP_TYPE = f.TRIP_TYPE AND t.CODE = f.CODE
+ORDER BY f.over_cap_no_stay_trips DESC;
+
+
+-- W4. The figures on everything else: theo on the kept trips, UAT after the run against PROD's snapshot — the trips
+--     the replay did not touch (summaries as loaded: must be untouched) and the trips it did (summaries rewritten by
+--     the run from UAT's own ratings table). A rewritten figure that differs is explained when the trip holds a rating
+--     that UAT's RATINGS_FACT lacks or values differently from PROD's (C7b's comparison); expect unexplained 0.
+--     Needs C7b's tables (DAASI_3641_WT_THEO_DIFF, _KEYS, _RF).
+WITH per_trip AS (
+    SELECT t.TRIP_MASTER_ID,
+           COUNT_IF(k.TRANSACTION_TABLE_SK IS NOT NULL AND u.RATINGS_FACT_SK IS NULL) AS missing_in_uat,
+           COUNT_IF(d.RATINGS_FACT_SK IS NOT NULL)                                   AS valued_differently
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF t
+    LEFT JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF_KEYS k ON k.TRIP_MASTER_ID = t.TRIP_MASTER_ID
+    LEFT JOIN DAAS_UAT.DAAS_CORE.RATINGS_FACT u ON u.RATINGS_FACT_SK = k.TRANSACTION_TABLE_SK
+    LEFT JOIN (SELECT DISTINCT RATINGS_FACT_SK FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_THEO_DIFF_RF) d ON d.RATINGS_FACT_SK = k.TRANSACTION_TABLE_SK
+    GROUP BY 1
+)
+SELECT IFF(f.TOUCHED, 'touched by the replay (summary rewritten by the run)', 'not touched (summary as loaded from PROD)') AS kept_trips,
+       COUNT(*)                                                                      AS trips_with_a_summary_row_in_both,
+       COUNT_IF(ROUND(u.TOTAL_THEO_WIN_AMT, 2) = ROUND(p.TOTAL_THEO_WIN_AMT, 2))       AS theo_identical,
+       COUNT_IF(ROUND(u.TOTAL_THEO_WIN_AMT, 2) <> ROUND(p.TOTAL_THEO_WIN_AMT, 2))      AS theo_differs,
+       COUNT_IF(ROUND(u.TOTAL_THEO_WIN_AMT, 2) <> ROUND(p.TOTAL_THEO_WIN_AMT, 2)
+                AND (x.missing_in_uat > 0 OR x.valued_differently > 0))               AS differs_because_uat_ratings_table_differs_from_prod,
+       COUNT_IF(ROUND(u.TOTAL_THEO_WIN_AMT, 2) <> ROUND(p.TOTAL_THEO_WIN_AMT, 2)
+                AND COALESCE(x.missing_in_uat, 0) = 0 AND COALESCE(x.valued_differently, 0) = 0) AS differs_unexplained,
+       ROUND(SUM(p.TOTAL_THEO_WIN_AMT), 2) AS prod_theo, ROUND(SUM(u.TOTAL_THEO_WIN_AMT), 2) AS uat_theo
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE f
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_PROD_TS p ON p.TRIP_MASTER_ID = f.TRIP_MASTER_ID
+JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_UAT_TS  u ON u.TRIP_MASTER_ID = f.TRIP_MASTER_ID
+LEFT JOIN per_trip x ON x.TRIP_MASTER_ID = f.TRIP_MASTER_ID
+WHERE f.FATE = 'kept, identical to PROD'
+GROUP BY 1
+ORDER BY 1 DESC;
+
+
+-- W5a. The merges the pre-existing join rule made, batch by batch. Batch 1 carries the 34 exposure guests and half the
+--      week's guests, batch 2 the other half and no exposure guests. Expect the new rule's column 0 in batch 2 while
+--      the join rule's columns are not: the merges happen with the new statement idle, so they are not its doing.
+WITH touched AS (
+    SELECT BATCH_NO, COUNT(DISTINCT GUEST_UNIQUE_ID) AS guests, COUNT(*) AS trips_touched,
+           COUNT_IF(EXPECT_NOMINATION) AS over_cap_no_stay_trips
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_EXPECT
+    GROUP BY 1
+),
+queue AS (
+    SELECT batch_no,
+           COUNT_IF(why LIKE 'over cap, no stay%')  AS nominated_by_the_new_rule,
+           COUNT_IF(why LIKE 'touched, within%')     AS touched_trips_nominated_by_the_join_rule,
+           COUNT_IF(why LIKE 'not touched%')         AS untouched_neighbours_it_pulled_in
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE
+    GROUP BY 1
+),
+retired AS (
+    SELECT q.batch_no,
+           COUNT_IF(f.FATE = 're-cut by the new rule (expected)')                AS re_cut_by_the_new_rule,
+           COUNT_IF(f.FATE = 'retired by the join rules (nominated as a pair)')  AS merged_by_the_join_rule
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_QUEUE q
+    JOIN DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_FATE f ON f.TRIP_MASTER_ID = q.trip_master_id
+    GROUP BY 1
+)
+SELECT t.BATCH_NO AS batch, t.guests, t.trips_touched, t.over_cap_no_stay_trips,
+       COALESCE(q.nominated_by_the_new_rule, 0) AS nominated_by_the_new_rule, COALESCE(r.re_cut_by_the_new_rule, 0) AS re_cut_by_the_new_rule,
+       COALESCE(q.touched_trips_nominated_by_the_join_rule, 0) AS touched_trips_nominated_by_the_join_rule,
+       COALESCE(q.untouched_neighbours_it_pulled_in, 0) AS untouched_neighbours_it_pulled_in,
+       COALESCE(r.merged_by_the_join_rule, 0) AS merged_by_the_join_rule
+FROM touched t
+LEFT JOIN queue q ON q.batch_no = t.BATCH_NO
+LEFT JOIN retired r ON r.batch_no = t.BATCH_NO
+ORDER BY 1;
+
+-- W5b. The same merges, pair by pair: each retired trip against the nominated trip next to it, classed against merge
+--      check's original pairing rule (needs C5b's DAASI_3641_WT_JOIN_PAIRS). Expect every row to fit a rule ('other' 0).
+SELECT RELATION                                                     AS how_the_pair_meets_the_rule,
+       WHAT_LETS_THE_RULE_FIRE                                      AS what_lets_it_fire,
+       COUNT(*)                                                     AS retired_trips,
+       COUNT_IF(NOT R_TOUCHED)                                      AS of_them_not_touched_by_the_replay,
+       COUNT_IF(P_START > DATE '2026-10-04' OR R_START > DATE '2026-10-04') AS pairs_where_one_trip_was_born_after_the_week,
+       COUNT_IF(GRP = 'EXPOSURE')                                   AS of_exposure_guests,
+       COUNT(DISTINCT CODE)                                         AS properties_and_markets
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_JOIN_PAIRS
+GROUP BY 1, 2
+ORDER BY 3 DESC;
