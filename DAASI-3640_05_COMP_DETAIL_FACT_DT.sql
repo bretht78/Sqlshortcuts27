@@ -1,6 +1,6 @@
--- DAASI-3640 (v1.15 of the comp fact logic): comments matched to any guest who ever held the
--- comp, or (v1.15) to the same person through DAAS_CORE.GUEST_XREF_BRIDGE_LKP for merges the
--- comp history never saw; remarks (CMPRM) matched to the comp live on the number when written,
+-- DAASI-3640 (v1.14 of the comp fact logic): comments matched to any guest who ever held the
+-- comp, or to the same person through DAAS_CORE.GUEST_XREF_BRIDGE_LKP for merges the comp
+-- history never saw; remarks (CMPRM) matched to the comp live on the number when written,
 -- joined with | in line order (previously "1) ... | 2) ..." by comp number only). The header
 -- below is UAT's; if the repo file carries a different CREATE line or warehouse, keep those two
 -- lines from the repo. Reads DAAS_CORE.GUEST_XREF_BRIDGE_LKP and DAAS_CORE.PROPERTY_DIM: the
@@ -1069,12 +1069,12 @@ create or replace dynamic table DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT(
 			/* v1.14 (DAASI-3640): a comment line belongs to a comp when its guest ever held
 			   that comp (same number, issue date and property) in the comp table history.
 			   Comp numbers are reused, so matching on number alone copied comments across
-			   guests. The history match also keeps a note after a merge, where CMS re-points
-			   the comp to the surviving guest id but leaves the comment under the old one.
-			   v1.15 (DAASI-3640): a second way in, for merges the history never saw. A line
-			   whose guest never held any comp on that number at that property attaches when
-			   the comp is one the feed first saw after its issue date, the holder is the same
-			   person (both local accounts map to the same primary account in
+			   guests. The history match also keeps a note after a merge inside the history,
+			   where CMS re-points the comp to the surviving guest id but leaves the comment
+			   under the old one. For merges the history never saw there is a second way in:
+			   a line whose guest never held any comp on that number at that property attaches
+			   when the comp is one the feed first saw after its issue date, the holder is the
+			   same person (both local accounts map to the same primary account in
 			   DAAS_CORE.GUEST_XREF_BRIDGE_LKP; local account = PROPERTY_DIM property id followed
 			   by the guest id padded to 8 digits) and the line is not older than the comp's
 			   issue date (one day's allowance). Where the holder's own line and a bridged
