@@ -46,17 +46,9 @@ Version 1.10 Changed key columns and added new fields (COMPOR_NAME,EMPLOYEE_FIRS
 Modify Date: July 2026
 Version 1.12 Changed the join to be on CASINO_REVENUE_CENTER_CD and we are opting to use RCL.REVENUE_CATEGORY only when CMPRW_RAW.CTYPRW = ''OTHR''
 
-Modify Date: 10/13/2026
+Modify Date: 11/03/2026
 Modified By: Frederick Johnson
-Version 1.13 Restored SYIDCM (guest ID) in the ECPCMPCM comment join so a comment attaches only to the comp of the guest who wrote it. Comp numbers are reused, so comments were copied across guests. (DAASI-3640)
-
-Modify Date: 10/21/2026
-Modified By: Frederick Johnson
-Version 1.14 Comments (ECPCMPCM): a comment attaches to a comp when its guest ever held that comp (same number, issue date, property) in the comp table history. This replaces the 1.13 guest match and also keeps notes after a merge, where CMS re-points the comp to the surviving guest id but leaves the comment under the old one. Remarks (CMPRM) are now loaded into the new column COMMENTS_EXTENDED, matched to the comp that was live on the number when the remark was written. COMMENTS_EXTENDED is part of MD5_CHECKSUM. (DAASI-3640)
-
-Modify Date: 10/29/2026
-Modified By: Frederick Johnson
-Version 1.15 Comments (ECPCMPCM): a second match for merges the comp history never saw. A comment line whose guest never held any comp on that number attaches to the comp when the feed first saw the comp after its issue date, the holder is the same person (same primary account in DAAS_CORE.GUEST_XREF_BRIDGE_LKP; local account = PROPERTY_DIM property id followed by the guest id padded to 8 digits) and the line is not older than the comp issue date. The holder own line wins on a shared line number. (DAASI-3640)
+Version 1.14 Comments (ECPCMPCM): a comment attaches to a comp when its guest ever held that comp (same number, issue date, property) in the comp table history; CMS reuses comp numbers, and matching on number alone had copied comments across guests. The history match keeps notes after a merge inside the history, where CMS re-points the comp to the surviving guest id but leaves the comment under the old one. For merges the history never saw (comps the feed first saw after their issue date), a line whose guest never held any comp on that number attaches when the holder is the same person (same primary account in DAAS_CORE.GUEST_XREF_BRIDGE_LKP; local account = PROPERTY_DIM property id followed by the guest id padded to 8 digits) and the line is not older than the comp issue date; the holder own line wins on a shared line number. Remarks (CMPRM) are loaded into the new column COMMENTS_EXTENDED, matched to the comp that was live on the number when the remark was written; COMMENTS_EXTENDED is part of MD5_CHECKSUM. (DAASI-3640)
 
 #####################################################################################
 */
@@ -470,12 +462,12 @@ try
 			/* v1.14 (DAASI-3640): a comment line belongs to a comp when its guest ever held
 			   that comp (same number, issue date and property) in the comp table history.
 			   Comp numbers are reused, so matching on number alone copied comments across
-			   guests. The history match also keeps a note after a merge, where CMS re-points
-			   the comp to the surviving guest id but leaves the comment under the old one.
-			   v1.15 (DAASI-3640): a second way in, for merges the history never saw. A line
-			   whose guest never held any comp on that number at that property attaches when
-			   the comp is one the feed first saw after its issue date, the holder is the same
-			   person (both local accounts map to the same primary account in
+			   guests. The history match also keeps a note after a merge inside the history,
+			   where CMS re-points the comp to the surviving guest id but leaves the comment
+			   under the old one. For merges the history never saw there is a second way in:
+			   a line whose guest never held any comp on that number at that property attaches
+			   when the comp is one the feed first saw after its issue date, the holder is the
+			   same person (both local accounts map to the same primary account in
 			   DAAS_CORE.GUEST_XREF_BRIDGE_LKP; local account = PROPERTY_DIM property id followed
 			   by the guest id padded to 8 digits) and the line is not older than the comp''s
 			   issue date (one day''s allowance). Where the holder''s own line and a bridged
