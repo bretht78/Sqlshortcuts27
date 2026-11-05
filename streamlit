@@ -1,0 +1,301 @@
+import os
+from datetime import date, datetime
+from decimal import Decimal
+from concurrent.futures import ThreadPoolExecutor
+
+import pandas as pd
+import streamlit as st
+
+# widescreen
+st.set_page_config(layout="wide")
+
+# global constants
+QUERY_TITLE = 0
+QUERY_SQL = 1
+QUERY_CACHE = 2
+QUERY_RELOAD = 3
+THREAD_WORKER = 0
+THREAD_CONTAINER = 1
+
+# filter settings (DAASI-3864)
+PICKLIST_MAX = 25                               # text columns with this many distinct values or fewer also get a pick list
+BLANK = "(blank)"                               # pick-list entry that selects rows where the column is empty
+ID_SUFFIXES = ("_ID", "_NBR", "_NUM", "_NO")    # numeric columns named like identifiers filter as text, e.g. "starts with 1234"
+TEXT_MODES = ["starts with", "contains", "equals", "does not contain", "is blank", "is not blank"]
+
+
+# functions to run sql queries and return results
+@st.cache_data
+def run_sql_cached(query_text):
+    return session.sql(query_text).collect()
+
+
+def run_sql_uncached(query_text):
+    return session.sql(query_text).collect()
+
+
+def run_sql_pandas(query_text):
+    # same query path as above, landed in pandas so the filters run locally instead of re-querying Snowflake
+    rows = session.sql(query_text).collect()
+    return tidy_types(pd.DataFrame([row.as_dict() for row in rows]))
+
+
+# ---------------------------------------------------------------------------
+# filtering (DAASI-3864): pick any column, get a widget suited to it, all active filters must hold (AND)
+# ---------------------------------------------------------------------------
+
+def tidy_types(df):
+    # DATE columns arrive as python date objects and scaled NUMBERs as Decimals; give pandas real dtypes
+    for col in df.columns:
+        s = df[col]
+        if s.dtype != object:
+            continue
+        vals = s.dropna()
+        if vals.empty:
+            continue
+        if vals.map(lambda v: isinstance(v, (date, datetime))).all():
+            df[col] = pd.to_datetime(s, errors="coerce")
+        elif vals.map(lambda v: isinstance(v, Decimal)).all():
+            df[col] = pd.to_numeric(s, errors="coerce")
+    return df
+
+
+def as_text(series):
+    # string form of a column for matching: NULL and blank -> "", whole-number floats lose the ".0"
+    def fmt(v):
+        if v is None or v is pd.NaT or v is pd.NA:
+            return ""
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, float):
+            if pd.isna(v):
+                return ""
+            if v.is_integer():
+                return str(int(v))
+        return str(v)
+    return series.map(fmt)
+
+
+def column_kind(df, col):
+    s = df[col]
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return "date"
+    if pd.api.types.is_numeric_dtype(s) and not col.upper().endswith(ID_SUFFIXES):
+        return "number"
+    return "text"
+
+
+def clear_filters(query_id):
+    st.session_state[f"flt_cols_{query_id}"] = []
+    for k in list(st.session_state.keys()):
+        if k.startswith(f"flt_{query_id}_"):
+            del st.session_state[k]
+
+
+def reset_data(query_id):
+    st.session_state.pop(f"data_{query_id}", None)
+    clear_filters(query_id)
+
+
+def column_filter(df, col, key):
+    # one widget set per chosen column; returns a boolean mask that is all True while the widget is untouched
+    s = df[col]
+    keep = pd.Series(True, index=df.index)
+    kind = column_kind(df, col)
+    st.markdown(f"**{col}**")
+
+    if kind == "date":
+        lo, hi = s.min(), s.max()
+        if pd.isna(lo):
+            st.caption("no dates to filter")
+            return keep
+        picked = st.date_input(col, value=(lo.date(), hi.date()), key=key, label_visibility="collapsed")
+        if isinstance(picked, tuple) and len(picked) == 2 and picked != (lo.date(), hi.date()):
+            start, end = picked
+            keep = (s >= pd.Timestamp(start)) & (s < pd.Timestamp(end) + pd.Timedelta(days=1))
+        return keep
+
+    if kind == "number":
+        lo, hi = float(s.min()), float(s.max())
+        if pd.isna(lo):
+            st.caption("no values to filter")
+            return keep
+        integral = (s.dropna() % 1 == 0).all()
+        step, fmt = (1.0, "%.0f") if integral else (0.01, "%.2f")
+        c1, c2 = st.columns(2)
+        new_lo = c1.number_input("from", value=lo, step=step, format=fmt, key=f"{key}_lo")
+        new_hi = c2.number_input("to", value=hi, step=step, format=fmt, key=f"{key}_hi")
+        if (new_lo, new_hi) != (lo, hi):
+            keep = (s >= new_lo) & (s <= new_hi)
+        return keep
+
+    # text (and identifier-like numbers)
+    text = as_text(s)
+    upper = text.str.upper()
+    distinct = sorted(v for v in text.unique() if v != "")
+    if 0 < len(distinct) <= PICKLIST_MAX:
+        options = distinct + ([BLANK] if (text == "").any() else [])
+        picked = st.multiselect(f"{col} is one of", options, key=f"{key}_pick",
+                                placeholder="is one of...", label_visibility="collapsed")
+        if picked:
+            hit = text.isin([p for p in picked if p != BLANK])
+            if BLANK in picked:
+                hit |= (text == "")
+            keep &= hit
+
+    c1, c2 = st.columns([2, 3])
+    mode = c1.selectbox(f"{col} match", TEXT_MODES, key=f"{key}_mode", label_visibility="collapsed")
+    if mode == "is blank":
+        return keep & (text == "")
+    if mode == "is not blank":
+        return keep & (text != "")
+    value = c2.text_input(f"{col} value", key=key, placeholder="value (comma-separate several)",
+                          label_visibility="collapsed")
+    pats = [p.strip().upper() for p in value.split(",") if p.strip()]
+    if not pats:
+        return keep
+    if mode == "starts with":
+        hit = upper.str.startswith(tuple(pats))
+    elif mode == "equals":
+        hit = upper.isin(pats)
+    elif mode == "contains":
+        hit = pd.Series(False, index=df.index)
+        for p in pats:
+            hit |= upper.str.contains(p, regex=False)
+    else:  # does not contain
+        hit = pd.Series(True, index=df.index)
+        for p in pats:
+            hit &= ~upper.str.contains(p, regex=False)
+    return keep & hit
+
+
+def render_filters(df, query_id):
+    cols_key = f"flt_cols_{query_id}"
+    keep = pd.Series(True, index=df.index)
+    with st.container(border=True):
+        head_l, head_r = st.columns([6, 1], vertical_alignment="bottom")
+        chosen = head_l.multiselect("Filter on", list(df.columns), key=cols_key,
+                                    placeholder="choose one or more columns to filter on")
+        head_r.button("Clear filters", key=f"flt_clear_{query_id}", on_click=clear_filters, args=(query_id,))
+        if chosen:
+            grid = st.columns(3)
+            for i, col in enumerate(chosen):
+                with grid[i % 3], st.container(border=True):
+                    keep &= column_filter(df, col, f"flt_{query_id}_{col}")
+    return df[keep]
+
+
+def date_display(df):
+    # DATE columns display as dates, not midnight timestamps
+    config = {}
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_datetime64_any_dtype(s) and (s.dropna().dt.normalize() == s.dropna()).all():
+            config[col] = st.column_config.DateColumn(format="YYYY-MM-DD")
+    return config
+
+
+# re-runnable queries: load once into session_state, filter in pandas. Filter widgets re-run only this
+# fragment, so typing in a filter never re-queries Snowflake; "Reload Data" does.
+@st.fragment
+def reload_data(query_id):
+    data_key = f"data_{query_id}"
+    st.subheader(query_information[query_id][QUERY_TITLE])
+    err_key = f"err_{query_id}"
+    if data_key not in st.session_state:
+        with st.spinner("Loading..."):
+            try:
+                st.session_state[data_key] = run_sql_pandas(query_information[query_id][QUERY_SQL])
+                st.session_state.pop(err_key, None)
+            except Exception as e:
+                st.session_state[data_key] = None
+                st.session_state[err_key] = str(e)
+    df = st.session_state[data_key]
+    if df is None:
+        # a failed query is not the same as an empty one: say so, or "No results." reads as "no VIP guests"
+        st.error(f"The data could not be loaded. {st.session_state.get(err_key, '')}")
+    elif df.empty:
+        st.text("No results.")
+    else:
+        shown = render_filters(df, query_id)
+        st.caption(f"Showing {len(shown):,} of {len(df):,} rows")
+        st.dataframe(shown, use_container_width=True, hide_index=True, column_config=date_display(shown))
+    st.button("Reload Data", key=f"reload_btn_{query_id}", on_click=reset_data, args=(query_id,))
+
+
+# title
+st.title("VIP Hotel Rooms - Guest Reservations")
+
+# remove download button from dataframes
+st.html("""
+<style>
+[data-testid=stElementToolbarButton]:nth-of-type(2) {
+    display: none;
+}
+</style>
+""")
+
+# create a database connection to Snowflake
+conn = st.connection("snowflake", ttl=os.getenv("SNOWFLAKE_CONNECTION_TTL"))
+session = conn.session()
+
+# placeholder dataframe
+temp_df = session.create_dataframe([("Loading...", "Loading...", "Loading...")], schema=["Column 1", "Column 2", "Column 3"])
+
+# add query information to list
+# queries.append(["dataframe description", "sql query", "cache results (Y/N)", "re-runnable (Y/N)"])
+# NOTE: queries marked as re-runnable always use the un-cached version and get the column filters
+queries = []
+
+queries.append(["Guests arriving within the next 7 days", r"""SELECT * FROM DAAS_DEV.DAAS_CORE_HOTEL.DAILY_VIP_HOTEL_ROOM_RESERVATIONS_VW;""", "N", "Y"])
+
+# query dictionary for tracking queries with unique ids
+query_information = {}
+i = 0
+for query_info in queries:
+    query_id = f"id_{i}"
+    query_information[query_id] = query_info
+    i += 1
+
+# re-runnable queries render themselves; the rest get placeholders and background threads
+threads = {}
+thread_executor = ThreadPoolExecutor(max_workers=max(1, len(queries)))
+for query_id, query_info in query_information.items():
+    if query_info[QUERY_RELOAD] == "Y":
+        reload_data(query_id)
+        continue
+    empty_element = st.empty()
+    with empty_element.container():
+        st.subheader(query_info[QUERY_TITLE])
+        st.dataframe(temp_df, use_container_width=True)
+    if query_info[QUERY_CACHE] == "Y":
+        threads[query_id] = [thread_executor.submit(run_sql_cached, query_info[QUERY_SQL]), empty_element]
+    else:
+        threads[query_id] = [thread_executor.submit(run_sql_uncached, query_info[QUERY_SQL]), empty_element]
+
+# progress bar covers the threaded queries only
+curr, total = 0, len(threads)
+if total:
+    bar = st.progress(0, text=f"Loaded {curr} of {total} objects.")
+
+# list of threads to check
+query_results = list(threads)
+
+# write results as they come in
+while curr < total:
+    for query_id in query_results[:]:
+        if threads[query_id][THREAD_WORKER].done():
+            thread_result = threads[query_id][THREAD_WORKER].result()
+            with threads[query_id][THREAD_CONTAINER].container():
+                st.subheader(query_information[query_id][QUERY_TITLE])
+                try:
+                    st.dataframe(session.create_dataframe(thread_result), use_container_width=True)
+                except:
+                    st.text("No results.")
+            query_results.remove(query_id)
+            curr += 1
+            bar.progress(curr/total, text=f"Loaded {curr} of {total} objects.")
+
+thread_executor.shutdown(wait=True)
+if total:
+    bar.empty()
