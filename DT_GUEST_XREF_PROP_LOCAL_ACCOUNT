@@ -1,16 +1,13 @@
--- DAASI-3612: HLT local accounts no longer show as hosted (HOST_CD = '' for HLT rows).
 create or replace task DAAS_COMMON.DT_GUEST_XREF_PROP_LOCAL_ACCOUNT
 	warehouse=DAAS_PROD_IT_DT_COMPUTE
-	schedule='USING CRON */15 * * * * America/Los_Angeles'
+	schedule='USING CRON 0 * * * * America/Los_Angeles'
 	as BEGIN
     INSERT OVERWRITE INTO DAAS_CORE.GUEST_XREF_PROP_LOCAL_ACCOUNT (PROPERTY_CD, GUEST_UNIQUE_ID, LOCAL_WINNET, LOCAL_CASINO_NBR, HOST_CD, SOURCE_UPDATED_DTTM)
     SELECT COALESCE(CAS_DTL.PROPERTY_CD,PRIMARY.PROPERTY_CD) AS PROPERTY_CD
         ,COALESCE(CAS_DTL.GUEST_UNIQUE_ID,PRIMARY.GUEST_UNIQUE_ID) AS GUEST_UNIQUE_ID
         ,COALESCE(CAS_DTL.LOCAL_WINNET,PRIMARY.LOCAL_WINNET) AS LOCAL_WINNET
         ,COALESCE(CAS_DTL.LOCAL_CASINO_NBR,PRIMARY.LOCAL_CASINO_NBR) AS LOCAL_CASINO_NBR
-        -- DAASI-3612: HLT's CMS has been combined with TAH, so HLT host codes are no longer current.
-        -- HLT rows publish as unhosted (''), the same empty value unhosted accounts already carry.
-        -- Applied after account selection, so the REPNO tie-breaks below still pick the same account.
+        -- DAASI-3612: HLT's CMS was combined into TAH, so HLT accounts publish as unhosted ('').
         ,CASE WHEN COALESCE(CAS_DTL.PROPERTY_CD,PRIMARY.PROPERTY_CD) = 'HLT' THEN ''
               ELSE COALESCE(CAS_DTL.HOST_CD,PRIMARY.HOST_CD)
          END AS HOST_CD
@@ -82,7 +79,3 @@ create or replace task DAAS_COMMON.DT_GUEST_XREF_PROP_LOCAL_ACCOUNT
             , COALESCE(PRIMARY.SOURCE_UPDATED_DTTM,DATE'1899-12-31'::TIMESTAMP) DESC) = 1
         ;
 END;
-
--- CREATE OR REPLACE leaves the task suspended. Keep this line if the other task files end with it;
--- drop it if the deploy resumes tasks itself.
-ALTER TASK DAAS_COMMON.DT_GUEST_XREF_PROP_LOCAL_ACCOUNT RESUME;
