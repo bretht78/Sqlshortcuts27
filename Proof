@@ -1,0 +1,144 @@
+-- =====================================================================================
+-- DAASI-3612 proof. Builds a scratch copy of the local-account table from PROD's real sources,
+-- using the task's exact SELECT, with the current HOST_CD and the new HOST_CD side by side.
+-- Nothing real is written: the only object touched is a new table in DAAS_UAT.DAAS_TEMP_WORK.
+-- Reads PROD, writes UAT scratch. Takes a few minutes on a Small warehouse; the task does
+-- this same work every hour.
+-- Role: DAAS_TEAM. If the CREATE is refused, switch to DAAS_UAT_DEVELOPER for the write
+-- (or USE SECONDARY ROLES ALL).
+-- =====================================================================================
+
+CREATE OR REPLACE TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI_3612_XREF_COMPARE AS
+    SELECT COALESCE(CAS_DTL.PROPERTY_CD,PRIMARY.PROPERTY_CD) AS PROPERTY_CD
+        ,COALESCE(CAS_DTL.GUEST_UNIQUE_ID,PRIMARY.GUEST_UNIQUE_ID) AS GUEST_UNIQUE_ID
+        ,COALESCE(CAS_DTL.LOCAL_WINNET,PRIMARY.LOCAL_WINNET) AS LOCAL_WINNET
+        ,COALESCE(CAS_DTL.LOCAL_CASINO_NBR,PRIMARY.LOCAL_CASINO_NBR) AS LOCAL_CASINO_NBR
+        ,COALESCE(CAS_DTL.HOST_CD,PRIMARY.HOST_CD) AS HOST_CD_CURRENT   -- what the task writes today
+        ,CASE WHEN COALESCE(CAS_DTL.PROPERTY_CD,PRIMARY.PROPERTY_CD) = 'HLT' THEN ''
+              ELSE COALESCE(CAS_DTL.HOST_CD,PRIMARY.HOST_CD)
+         END AS HOST_CD_NEW                                               -- DAASI-3612
+        ,COALESCE(CAS_DTL.SOURCE_UPDATED_DTTM,PRIMARY.SOURCE_UPDATED_DTTM) AS SOURCE_UPDATED_DTTM
+    FROM (
+                SELECT PROPERTY_CD, BRDG.PRIMARY_ACCOUNT_NBR AS GUEST_UNIQUE_ID, BRDG.XREF_ACCOUNT_NBR AS LOCAL_WINNET, CMSID AS LOCAL_CASINO_NBR, REPNO AS HOST_CD, OPERATION_DATE AS SOURCE_UPDATED_DTTM
+                FROM (
+                    SELECT PROP.PROPERTY_CD, PROP.PROPERTY_ID*100000000+CMSID AS GUEST_UNIQUE_ID, CMPMS_SUB.*
+                    FROM (
+                        SELECT PROPERTY_CODE, CMSID,  CMBTMS, SCDEMS, CTYPMS, CESTD, REPNO, OPERATION_DATE, "ALIM$", OPERATION_TYPE
+                        FROM DAAS_PROD.DAAS_RAW_HETCMS.CMPMS_RAW
+                        QUALIFY ROW_NUMBER() OVER(PARTITION BY PROPERTY_CODE, CMSID ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC )=1
+                        ) CMPMS_SUB
+                    	JOIN DAAS_PROD.DAAS_CORE.PROPERTY_DIM PROP
+                       	 ON PROP.PROPERTY_CD = CMPMS_SUB.PROPERTY_CODE
+			WHERE OPERATION_TYPE NOT IN (0,5,8)
+                    ) CMPMS_SUB
+                JOIN DAAS_PROD.DAAS_CORE_CUSTOMER_VW.GUEST_XREF_BRIDGE_LKP_VW BRDG
+                   ON CMPMS_SUB.GUEST_UNIQUE_ID = BRDG.XREF_ACCOUNT_NBR
+
+                QUALIFY ROW_NUMBER() OVER(PARTITION BY CMPMS_SUB.PROPERTY_CD, BRDG.PRIMARY_ACCOUNT_NBR
+                    ORDER BY CMBTMS ASC -- cms xref field, 0 if none.
+                        ,CASE WHEN CMPMS_SUB.GUEST_UNIQUE_ID = BRDG.PRIMARY_ACCOUNT_NBR THEN 1 ELSE 0 END DESC -- check if the account is the same as their primary account, if so, give them priority
+                        ,CASE WHEN COALESCE(REPNO,'') <> ''  THEN 1 ELSE 0 END DESC -- if one of the accounts is hosted but the other isn't, prioritize the one with a host
+                        ,CASE SCDEMS -- account status -- XX = combined, D is deleted, C is closed, H is STOP, I is SUSPEND -- choose those last.
+                            WHEN 'X' THEN 1
+                            WHEN 'D' THEN 2
+                            WHEN 'C' THEN 3
+                            WHEN 'H' THEN 4
+                            WHEN 'I' THEN 5
+                         ELSE 6 END DESC
+                        ,REPNO DESC
+                        ,CASE CESTD WHEN 0 THEN 99999 ELSE CESTD END ASC -- established date. prioritize the one with less - unless it's 0.
+                        ,"ALIM$" DESC -- give priority to the account with the highest available credit limit
+                        ,OPERATION_DATE DESC -- finally give priority to latest record.
+                    ) = 1
+            ) CAS_DTL
+            FULL JOIN (
+                SELECT PROPERTY_CD, GUEST_UNIQUE_ID, LOCAL_WINNET, LOCAL_CASINO_NBR, SOURCE_UPDATED_DTTM, CMPMS.REPNO AS HOST_CD
+                FROM (select PROP.PROPERTY_CD
+                      , BRDG.PRIMARY_ACCOUNT_NBR AS GUEST_UNIQUE_ID
+                      , BRDG.PRIMARY_ACCOUNT_NBR AS LOCAL_WINNET
+                      , GST.GUEST_ID  AS LOCAL_CASINO_NBR
+                      , GST.CREATED_DT AS SOURCE_UPDATED_DTTM
+                 from DAAS_PROD.DAAS_CORE_CUSTOMER_VW.GUEST_XREF_BRIDGE_LKP_VW BRDG
+                          JOIN DAAS_PROD.DAAS_CORE_CUSTOMER_VW.PROPERTY_DIM_VW PROP
+                               ON SUBSTR(BRDG.PRIMARY_ACCOUNT_NBR, 1, 3) = PROP.PROPERTY_ID
+                          JOIN DAAS_PROD.DAAS_CORE_CUSTOMER_VW.GUEST_DIM_VW GST
+                            ON BRDG.PRIMARY_ACCOUNT_NBR = GST.GUEST_UNIQUE_ID
+                 ) CAS_DTL
+		LEFT JOIN (
+			SELECT PROPERTY_CODE, CMSID,  CMBTMS, SCDEMS, CTYPMS, CESTD, REPNO, OPERATION_TYPE FROM
+			(
+				SELECT PROPERTY_CODE, CMSID,  CMBTMS, SCDEMS, CTYPMS, CESTD, REPNO, OPERATION_TYPE
+				FROM DAAS_PROD.DAAS_RAW_HETCMS.CMPMS_RAW
+				QUALIFY ROW_NUMBER() OVER(PARTITION BY PROPERTY_CODE, CMSID ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC )=1
+                        ) CMPMS_SUB
+			WHERE OPERATION_TYPE NOT IN (0,5,8)
+		) CMPMS
+		 ON CAS_DTL.PROPERTY_CD = CMPMS.PROPERTY_CODE
+		 AND CAS_DTL.LOCAL_CASINO_NBR = CMPMS.CMSID
+            ) PRIMARY
+            ON CAS_DTL.GUEST_UNIQUE_ID = PRIMARY.GUEST_UNIQUE_ID
+            AND CAS_DTL.PROPERTY_CD = PRIMARY.PROPERTY_CD
+
+    -- dedupe primary account nbr + property cd, prioritize CMPMS
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY COALESCE(CAS_DTL.GUEST_UNIQUE_ID,PRIMARY.GUEST_UNIQUE_ID), COALESCE(CAS_DTL.PROPERTY_CD,PRIMARY.PROPERTY_CD)
+        ORDER BY COALESCE(CAS_DTL.SOURCE_UPDATED_DTTM,DATE'1899-12-31'::TIMESTAMP) DESC
+            , COALESCE(PRIMARY.SOURCE_UPDATED_DTTM,DATE'1899-12-31'::TIMESTAMP) DESC) = 1
+;
+
+
+-- ----- Proof 1: which properties change at all? Expect exactly one row: HLT. -----
+-- Any other property here means the change leaked; stop and look.
+SELECT PROPERTY_CD,
+       COUNT(*)                                                               AS ROWS_FOR_PROPERTY,
+       COUNT_IF(COALESCE(HOST_CD_CURRENT, '') <> COALESCE(HOST_CD_NEW, ''))   AS ROWS_THAT_CHANGE
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3612_XREF_COMPARE
+GROUP BY PROPERTY_CD
+HAVING ROWS_THAT_CHANGE > 0
+ORDER BY PROPERTY_CD;
+
+
+-- ----- Proof 2: HLT before and after. Expect HOST_CODES_AFTER = 0, HLT_ROWS unchanged. -----
+SELECT COUNT(*)                                               AS HLT_ROWS,
+       COUNT_IF(COALESCE(TRIM(HOST_CD_CURRENT), '') <> '')    AS HOST_CODES_BEFORE,
+       COUNT_IF(COALESCE(TRIM(HOST_CD_NEW), '') <> '')        AS HOST_CODES_AFTER
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3612_XREF_COMPARE
+WHERE PROPERTY_CD = 'HLT';
+
+
+-- ----- Proof 3: the scratch build is the live task's SQL. -----
+-- Compares the scratch table's CURRENT columns with PROD's live table, guest by guest, and sorts every
+-- difference into a reason. The live table is rebuilt every hour from sources that change all day,
+-- so the number of differences depends on how long after the build this runs; what matters is WHERE
+-- they land. Reasons 1-3 are the source data moving on after the build; reason 4 is a bridge remap, or a tie
+-- between identical accounts that any two runs of the same SQL can break either way. Reason 5 (same guest,
+-- same source timestamp, different host code) is the only one that could mean the SQL differs: expect 0.
+WITH S AS (
+    SELECT PROPERTY_CD, GUEST_UNIQUE_ID, LOCAL_WINNET, LOCAL_CASINO_NBR, HOST_CD_CURRENT AS HOST_CD, SOURCE_UPDATED_DTTM
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3612_XREF_COMPARE
+),
+P AS (
+    SELECT PROPERTY_CD, GUEST_UNIQUE_ID, LOCAL_WINNET, LOCAL_CASINO_NBR, HOST_CD, SOURCE_UPDATED_DTTM
+    FROM DAAS_PROD.DAAS_CORE.GUEST_XREF_PROP_LOCAL_ACCOUNT
+),
+DIFF_KEYS AS (
+    SELECT PROPERTY_CD, GUEST_UNIQUE_ID FROM (SELECT * FROM S EXCEPT SELECT * FROM P)
+    UNION
+    SELECT PROPERTY_CD, GUEST_UNIQUE_ID FROM (SELECT * FROM P EXCEPT SELECT * FROM S)
+)
+SELECT CASE
+         WHEN S.GUEST_UNIQUE_ID IS NULL
+              THEN '1 in PROD only: guest or account added or remapped since the build'
+         WHEN P.GUEST_UNIQUE_ID IS NULL
+              THEN '2 in scratch only: guest or account dropped or remapped since the build'
+         WHEN P.SOURCE_UPDATED_DTTM IS DISTINCT FROM S.SOURCE_UPDATED_DTTM
+              THEN '3 same guest, the chosen record changed in CMS since the build'
+         WHEN COALESCE(P.HOST_CD, '') = COALESCE(S.HOST_CD, '')
+              THEN '4 same guest, same host code, different local account (bridge remap since the build, or a tie between identical accounts)'
+         ELSE      '5 same guest, same source timestamp, DIFFERENT HOST CODE  <-- only this could mean different logic'
+       END      AS WHY,
+       COUNT(*) AS GUESTS
+FROM DIFF_KEYS K
+LEFT JOIN S ON S.PROPERTY_CD = K.PROPERTY_CD AND S.GUEST_UNIQUE_ID = K.GUEST_UNIQUE_ID
+LEFT JOIN P ON P.PROPERTY_CD = K.PROPERTY_CD AND P.GUEST_UNIQUE_ID = K.GUEST_UNIQUE_ID
+GROUP BY 1
+ORDER BY 1;
