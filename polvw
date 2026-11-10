@@ -1,0 +1,327 @@
+/* =====================================================================
+   DAASI-3640 | 27: the view, rehearsed before it deploys and checked after
+   Read-only. Nothing is created. Run as DAAS_TEAM in one worksheet.
+
+   The view is one SELECT, so it can be tried out before anyone deploys
+   it. Queries 1 to 3 run the new text from 08 as a plain query beside
+   the view that is live today. They need the fact column
+   COMMENTS_EXTENDED, so they run in UAT now, and in PROD once the table
+   file is deployed there (change the USE line: queries 1 to 3 name no
+   database).
+
+     1  every other column, every row: unchanged
+     2  the comment column: untouched without remarks, right with them
+     3  a few comps to look at
+     4  PROD: who reads the comment column today
+     5  after the view deploys: owner, columns, tags, grants
+
+   Query 3 returns comp numbers and note text with employee names in
+   it. Its result stays off the ticket.
+   ===================================================================== */
+
+USE DATABASE DAAS_UAT;
+
+
+-- ---------------------------------------------------------------------
+-- 1. EVERYTHING ELSE IS UNCHANGED            (before the view deploys)
+--    One fingerprint over the 74 columns the change does not touch, in
+--    every row: first the view as it is deployed today, then the new
+--    text (HASH_AGG, the check 26's query 4 used). Expect two rows with
+--    the same three numbers. If OTHER_74_COLUMNS differs and
+--    WITHOUT_EMPLOYEE_COLUMNS agrees, the difference is how the
+--    employee columns are masked for this role on each path, not the
+--    view. Reads the whole fact and the guest bridge twice: use the
+--    Large, allow several minutes.
+-- ---------------------------------------------------------------------
+SELECT 'View as deployed today' AS WHAT,
+       CURRENT_DATABASE()       AS DATABASE_CHECKED,
+       COUNT(*)                 AS ROWS_RETURNED,
+       HASH_AGG(* EXCLUDE (COMP_COMMENTS_DESC)) AS OTHER_74_COLUMNS,
+       HASH_AGG(* EXCLUDE (COMP_COMMENTS_DESC, AUTHORIZER_ID, COMPOR_AUTHOR_NBR, COMPOR_NAME, EMPLOYEE_FIRST_NM, EMPLOYEE_LAST_NM)) AS WITHOUT_EMPLOYEE_COLUMNS
+FROM DAAS_CORE_GAMING_VW.COMP_DETAIL_FACT_VW
+UNION ALL
+SELECT 'New view text',
+       CURRENT_DATABASE(),
+       COUNT(*),
+       HASH_AGG(* EXCLUDE (COMP_COMMENTS_DESC, COMMENTS_EXTENDED)),
+       HASH_AGG(* EXCLUDE (COMP_COMMENTS_DESC, COMMENTS_EXTENDED, AUTHORIZER_ID, COMPOR_AUTHOR_NBR, COMPOR_NAME, EMPLOYEE_FIRST_NM, EMPLOYEE_LAST_NM))
+FROM (
+-- >>> the new view's SELECT, word for word from 08
+SELECT
+    COMP_DETAIL_FACT.COMP_DETAIL_FACT_SK,
+	COMP_DETAIL_FACT.GUEST_ID ,
+	COALESCE(BRIDGE.PRIMARY_ACCOUNT_NBR, 0) AS GUEST_UNIQUE_ID,
+    COMP_DETAIL_FACT.COMP_NBR,
+	COMP_DETAIL_FACT.CASINO_OUTLET_CD,
+	COMP_DETAIL_FACT.OUTLET_CATEGORY,
+	COMP_DETAIL_FACT.COMPOR_NAME,
+	COMP_DETAIL_FACT.EMPLOYEE_FIRST_NM,
+	COMP_DETAIL_FACT.EMPLOYEE_LAST_NM,
+	COMP_DETAIL_FACT.COMP_CATEGORY,
+    COMP_DETAIL_FACT.LIMIT_TYPE_CD,
+    COMP_DETAIL_FACT.AUTHORIZER_ID ,
+--  COMP_DETAIL_FACT.REVENUE_CENTER_NBR,
+    COMP_DETAIL_FACT.COMPOR_DEPARTMENT_CD,
+--  COMP_DETAIL_FACT.COMPOR_LEVEL_CD,
+	COMP_DETAIL_FACT.PROPERTY_CD,
+   /* COMP_DETAIL_FACT.REDEEM_AMT,*/
+    COMP_DETAIL_FACT.ISSUE_COMP_LIMIT_AMT,
+    COMP_DETAIL_FACT.LIMIT_DESC,
+    COMP_DETAIL_FACT.LAST_CHANGE_ISSUE_DTTM,
+    PD.PROPERTY_ID, -- added through lookup to property dim
+	--COMP_DETAIL_FACT.PROPERTY_ID,
+    COMP_DETAIL_FACT.ISSUE_DT,
+	COMP_DETAIL_FACT.ISHDRW,
+    COMP_DETAIL_FACT.SNAPSHOT_CMS_TRIP_WIN_LOSS_AMT,
+    COMP_DETAIL_FACT.SNAPSHOT_CMS_TRIP_COMP_WORTH,
+    COMP_DETAIL_FACT.SNAPSHOT_CMS_PROPERTY_COMP_WORTH,
+    COMP_DETAIL_FACT.SNAPSHOT_CMS_BRAND_COMP_WORTH,
+    COMP_DETAIL_FACT.COMP_AVERAGE_AMT,
+    COMP_DETAIL_FACT.COMP_OVERAGE_PCT,
+    COMP_DETAIL_FACT.COMPOR_AUTHOR_NBR,
+    COMP_DETAIL_FACT.STATUS_CD,
+    COMP_DETAIL_FACT.COMP_STATUS_CD,
+    COMP_DETAIL_FACT.LAST_CHANGE_DT,
+    COMP_DETAIL_FACT.LAST_CHANGE_COMP_LIMIT_AMT,
+    COMP_DETAIL_FACT.LAST_CHANGE_COMP_OVER_AMT,
+    COMP_DETAIL_FACT.LAST_CHANGE_COMP_OVER_PCT,
+    COMP_DETAIL_FACT.SNAPSHOT_CMS_COMP_WORTH_AVAILABLE_AMT,
+    COMP_DETAIL_FACT.SNAPSHOT_CMS_CURRENT_TRIP_THEO_AMT,
+    COMP_DETAIL_FACT.DISCRETIONARY_COMP_FLG,
+    COMP_DETAIL_FACT.ISSUED_BY_CD,
+    COMP_DETAIL_FACT.COMP_TYPE_CD,
+    COMP_DETAIL_FACT.NUMBER_OF_PEOPLE_CNT,
+    COMP_DETAIL_FACT.WINE_COMP_LIMIT_AMT,
+    COMP_DETAIL_FACT.ISSUE_POINT_LIMIT_AMT,
+    COMP_DETAIL_FACT.WINE_POINT_LIMIT_AMT,
+    COMP_DETAIL_FACT.ISSUE_POINT_LIMIT,
+    COMP_DETAIL_FACT.REDEEM_DTTM,
+    COMP_DETAIL_FACT.REDEEM_AUTHORIZATION_CD,
+    COMP_DETAIL_FACT.FOLIO_ID,
+    COMP_DETAIL_FACT.EXTERNAL_TICKET_NBR,
+    COMP_DETAIL_FACT.REDEEM_POINT_AMT,
+    COMP_DETAIL_FACT.COMP_EXCEPTION_CD,
+    COMP_DETAIL_FACT.VOID_AUTHORIZATION_CD,
+    COMP_DETAIL_FACT.VOID_DTTM,
+    COMP_DETAIL_FACT.CREATE_DTTM,
+    COMP_DETAIL_FACT.LAST_DTTM,
+    COMP_DETAIL_FACT.NGC_EXTRACTION_PROCESSED_FLG,
+    COMP_DETAIL_FACT.ISS_REWARD_CREDIT_AMT,
+    COMP_DETAIL_FACT.ISS_REWARD_CREDIT_NBR,
+    COMP_DETAIL_FACT.USED_REWARD_CREDT_AMT,
+    COMP_DETAIL_FACT.USED_REWARD_CREDITS_NBR,
+    COMP_DETAIL_FACT.PLAYER_DEVELOPMENT_FLG,
+    COMP_DETAIL_FACT.SNAPSHOT_CMS_REWARD_CREDIT_BALANCE_AT_ISSUE_AMT,
+    COMP_DETAIL_FACT.ISSUE_COMP_WORTH_AMT,
+    COMP_DETAIL_FACT.USED_COMP_WORTH_AMT,
+    COMP_DETAIL_FACT.UNIQUE_REWARD_LINK_NBR,
+    /* DAASI-3640: the comment the report reads, now with the CMS remarks after it.
+         no remarks -> the comment field, exactly as before
+         no comment -> the remarks
+         both       -> the comment lines, then each remark line that is not already among them
+       Lines are separated by |. The longest possible value is 1000 + 1 + 4000 characters. */
+    CAST(CASE
+             WHEN NULLIF(COMP_DETAIL_FACT.COMMENTS_EXTENDED, '') IS NULL THEN COMP_DETAIL_FACT.COMP_COMMENTS_DESC
+             WHEN NULLIF(COMP_DETAIL_FACT.COMP_COMMENTS_DESC, '') IS NULL THEN COMP_DETAIL_FACT.COMMENTS_EXTENDED
+             ELSE ARRAY_TO_STRING(
+                      ARRAY_CAT(SPLIT(COMP_DETAIL_FACT.COMP_COMMENTS_DESC, '|'),
+                                FILTER(SPLIT(COMP_DETAIL_FACT.COMMENTS_EXTENDED, '|'),
+                                       remark_line -> NOT ARRAY_CONTAINS(remark_line, SPLIT(COMP_DETAIL_FACT.COMP_COMMENTS_DESC, '|')))),
+                      '|')
+         END AS VARCHAR(5001)) AS COMP_COMMENTS_DESC,
+	COMP_DETAIL_FACT.SOURCE_SYSTEM_NM,
+    COMP_DETAIL_FACT.TIME_ZONE,
+    COMP_DETAIL_FACT.CREATED_DTTM,
+    COMP_DETAIL_FACT.CREATED_BY,
+    COMP_DETAIL_FACT.UPDATED_DTTM,
+    COMP_DETAIL_FACT.UPDATED_BY,
+    COMP_DETAIL_FACT.DELETE_IND,
+    COMP_DETAIL_FACT.BATCH_ID,
+    COMP_DETAIL_FACT.LAST_DML_CD,
+    COMP_DETAIL_FACT.OPERATION_SEQUENCE_NBR,
+    COMP_DETAIL_FACT.ISSUE_DTTM,
+    COMP_DETAIL_FACT.COMMENTS_EXTENDED   -- DAASI-3640: the CMS remarks on their own, lines separated by |
+FROM                        
+	DAAS_CORE.COMP_DETAIL_FACT COMP_DETAIL_FACT
+LEFT JOIN 
+(
+	SELECT 
+		PROPERTY_CD,
+		MAX(PROPERTY_ID) PROPERTY_ID 
+	FROM 
+		DAAS_CORE.PROPERTY_DIM
+	GROUP BY 
+		PROPERTY_CD
+) PD 
+ON 
+	PD.PROPERTY_CD = COMP_DETAIL_FACT.PROPERTY_CD
+LEFT JOIN
+	DAAS_CORE.GUEST_XREF_BRIDGE_LKP BRIDGE
+ON
+	CASE 
+		WHEN LENGTH(COMP_DETAIL_FACT.GUEST_ID) = 11 THEN COMP_DETAIL_FACT.GUEST_ID
+		ELSE COMP_DETAIL_FACT.GUEST_ID  + PD.PROPERTY_ID * 100000000
+	END = BRIDGE.XREF_ACCOUNT_NBR
+WHERE 
+	COMP_DETAIL_FACT.DELETE_IND = 'N'
+-- <<<
+) NEW_VIEW;
+
+
+-- ---------------------------------------------------------------------
+-- 2. THE COMMENT COLUMN
+--    The view's new expression, word for word, beside the two fact
+--    columns it reads, and beside the same text built a second way:
+--    line by line, with the order spelled out (the build behind
+--    Tracy's sample in 25). Expect:
+--      NO_REMARKS_CHANGED = 0   a comp with no remarks reads exactly as it does today
+--      WITH_REMARKS_WRONG = 0   comment lines first, then the remark lines not already among them
+--      LONGEST_TEXT at most 5001
+--    TEXT_CHANGES is how many comps will read differently in the report.
+-- ---------------------------------------------------------------------
+SELECT CURRENT_DATABASE()                                                                  AS DATABASE_CHECKED,
+       COUNT(*)                                                                            AS ROWS_CHECKED,
+       COUNT_IF(v.REMARKS IS NULL)                                                         AS NO_REMARKS,
+       COUNT_IF(v.REMARKS IS NULL AND v.VIEW_SHOWS IS DISTINCT FROM v.COMMENT_FIELD)       AS NO_REMARKS_CHANGED,
+       COUNT_IF(v.REMARKS IS NOT NULL)                                                     AS WITH_REMARKS,
+       COUNT_IF(v.REMARKS IS NOT NULL AND v.VIEW_SHOWS IS DISTINCT FROM e.EXPECTED_TEXT)   AS WITH_REMARKS_WRONG,
+       COUNT_IF(v.VIEW_SHOWS IS DISTINCT FROM v.COMMENT_FIELD)                             AS TEXT_CHANGES,
+       MAX(LENGTH(v.VIEW_SHOWS))                                                           AS LONGEST_TEXT
+FROM (
+        SELECT COMP_DETAIL_FACT.COMP_DETAIL_FACT_SK                 AS SK,
+               COMP_DETAIL_FACT.COMP_COMMENTS_DESC                  AS COMMENT_FIELD,
+               NULLIF(COMP_DETAIL_FACT.COMMENTS_EXTENDED, '')       AS REMARKS,
+               CAST(CASE
+                        WHEN NULLIF(COMP_DETAIL_FACT.COMMENTS_EXTENDED, '') IS NULL THEN COMP_DETAIL_FACT.COMP_COMMENTS_DESC
+                        WHEN NULLIF(COMP_DETAIL_FACT.COMP_COMMENTS_DESC, '') IS NULL THEN COMP_DETAIL_FACT.COMMENTS_EXTENDED
+                        ELSE ARRAY_TO_STRING(
+                                 ARRAY_CAT(SPLIT(COMP_DETAIL_FACT.COMP_COMMENTS_DESC, '|'),
+                                           FILTER(SPLIT(COMP_DETAIL_FACT.COMMENTS_EXTENDED, '|'),
+                                                  remark_line -> NOT ARRAY_CONTAINS(remark_line, SPLIT(COMP_DETAIL_FACT.COMP_COMMENTS_DESC, '|')))),
+                                 '|')
+                    END AS VARCHAR(5001)) AS VIEW_SHOWS
+        FROM DAAS_CORE.COMP_DETAIL_FACT COMP_DETAIL_FACT
+        WHERE COMP_DETAIL_FACT.DELETE_IND = 'N'
+     ) v
+LEFT JOIN (
+        SELECT SK, LISTAGG(LINE, '|') WITHIN GROUP (ORDER BY PIECE, POS) AS EXPECTED_TEXT
+        FROM (SELECT f.COMP_DETAIL_FACT_SK AS SK, 1 AS PIECE, x.INDEX AS POS, x.VALUE::VARCHAR AS LINE
+              FROM DAAS_CORE.COMP_DETAIL_FACT f, LATERAL FLATTEN(INPUT => SPLIT(NULLIF(f.COMP_COMMENTS_DESC, ''), '|')) x
+              WHERE f.DELETE_IND = 'N' AND NULLIF(f.COMMENTS_EXTENDED, '') IS NOT NULL
+              UNION ALL
+              SELECT f.COMP_DETAIL_FACT_SK AS SK, 2 AS PIECE, x.INDEX AS POS, x.VALUE::VARCHAR AS LINE
+              FROM DAAS_CORE.COMP_DETAIL_FACT f, LATERAL FLATTEN(INPUT => SPLIT(NULLIF(f.COMMENTS_EXTENDED, ''), '|')) x
+              WHERE f.DELETE_IND = 'N'
+                AND (NULLIF(f.COMP_COMMENTS_DESC, '') IS NULL
+                     OR POSITION('|' || x.VALUE::VARCHAR || '|' IN '|' || f.COMP_COMMENTS_DESC || '|') = 0))
+        GROUP BY SK
+     ) e
+  ON e.SK = v.SK;
+
+
+-- ---------------------------------------------------------------------
+-- 3. A FEW TO LOOK AT
+--    Up to four comps of each kind, with the comment field, the
+--    remarks, and what the view will show.
+-- ---------------------------------------------------------------------
+SELECT WHAT_HAPPENS, PROPERTY_CD, COMP_NBR, ISSUE_DT, COMMENT_FIELD, REMARKS, VIEW_SHOWS
+FROM (
+        SELECT CASE WHEN NULLIF(COMMENT_FIELD, '') IS NULL                                   THEN '1. No comment: the remarks are shown'
+                    WHEN VIEW_SHOWS = COMMENT_FIELD || '|' || REMARKS                        THEN '2. Remarks added after the comment'
+                    WHEN VIEW_SHOWS = COMMENT_FIELD                                          THEN '4. Every remark line repeats the comment: nothing added'
+                    ELSE                                                                          '3. Some remark lines repeat the comment: each shown once'
+               END AS WHAT_HAPPENS,
+               SK, PROPERTY_CD, COMP_NBR, ISSUE_DT, COMMENT_FIELD, REMARKS, VIEW_SHOWS
+        FROM (
+                SELECT COMP_DETAIL_FACT.COMP_DETAIL_FACT_SK         AS SK,
+                       COMP_DETAIL_FACT.PROPERTY_CD,
+                       COMP_DETAIL_FACT.COMP_NBR,
+                       COMP_DETAIL_FACT.ISSUE_DT,
+                       COMP_DETAIL_FACT.COMP_COMMENTS_DESC          AS COMMENT_FIELD,
+                       COMP_DETAIL_FACT.COMMENTS_EXTENDED           AS REMARKS,
+                       CAST(CASE
+                                WHEN NULLIF(COMP_DETAIL_FACT.COMMENTS_EXTENDED, '') IS NULL THEN COMP_DETAIL_FACT.COMP_COMMENTS_DESC
+                                WHEN NULLIF(COMP_DETAIL_FACT.COMP_COMMENTS_DESC, '') IS NULL THEN COMP_DETAIL_FACT.COMMENTS_EXTENDED
+                                ELSE ARRAY_TO_STRING(
+                                         ARRAY_CAT(SPLIT(COMP_DETAIL_FACT.COMP_COMMENTS_DESC, '|'),
+                                                   FILTER(SPLIT(COMP_DETAIL_FACT.COMMENTS_EXTENDED, '|'),
+                                                          remark_line -> NOT ARRAY_CONTAINS(remark_line, SPLIT(COMP_DETAIL_FACT.COMP_COMMENTS_DESC, '|')))),
+                                         '|')
+                            END AS VARCHAR(5001)) AS VIEW_SHOWS
+                FROM DAAS_CORE.COMP_DETAIL_FACT COMP_DETAIL_FACT
+                WHERE COMP_DETAIL_FACT.DELETE_IND = 'N'
+                  AND NULLIF(COMP_DETAIL_FACT.COMMENTS_EXTENDED, '') IS NOT NULL
+             )
+     )
+QUALIFY ROW_NUMBER() OVER (PARTITION BY WHAT_HAPPENS ORDER BY HASH(SK)) <= 4
+ORDER BY WHAT_HAPPENS, PROPERTY_CD, COMP_NBR;
+
+
+-- ---------------------------------------------------------------------
+-- 4. PROD: WHO READS THE COMMENT COLUMN TODAY        (before the PROD deploy)
+--    Outside the view, this change shows two things: one more column
+--    at the end, and a longer comment (up to 5001 characters where it
+--    was at most 1000). A report just shows more text. Anything that
+--    copies the view into a table of its own, with INSERT ... SELECT *
+--    or a comment field sized for 1000, would reject it or cut it.
+--    This lists who read the comment column through the view in the
+--    last 30 days, and whether any of those queries filled a table
+--    with what they read. The names it returns are the people and
+--    service accounts to tell before the PROD deploy.
+--    (Access history runs up to three hours behind.)
+-- ---------------------------------------------------------------------
+SELECT a.USER_NAME,
+       COUNT(DISTINCT a.QUERY_ID)                                                   AS QUERIES,
+       MAX(a.QUERY_START_TIME)::DATE                                                AS LAST_READ,
+       COUNT(DISTINCT IFF(ARRAY_SIZE(a.OBJECTS_MODIFIED) > 0, a.QUERY_ID, NULL))    AS QUERIES_THAT_FILLED_A_TABLE,
+       MAX(a.OBJECTS_MODIFIED[0]:objectName::VARCHAR)                               AS A_TABLE_IT_FILLED
+FROM SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY a,
+     LATERAL FLATTEN(INPUT => a.DIRECT_OBJECTS_ACCESSED) o,
+     LATERAL FLATTEN(INPUT => o.VALUE:columns) c
+WHERE a.QUERY_START_TIME >= DATEADD(DAY, -30, CURRENT_TIMESTAMP())
+  AND o.VALUE:objectName::VARCHAR = 'DAAS_PROD.DAAS_CORE_GAMING_VW.COMP_DETAIL_FACT_VW'
+  AND c.VALUE:columnName::VARCHAR = 'COMP_COMMENTS_DESC'
+GROUP BY a.USER_NAME
+ORDER BY QUERIES DESC;
+
+
+-- ---------------------------------------------------------------------
+-- 5. AFTER THE VIEW DEPLOYS                   (UAT first, then PROD)
+--    Run 5c once BEFORE the deploy as well and keep the result: the
+--    list after has to match it. For PROD, change DAAS_UAT to DAAS_PROD
+--    in 5b and 5c as well as in the USE line.
+-- ---------------------------------------------------------------------
+-- 5a. Owner, still secure, 76 columns with the new one last, comment up to 5001 characters.
+--     Expect  owner | YES | 76 | 76 | 5001 | 4000
+--     The owner today is DEVOPS_SERVICE_UAT in UAT and DOMAIN_GAMING_ADMIN_PROD in PROD.
+--     Another name here means the role that ran the deploy now owns the view.
+SELECT v.TABLE_OWNER AS OWNER_ROLE, v.IS_SECURE, c.COLUMNS, c.NEW_COLUMN_POSITION, c.COMMENT_LENGTH, c.REMARKS_LENGTH
+FROM INFORMATION_SCHEMA.VIEWS v
+CROSS JOIN (SELECT COUNT(*)                                                                      AS COLUMNS,
+                   MAX(IFF(COLUMN_NAME = 'COMMENTS_EXTENDED',  ORDINAL_POSITION, NULL))          AS NEW_COLUMN_POSITION,
+                   MAX(IFF(COLUMN_NAME = 'COMP_COMMENTS_DESC', CHARACTER_MAXIMUM_LENGTH, NULL))  AS COMMENT_LENGTH,
+                   MAX(IFF(COLUMN_NAME = 'COMMENTS_EXTENDED',  CHARACTER_MAXIMUM_LENGTH, NULL))  AS REMARKS_LENGTH
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = 'DAAS_CORE_GAMING_VW' AND TABLE_NAME = 'COMP_DETAIL_FACT_VW') c
+WHERE v.TABLE_SCHEMA = 'DAAS_CORE_GAMING_VW' AND v.TABLE_NAME = 'COMP_DETAIL_FACT_VW';
+
+-- 5b. The two tags that mask the employee columns are still on the view.
+--     Expect two rows: AUTHORIZER_ID and COMPOR_AUTHOR_NBR, DATA_CATEGORY_TAG = COMPCODE.
+SELECT COLUMN_NAME, TAG_SCHEMA, TAG_NAME, TAG_VALUE
+FROM TABLE(DAAS_UAT.INFORMATION_SCHEMA.TAG_REFERENCES_ALL_COLUMNS('DAAS_UAT.DAAS_CORE_GAMING_VW.COMP_DETAIL_FACT_VW', 'table'))
+ORDER BY COLUMN_NAME;
+
+-- 5c. The grants on the view: the same list as before the deploy.
+--     (PROD: the eight SELECT grants and the owner from 26's query 5.)
+SHOW GRANTS ON VIEW DAAS_UAT.DAAS_CORE_GAMING_VW.COMP_DETAIL_FACT_VW;
+
+-- 5d. PROD only, after the replay and the view: the two comps Tracy sent, read from the view
+--     the report reads. Expect the $95 and the $80 comment, each followed by its two remark lines.
+SELECT PROPERTY_CD, COMP_NBR, GUEST_ID, ISSUE_DT, COMP_COMMENTS_DESC, COMMENTS_EXTENDED
+FROM DAAS_PROD.DAAS_CORE_GAMING_VW.COMP_DETAIL_FACT_VW
+WHERE SOURCE_SYSTEM_NM = 'HETCMS' AND PROPERTY_CD = 'UTU'
+  AND ((COMP_NBR = 7009616 AND GUEST_ID = 1176654) OR (COMP_NBR = 4369229 AND GUEST_ID = 2706870));
+
+-- 5e. A few hours later (ACCOUNT_USAGE runs behind): rerun 26's query 1. LOGIC_FINGERPRINT should
+--     read dcd647def630e23c7e52cc52bfcdd539 in both databases. That says the text
+--     that deployed is the text in 08.
