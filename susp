@@ -1,0 +1,348 @@
+/* =====================================================================
+   DAASI-3640 | The review sheet for Tracy: comp comments today and
+   after the fix
+   Read-only. The one table it makes is temporary: it lives in this
+   worksheet's session, nobody else sees it, and it drops itself when
+   the session ends (rerun query 1 if a later query cannot find it).
+   Run as DAAS_TEAM, top to bottom, in one worksheet, before the PROD
+   replay.
+
+   What is compared, comp by comp, for the UAT test slice (UTU, issue
+   dates March 2026, 49,455 comps):
+     TODAY  the comment the report reads now: the PROD fact. UAT's own
+            "before" was scrubbed by the 10/13 script, so PROD is the
+            true picture of what she sees today.
+     AFTER  the same comp in the UAT fact, rebuilt by the replay,
+            written the way the report column will read once the view
+            change (08) is in: the comment lines, then any remark line
+            not already among them, joined with |.
+
+     1  build the comparison once                      (temporary table)
+     2  the counts, to check before sending            (5 rows)
+     3  THE SHEET: about 35 comps, drawn at random     (export, send)
+        within each kind of change
+     4  the seven example comps from the ticket,       (PROD, read-only;
+        today and after                                 export, send)
+     5  the view expression in 08 against this build   (expect 0)
+
+   Queries 3 and 4 return guest account numbers and note text with
+   employee names in it. They go to Tracy directly, not on the ticket.
+   ===================================================================== */
+
+USE DATABASE DAAS_UAT;
+
+
+-- ---------------------------------------------------------------------
+-- 1. BUILD THE COMPARISON ONCE
+--    One row per comp: the text today, the text after, and which kind
+--    of change that is. Lines are compared one by one, so "lost" means
+--    a line the report shows today and will not show after, and
+--    "gained" the reverse. (A line is looked for between | marks, so
+--    "$95" is not found inside "$95 BASED ON PLAY".)
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE TEMPORARY TABLE DAAS_UAT.DAAS_TEMP_WORK.DAASI3640_TRACY_REVIEW AS
+WITH prod_now AS (       -- what the report reads today
+    SELECT COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD, GUEST_ID, ISSUE_DT,
+           NULLIF(COMP_COMMENTS_DESC, '') AS TODAY_TEXT
+    FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT
+    WHERE DELETE_IND = 'N' AND SOURCE_SYSTEM_NM = 'HETCMS'
+      AND PROPERTY_CD = 'UTU' AND ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
+),
+uat_fixed AS (           -- the same comps after the UAT replay
+    SELECT COMP_DETAIL_FACT_SK AS UAT_SK, COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD, GUEST_ID, DELETE_IND,
+           NULLIF(COMP_COMMENTS_DESC, '') AS NOTE_AFTER,
+           NULLIF(COMMENTS_EXTENDED, '')  AS REMARKS_AFTER
+    FROM DAAS_UAT.DAAS_CORE.COMP_DETAIL_FACT
+    WHERE SOURCE_SYSTEM_NM = 'HETCMS'
+      AND PROPERTY_CD = 'UTU' AND ISSUE_DT BETWEEN '2026-03-01' AND '2026-03-31'
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD, GUEST_ID
+                               ORDER BY DELETE_IND, UPDATED_DTTM DESC) = 1
+),
+after_text AS (          -- the report column: the comment lines, then the remark lines not already among them
+    SELECT UAT_SK, LISTAGG(LINE, '|') WITHIN GROUP (ORDER BY PIECE, POS) AS AFTER_TEXT
+    FROM (SELECT f.UAT_SK, 1 AS PIECE, x.INDEX AS POS, x.VALUE::VARCHAR AS LINE
+          FROM uat_fixed f, LATERAL FLATTEN(INPUT => SPLIT(f.NOTE_AFTER, '|')) x
+          UNION ALL
+          SELECT f.UAT_SK, 2 AS PIECE, x.INDEX AS POS, x.VALUE::VARCHAR AS LINE
+          FROM uat_fixed f, LATERAL FLATTEN(INPUT => SPLIT(f.REMARKS_AFTER, '|')) x
+          WHERE POSITION('|' || x.VALUE::VARCHAR || '|' IN '|' || COALESCE(f.NOTE_AFTER, '') || '|') = 0)
+    GROUP BY UAT_SK
+),
+compared AS (            -- today beside after, comp by comp
+    SELECT f.UAT_SK, t.PROPERTY_CD, t.COMP_NBR, t.ISHDRW, t.CASINO_OUTLET_CD, t.GUEST_ID, t.ISSUE_DT,
+           t.TODAY_TEXT, f.NOTE_AFTER, f.REMARKS_AFTER,
+           NULLIF(a.AFTER_TEXT, '') AS AFTER_TEXT,
+           f.DELETE_IND             AS DELETED_AFTER
+    FROM prod_now t
+    JOIN uat_fixed f
+      ON  f.COMP_NBR = t.COMP_NBR AND f.ISHDRW = t.ISHDRW AND f.PROPERTY_CD = t.PROPERTY_CD
+      AND f.CASINO_OUTLET_CD = t.CASINO_OUTLET_CD AND f.GUEST_ID = t.GUEST_ID
+    LEFT JOIN after_text a ON a.UAT_SK = f.UAT_SK
+),
+lost AS (                -- lines the report shows today that are not in the text after
+    SELECT c.UAT_SK, COUNT(*) AS LINES_LOST
+    FROM compared c, LATERAL FLATTEN(INPUT => SPLIT(c.TODAY_TEXT, '|')) x
+    WHERE POSITION('|' || x.VALUE::VARCHAR || '|' IN '|' || COALESCE(c.AFTER_TEXT, '') || '|') = 0
+    GROUP BY c.UAT_SK
+),
+gained AS (              -- lines in the text after that the report does not show today
+    SELECT c.UAT_SK, COUNT(*) AS LINES_GAINED
+    FROM compared c, LATERAL FLATTEN(INPUT => SPLIT(c.AFTER_TEXT, '|')) x
+    WHERE POSITION('|' || x.VALUE::VARCHAR || '|' IN '|' || COALESCE(c.TODAY_TEXT, '') || '|') = 0
+    GROUP BY c.UAT_SK
+)
+SELECT c.PROPERTY_CD, c.COMP_NBR, c.ISHDRW, c.CASINO_OUTLET_CD, c.GUEST_ID, c.ISSUE_DT,
+       c.TODAY_TEXT, c.NOTE_AFTER, c.REMARKS_AFTER, c.AFTER_TEXT, c.DELETED_AFTER,
+       COALESCE(l.LINES_LOST, 0)   AS LINES_LOST,
+       COALESCE(g.LINES_GAINED, 0) AS LINES_GAINED,
+       CASE WHEN c.DELETED_AFTER = 'Y'                     THEN '4. Comp drops out of the report (deleted in CMS)'
+            WHEN l.UAT_SK IS NULL AND g.UAT_SK IS NULL     THEN '5. No change'
+            WHEN l.UAT_SK IS NULL                          THEN '1. Missing text now shown'
+            WHEN g.UAT_SK IS NULL                          THEN '2. Another guest''s note removed'
+            ELSE '3. Both: another guest''s note removed, the comp''s own text shown' END AS CHANGE_TYPE
+FROM compared c
+LEFT JOIN lost   l ON l.UAT_SK = c.UAT_SK
+LEFT JOIN gained g ON g.UAT_SK = c.UAT_SK;
+
+
+-- ---------------------------------------------------------------------
+-- 2. THE COUNTS, TO CHECK BEFORE SENDING
+--    What happens to the month, by kind of change. Expect the five
+--    rows to add up to 49,455 (or within a few of it); 4 to read 209;
+--    2 and 3 together about 16,700 (the 16,780 comps that show another
+--    guest's note in PROD today, less the ones among the 209); 1 in
+--    the high hundreds to low thousands (1,274 active comps carry
+--    remarks; where the host typed the same text in both CMS fields
+--    the report text does not change); 5 the rest, about 31,000.
+--    If 1 reads 0, the slice is mid-rebuild (file 14): wait for it.
+-- ---------------------------------------------------------------------
+SELECT CHANGE_TYPE,
+       COUNT(*)                                          AS COMPS,
+       ROUND(100 * COUNT(*) / SUM(COUNT(*)) OVER (), 1)  AS PCT_OF_THE_MONTH
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI3640_TRACY_REVIEW
+GROUP BY CHANGE_TYPE
+ORDER BY CHANGE_TYPE;
+
+
+-- ---------------------------------------------------------------------
+-- 3. THE SHEET FOR TRACY
+--    About 35 comps: 12 that gain the missing text (4 where the report
+--    shows nothing today, 4 where it shows only an amount, 4 where it
+--    shows part of the text), 12 that lose another guest's note (6 left
+--    blank, 6 that keep lines of their own), 3 with both, 4 that drop
+--    out, and 4 that do not change, for comparison. Within each kind
+--    the comps are drawn at random (by hash, so a rerun returns the
+--    same ones); nothing is hand-picked.
+--    For a removed note the last column names the account it was
+--    written under in CMS and how long it has been on file, looked up
+--    in PROD's comment table; only comps whose removed note traces to
+--    an account that never held the comp are drawn.
+--    Export the result as it is; the column headings are written for
+--    her.
+-- ---------------------------------------------------------------------
+WITH shaped AS (
+    SELECT r.*,
+           CASE WHEN r.CHANGE_TYPE LIKE '1%' AND r.TODAY_TEXT IS NULL                             THEN 'a'   -- report shows nothing today
+                WHEN r.CHANGE_TYPE LIKE '1%' AND REGEXP_LIKE(r.TODAY_TEXT, '^\\$?[0-9][0-9.,]*$') THEN 'b'   -- only an amount today
+                WHEN r.CHANGE_TYPE LIKE '1%'                                                      THEN 'c'   -- part of the text today
+                WHEN r.CHANGE_TYPE LIKE '2%' AND r.AFTER_TEXT IS NULL                             THEN 'a'   -- the comp has no note of its own
+                WHEN r.CHANGE_TYPE LIKE '2%'                                                      THEN 'b'   -- the comp keeps lines of its own
+                ELSE 'a' END AS SHAPE
+    FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI3640_TRACY_REVIEW r
+    WHERE NOT (r.CHANGE_TYPE LIKE '1%' AND (r.REMARKS_AFTER IS NULL OR r.NOTE_AFTER IS DISTINCT FROM r.TODAY_TEXT))   -- kind 1: the gain is the remarks
+      AND NOT (r.CHANGE_TYPE LIKE '5%' AND r.TODAY_TEXT IS NULL)                                                      -- kind 5: comps that have a note
+),
+pool AS (            -- a random draw from each kind, larger than needed
+    SELECT *
+    FROM shaped
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY CHANGE_TYPE, SHAPE ORDER BY HASH(COMP_NBR, ISHDRW)) <= 40
+),
+gone AS (            -- the lines on today's report that the fix takes away, one row per line
+    SELECT p.COMP_NBR, p.ISHDRW, p.CASINO_OUTLET_CD, x.VALUE::VARCHAR AS LINE
+    FROM pool p, LATERAL FLATTEN(INPUT => SPLIT(p.TODAY_TEXT, '|')) x
+    WHERE (p.CHANGE_TYPE LIKE '2%' OR p.CHANGE_TYPE LIKE '3%')
+      AND POSITION('|' || x.VALUE::VARCHAR || '|' IN '|' || COALESCE(p.AFTER_TEXT, '') || '|') = 0
+),
+written AS (         -- in CMS: the account each of those lines was written under, and since when it is on file
+    SELECT e."CMP#CM" AS COMP_NBR, e.SYIDCM, e.CMNTCM, MIN(e.OPERATION_DATE) AS ON_FILE_SINCE
+    FROM DAAS_PROD.DAAS_RAW_HETCMS.ECPCMPCM_RAW e
+    WHERE e.PROPERTY_CODE = 'UTU' AND e."CMP#CM" IN (SELECT COMP_NBR FROM gone)
+    GROUP BY e."CMP#CM", e.SYIDCM, e.CMNTCM
+),
+holders AS (         -- every account that ever held each of those comps
+    SELECT DISTINCT h.CNUMRW, h.ISHDRW, h.SYIDRW
+    FROM DAAS_PROD.DAAS_RAW_HETCMS.CMPRW_RAW h
+    WHERE h.PROPERTY_CODE = 'UTU' AND h.CNUMRW IN (SELECT COMP_NBR FROM gone)
+),
+whose AS (           -- per comp: whose note the report was showing
+    SELECT g.COMP_NBR, g.ISHDRW, g.CASINO_OUTLET_CD,
+           LISTAGG(DISTINCT w.SYIDCM::VARCHAR, ', ') WITHIN GROUP (ORDER BY w.SYIDCM::VARCHAR) AS NOTE_ACCOUNTS,
+           COUNT(DISTINCT w.SYIDCM)                                                           AS NOTE_ACCOUNT_COUNT,
+           MIN(w.ON_FILE_SINCE)::DATE                                                         AS ON_FILE_SINCE
+    FROM gone g
+    JOIN written w ON w.COMP_NBR = g.COMP_NBR AND w.CMNTCM = g.LINE
+    LEFT JOIN holders h ON h.CNUMRW = g.COMP_NBR AND h.ISHDRW = g.ISHDRW AND h.SYIDRW = w.SYIDCM
+    WHERE h.SYIDRW IS NULL
+    GROUP BY g.COMP_NBR, g.ISHDRW, g.CASINO_OUTLET_CD
+),
+cms_deleted AS (     -- when CMS deleted the comps that drop out (the deletion row in UAT's comp table)
+    SELECT c.CNUMRW, c.ISHDRW, c.COTLRW, c.OPERATION_DATE::DATE AS DELETED_ON
+    FROM DAAS_UAT.DAAS_RAW_HETCMS.CMPRW_RAW c
+    WHERE c.PROPERTY_CODE = 'UTU' AND c.OPERATION_TYPE IN (0, 5, 8)
+      AND c.CNUMRW IN (SELECT COMP_NBR FROM pool WHERE CHANGE_TYPE LIKE '4%')
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY c.CNUMRW, c.ISHDRW, c.COTLRW
+            ORDER BY c.OPERATION_DATE DESC, c.OPERATION_SEQUENCE_NBR DESC, c.CREATED_DATE DESC) = 1
+),
+picked AS (
+    SELECT p.*, w.NOTE_ACCOUNTS, w.NOTE_ACCOUNT_COUNT, w.ON_FILE_SINCE, d.DELETED_ON,
+           ROW_NUMBER() OVER (PARTITION BY p.CHANGE_TYPE, p.SHAPE ORDER BY HASH(p.COMP_NBR, p.ISHDRW)) AS PICK
+    FROM pool p
+    LEFT JOIN whose w
+           ON w.COMP_NBR = p.COMP_NBR AND w.ISHDRW = p.ISHDRW AND w.CASINO_OUTLET_CD = p.CASINO_OUTLET_CD
+    LEFT JOIN cms_deleted d
+           ON d.CNUMRW = p.COMP_NBR AND d.ISHDRW = p.ISHDRW AND d.COTLRW = p.CASINO_OUTLET_CD
+    WHERE NOT ((p.CHANGE_TYPE LIKE '2%' OR p.CHANGE_TYPE LIKE '3%') AND w.NOTE_ACCOUNTS IS NULL)
+)
+SELECT CHANGE_TYPE                                        AS "What changes",
+       PROPERTY_CD                                        AS "Property",
+       COMP_NBR                                           AS "Comp number",
+       ISSUE_DT                                           AS "Issue date",
+       GUEST_ID                                           AS "CMS account",
+       COALESCE(TODAY_TEXT, '(blank)')                    AS "Comment in the report today",
+       IFF(CHANGE_TYPE LIKE '4%', '(comp no longer in the report)',
+           COALESCE(AFTER_TEXT, '(blank)'))               AS "Comment in the report after the fix",
+       CASE WHEN CHANGE_TYPE LIKE '1%'
+                 THEN 'The host typed this on the CMS remarks screen. The report was not loading that screen.'
+            WHEN CHANGE_TYPE LIKE '2%' OR CHANGE_TYPE LIKE '3%'
+                 THEN 'The note showing today was written under CMS account'
+                      || IFF(NOTE_ACCOUNT_COUNT > 1, 's ', ' ') || NOTE_ACCOUNTS
+                      || ', which never held this comp. It has been on file since '
+                      || TO_VARCHAR(ON_FILE_SINCE, 'MM/DD/YYYY') || '.'
+                      || IFF(CHANGE_TYPE LIKE '3%', ' The comp''s own text takes its place.', '')
+            WHEN CHANGE_TYPE LIKE '4%'
+                 THEN 'CMS deleted this comp'
+                      || COALESCE(' on ' || TO_VARCHAR(DELETED_ON, 'MM/DD/YYYY') || ', '
+                                  || DATEDIFF(DAY, ISSUE_DT, DELETED_ON)::VARCHAR
+                                  || IFF(DATEDIFF(DAY, ISSUE_DT, DELETED_ON) = 1, ' day', ' days')
+                                  || ' after it was issued', '')
+                      || '. The report still shows it today.'
+            ELSE 'This comp''s own note. Nothing changes.' END AS "Why"
+FROM picked
+WHERE PICK <= CASE WHEN CHANGE_TYPE LIKE '1%' THEN 4
+                   WHEN CHANGE_TYPE LIKE '2%' THEN 6
+                   WHEN CHANGE_TYPE LIKE '3%' THEN 3
+                   ELSE 4 END
+ORDER BY CHANGE_TYPE, SHAPE, ISSUE_DT, COMP_NBR;
+
+
+-- ---------------------------------------------------------------------
+-- 4. THE SEVEN EXAMPLE COMPS FROM THE TICKET, TODAY AND AFTER
+--    PROD, read-only. These comps are newer than UAT's frozen copy of
+--    the raw tables, so the replay could not include them. This applies
+--    the fix's two rules to PROD's raw tables for those seven numbers
+--    only and writes the result the way the report column will read:
+--    the same SQL as the dynamic table (05) and the answer key (07 B2),
+--    without the bridge step, which only concerns comps the feed first
+--    saw after their issue date. 07 F5 looks at the same seven after
+--    the PROD replay, so the two can be laid side by side then.
+--    The comp taken on each number is the latest active one; the issue
+--    date and account are in the result so you can confirm each is the
+--    comp she sent (7009616: account 1176654, issued 2026-08-17;
+--    4369229: account 2706870).
+--    Expect, as in 07 F5:
+--      UTU 7009616   $95  ->  $95|$95 BASED ON PLAY|PER HUAIBI LI
+--      UTU 4369229   $80  ->  $80|$80 BASED ON LOSS 3/1|PER HUAIBI LI
+--      the five from 10/4 (GBI, CLV, UBA, LUS, NOR)  ->  (blank)
+--    If a row reads differently, hold the sheet and send me the result.
+-- ---------------------------------------------------------------------
+WITH picks AS (
+    SELECT column1 AS PROPERTY_CD, column2 AS COMP_NBR
+    FROM VALUES ('UTU', 7009616), ('UTU', 4369229), ('GBI', 2884740), ('CLV', 5901079),
+                ('UBA', 3254281), ('LUS', 1905058), ('NOR', 7762024)
+),
+comps AS (           -- the comp she saw: the latest active one on each number
+    SELECT f.PROPERTY_CD, f.COMP_NBR, f.ISHDRW, f.GUEST_ID, f.ISSUE_DT,
+           NULLIF(f.COMP_COMMENTS_DESC, '') AS TODAY_TEXT
+    FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT f
+    JOIN picks p ON p.PROPERTY_CD = f.PROPERTY_CD AND p.COMP_NBR = f.COMP_NBR
+    WHERE f.DELETE_IND = 'N' AND f.SOURCE_SYSTEM_NM = 'HETCMS'
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY f.PROPERTY_CD, f.COMP_NBR ORDER BY f.ISSUE_DT DESC) = 1
+),
+holders AS (         -- every account that ever held each comp on those numbers
+    SELECT DISTINCT r.PROPERTY_CODE, r.CNUMRW, r.ISHDRW, r.SYIDRW
+    FROM DAAS_PROD.DAAS_RAW_HETCMS.CMPRW_RAW r
+    JOIN picks p ON p.PROPERTY_CD = r.PROPERTY_CODE AND p.COMP_NBR = r.CNUMRW
+),
+note_lines AS (      -- comment rule: a line belongs to a comp when its account held that comp
+    SELECT h.PROPERTY_CODE, h.CNUMRW, h.ISHDRW, l.CSEQCM AS POS, l.CMNTCM AS LINE
+    FROM holders h
+    JOIN (SELECT e.SYIDCM, e."CMP#CM", e.CSEQCM, e.CMNTCM, e.PROPERTY_CODE,
+                 e.OPERATION_DATE, e.OPERATION_SEQUENCE_NBR, e.CREATED_DATE
+          FROM DAAS_PROD.DAAS_RAW_HETCMS.ECPCMPCM_RAW e
+          JOIN picks p ON p.PROPERTY_CD = e.PROPERTY_CODE AND p.COMP_NBR = e."CMP#CM"
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY e.SYIDCM, e."CMP#CM", e.CSEQCM, e.PROPERTY_CODE
+                  ORDER BY e.OPERATION_DATE DESC, e.OPERATION_SEQUENCE_NBR DESC, e.CREATED_DATE DESC) = 1) l
+      ON l.SYIDCM = h.SYIDRW AND l."CMP#CM" = h.CNUMRW AND l.PROPERTY_CODE = h.PROPERTY_CODE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY h.PROPERTY_CODE, h.CNUMRW, h.ISHDRW, l.CSEQCM
+            ORDER BY l.OPERATION_DATE DESC, l.OPERATION_SEQUENCE_NBR DESC, l.CREATED_DATE DESC) = 1
+),
+lives AS (           -- each comp's life on its number: when the feed first saw it, and its neighbours
+    SELECT PROPERTY_CODE, CNUMRW, ISHDRW, FIRST_SEEN,
+           LAG(FIRST_SEEN)  OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS PREV_FIRST_SEEN,
+           LEAD(FIRST_SEEN) OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS NEXT_FIRST_SEEN
+    FROM (SELECT r.PROPERTY_CODE, r.CNUMRW, r.ISHDRW, MIN(r.OPERATION_DATE) AS FIRST_SEEN
+          FROM DAAS_PROD.DAAS_RAW_HETCMS.CMPRW_RAW r
+          JOIN picks p ON p.PROPERTY_CD = r.PROPERTY_CODE AND p.COMP_NBR = r.CNUMRW
+          GROUP BY r.PROPERTY_CODE, r.CNUMRW, r.ISHDRW)
+),
+remark_lines AS (    -- remark rule: a line belongs to the comp that was live on the number when it was written
+    SELECT c.PROPERTY_CODE, c.CNUMRW, c.ISHDRW, m.SEQNRM AS POS, m.EXPLRM AS LINE
+    FROM lives c
+    JOIN DAAS_PROD.DAAS_RAW_HETCMS.CMPRM_RAW m
+      ON  m.CNUMRM = c.CNUMRW AND m.PROPERTY_CODE = c.PROPERTY_CODE
+      AND (c.PREV_FIRST_SEEN IS NULL OR m.OPERATION_DATE >= DATEADD(SECOND, -60, c.FIRST_SEEN))
+      AND (c.NEXT_FIRST_SEEN IS NULL OR m.OPERATION_DATE <  DATEADD(SECOND, -60, c.NEXT_FIRST_SEEN))
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY c.PROPERTY_CODE, c.CNUMRW, c.ISHDRW, m.SEQNRM
+            ORDER BY m.OPERATION_DATE DESC, m.OPERATION_SEQUENCE_NBR DESC, m.CREATED_DATE DESC) = 1
+),
+after_text AS (      -- the report column: comment lines, then remark lines not already among them
+    SELECT PROPERTY_CODE, CNUMRW, ISHDRW, LISTAGG(LINE, '|') WITHIN GROUP (ORDER BY PIECE, POS) AS AFTER_TEXT
+    FROM (SELECT PROPERTY_CODE, CNUMRW, ISHDRW, 1 AS PIECE, POS, LINE FROM note_lines
+          UNION ALL
+          SELECT m.PROPERTY_CODE, m.CNUMRW, m.ISHDRW, 2 AS PIECE, m.POS, m.LINE
+          FROM remark_lines m
+          WHERE NOT EXISTS (SELECT 1 FROM note_lines n
+                            WHERE n.PROPERTY_CODE = m.PROPERTY_CODE AND n.CNUMRW = m.CNUMRW
+                              AND n.ISHDRW = m.ISHDRW AND n.LINE = m.LINE))
+    GROUP BY PROPERTY_CODE, CNUMRW, ISHDRW
+)
+SELECT c.PROPERTY_CD                                   AS "Property",
+       c.COMP_NBR                                      AS "Comp number",
+       c.ISSUE_DT                                      AS "Issue date",
+       c.GUEST_ID                                      AS "CMS account",
+       COALESCE(c.TODAY_TEXT, '(blank)')               AS "Comment in the report today",
+       COALESCE(NULLIF(a.AFTER_TEXT, ''), '(blank)')   AS "Comment in the report after the fix"
+FROM comps c
+LEFT JOIN after_text a
+       ON a.PROPERTY_CODE = c.PROPERTY_CD AND a.CNUMRW = c.COMP_NBR AND a.ISHDRW = c.ISHDRW
+ORDER BY c.PROPERTY_CD, c.COMP_NBR;
+
+
+-- ---------------------------------------------------------------------
+-- 5. THE VIEW EXPRESSION IN 08, AGAINST THIS BUILD
+--    The AFTER text above is built line by line with the order spelled
+--    out. The view has to produce the same text from one expression.
+--    This runs 08's expression over every comp in the table from query
+--    1 and counts where it differs. Expect 49,455 (query 2's total) | 0.
+--    (08 first used ARRAY_DISTINCT, whose element order Snowflake
+--    documents as unspecified; it now filters the remark lines in
+--    place, which this checks on real rows.)
+-- ---------------------------------------------------------------------
+SELECT COUNT(*) AS comps,
+       COUNT_IF(NULLIF(ARRAY_TO_STRING(
+                    ARRAY_CAT(COALESCE(SPLIT(NOTE_AFTER, '|'), ARRAY_CONSTRUCT()),
+                              FILTER(COALESCE(SPLIT(REMARKS_AFTER, '|'), ARRAY_CONSTRUCT()),
+                                     x -> NOT ARRAY_CONTAINS(x, COALESCE(SPLIT(NOTE_AFTER, '|'), ARRAY_CONSTRUCT())))),
+                    '|'), '')
+                IS DISTINCT FROM AFTER_TEXT) AS view_expression_differs
+FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI3640_TRACY_REVIEW;
