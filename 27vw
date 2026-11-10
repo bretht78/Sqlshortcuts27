@@ -1,0 +1,301 @@
+/* =====================================================================
+   DAASI-3640 | Is the DEV text of COMP_DETAIL_FACT_VW what PROD runs?
+   Read-only. Run as DAAS_TEAM. Queries 1 to 3 read Snowflake's own
+   records of the account (SNOWFLAKE.ACCOUNT_USAGE): they cover every
+   database in the account in one go and lag by up to two hours.
+
+   Already settled, from the Snowsight photos of the PROD view sent
+   earlier in this ticket (the column list, and DESCRIBE VIEW):
+     - PROD has 75 columns, and every one sits at the same position,
+       under the same name, as in the DEV text (checked 1 to 75);
+     - the types visible in the photos (columns 35 to 75) are what the
+       DEV text produces; PROPERTY_ID is a NUMBER in PROD, so PROD also
+       takes it from PROPERTY_DIM and not from the fact, where it is a
+       VARCHAR;
+     - AUTHORIZER_ID and COMPOR_AUTHOR_NBR carry DATA_CATEGORY_TAG =
+       COMPCODE in PROD, as in DEV.
+   Not settled by photos: the joins and the filter, the tags on the 31
+   columns whose tag cell was out of frame (44 of the 75 were in frame),
+   and anything changed since the photos were taken.
+
+     1  the definition PROD holds, its owner and last change    (the text itself)
+     2  columns and types, environment against environment      (expect 75 each; no rows)
+     3  tags and policies on the view                           (expect the same two tags each)
+     4  the DEV text run on PROD's tables, against the PROD view (expect two equal rows)
+     5  who reads the PROD view and who owns it                 (needed before any redeploy)
+     6  a side check the DEV text prompted, for the v1.14 procs  (expect 0)
+   ===================================================================== */
+
+
+-- ---------------------------------------------------------------------
+-- 1. THE DEFINITION PROD HOLDS
+--    GET_DDL, SHOW VIEWS and Snowsight hide a secure view's text from
+--    every role but its owner. Snowflake's account records do not: a
+--    role that can read SNOWFLAKE.ACCOUNT_USAGE.VIEWS sees secure view
+--    definitions there (documented behaviour), and DAAS_TEAM already
+--    reads ACCOUNT_USAGE (the procedure and dependency checks earlier
+--    in this ticket). If this errors on access, go to 4.
+--    One row per view of this name, any database or schema: the current
+--    one first, then the versions it replaced over the past year.
+--      OWNER_ROLE          the only role that can replace the view
+--      LAST_DDL_BY         the user that last created it: the lead on
+--                          where its code is deployed from
+--      LOGIC_FINGERPRINT   the text from SELECT onward with case, spacing,
+--                          semicolons and the database name taken out.
+--                          The DEV text sent on 11/10 fingerprints to
+--                          790a439db3b60811f6fbc4d5cc766259. PROD showing
+--                          the same value means the same joins, filter
+--                          and select list, character for character.
+--      VIEW_DEFINITION     the text. If PROD's fingerprint differs, send
+--                          me this cell for PROD and I will line it up
+--                          against DEV. If it is empty for PROD, the
+--                          role does not see it after all: go to 4.
+-- ---------------------------------------------------------------------
+SELECT TABLE_CATALOG                                                       AS DATABASE_NAME,
+       TABLE_SCHEMA                                                        AS SCHEMA_NAME,
+       IFF(DELETED IS NULL, 'current', 'replaced ' || TO_VARCHAR(DELETED, 'YYYY-MM-DD')) AS VERSION,
+       TABLE_OWNER                                                         AS OWNER_ROLE,
+       IS_SECURE,
+       CREATED,
+       LAST_DDL,
+       LAST_DDL_BY,
+       LENGTH(VIEW_DEFINITION)                                             AS DEFINITION_CHARS,
+       MD5(REGEXP_REPLACE(
+             REPLACE(REPLACE(UPPER(SUBSTR(VIEW_DEFINITION, POSITION('SELECT' IN UPPER(VIEW_DEFINITION)))),
+                             TABLE_CATALOG || '.', ''),
+                     ';', ''),
+             '\\s+', ''))                                                  AS LOGIC_FINGERPRINT,
+       VIEW_DEFINITION
+FROM SNOWFLAKE.ACCOUNT_USAGE.VIEWS
+WHERE TABLE_NAME = 'COMP_DETAIL_FACT_VW'
+ORDER BY IFF(DELETED IS NULL, 0, 1), TABLE_SCHEMA, TABLE_CATALOG, CREATED DESC;
+
+
+-- ---------------------------------------------------------------------
+-- 2. COLUMNS AND TYPES, ENVIRONMENT AGAINST ENVIRONMENT
+--    2a: how many columns the view has in each database. Expect 75 each.
+--        (No rows at all would mean the account records do not list view
+--        columns; tell me and I will point this at INFORMATION_SCHEMA.)
+--    2b: every position where the databases do not agree on the name or
+--        the type. Expect no rows.
+-- ---------------------------------------------------------------------
+SELECT c.TABLE_CATALOG AS DATABASE_NAME, COUNT(*) AS COLUMNS
+FROM SNOWFLAKE.ACCOUNT_USAGE.COLUMNS c
+JOIN SNOWFLAKE.ACCOUNT_USAGE.VIEWS v ON v.TABLE_ID = c.TABLE_ID AND v.DELETED IS NULL
+WHERE c.TABLE_SCHEMA = 'DAAS_CORE_GAMING_VW' AND c.TABLE_NAME = 'COMP_DETAIL_FACT_VW' AND c.DELETED IS NULL
+GROUP BY c.TABLE_CATALOG
+ORDER BY c.TABLE_CATALOG;
+
+SELECT POSITION_IN_VIEW,
+       LISTAGG(DATABASE_NAME || ': ' || COLUMN_AND_TYPE, '   |   ') WITHIN GROUP (ORDER BY DATABASE_NAME) AS AS_FOUND
+FROM (SELECT c.TABLE_CATALOG    AS DATABASE_NAME,
+             c.ORDINAL_POSITION AS POSITION_IN_VIEW,
+             c.COLUMN_NAME || ' ' || c.DATA_TYPE
+               || COALESCE('(' || c.CHARACTER_MAXIMUM_LENGTH::VARCHAR || ')',
+                           '(' || c.NUMERIC_PRECISION::VARCHAR || ',' || c.NUMERIC_SCALE::VARCHAR || ')',
+                           '')  AS COLUMN_AND_TYPE
+      FROM SNOWFLAKE.ACCOUNT_USAGE.COLUMNS c
+      JOIN SNOWFLAKE.ACCOUNT_USAGE.VIEWS v ON v.TABLE_ID = c.TABLE_ID AND v.DELETED IS NULL
+      WHERE c.TABLE_SCHEMA = 'DAAS_CORE_GAMING_VW' AND c.TABLE_NAME = 'COMP_DETAIL_FACT_VW' AND c.DELETED IS NULL)
+GROUP BY POSITION_IN_VIEW
+HAVING COUNT(DISTINCT COLUMN_AND_TYPE) > 1
+ORDER BY POSITION_IN_VIEW;
+
+
+-- ---------------------------------------------------------------------
+-- 3. TAGS AND POLICIES ON THE VIEW
+--    3a: every tag on the view or its columns, per database. Expect, in
+--        each database, AUTHORIZER_ID and COMPOR_AUTHOR_NBR tagged
+--        <that database>.DAAS_SECURITY.DATA_CATEGORY_TAG = COMPCODE and
+--        nothing else. A tag PROD has and DEV lacks has to go into the
+--        redeployed view, or the column loses whatever masking that tag
+--        carries.
+--    3b: masking or row access policies attached to the view itself. A
+--        policy that reaches a column through its tag shows the tag's
+--        name; one attached directly would be lost when the view is
+--        replaced, so it must be known first. Expect none attached
+--        directly.
+-- ---------------------------------------------------------------------
+SELECT COLUMN_NAME, OBJECT_DATABASE AS DATABASE_NAME, DOMAIN,
+       TAG_DATABASE || '.' || TAG_SCHEMA || '.' || TAG_NAME AS TAG, TAG_VALUE
+FROM SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES
+WHERE OBJECT_SCHEMA = 'DAAS_CORE_GAMING_VW' AND OBJECT_NAME = 'COMP_DETAIL_FACT_VW'
+  AND OBJECT_DELETED IS NULL
+ORDER BY COLUMN_NAME, OBJECT_DATABASE, TAG;
+
+SELECT REF_DATABASE_NAME AS DATABASE_NAME, REF_ENTITY_DOMAIN, REF_COLUMN_NAME, POLICY_KIND,
+       POLICY_DB || '.' || POLICY_SCHEMA || '.' || POLICY_NAME AS POLICY, TAG_NAME, POLICY_STATUS
+FROM SNOWFLAKE.ACCOUNT_USAGE.POLICY_REFERENCES
+WHERE REF_SCHEMA_NAME = 'DAAS_CORE_GAMING_VW' AND REF_ENTITY_NAME = 'COMP_DETAIL_FACT_VW'
+ORDER BY REF_DATABASE_NAME, REF_COLUMN_NAME;
+
+
+-- ---------------------------------------------------------------------
+-- 4. THE DEV TEXT ON PROD'S TABLES, AGAINST THE PROD VIEW
+--    The proof that does not depend on reading anyone's text. The CTE
+--    below is the DEV view's SELECT word for word, with its three
+--    tables pointed at DAAS_PROD. Both sides are read in one statement,
+--    so they see the same instant of the fact even while the load runs.
+--    Each side is reduced to a row count and a fingerprint of every
+--    value in every row (HASH_AGG; row order does not matter).
+--    Expect two rows with the same three numbers: the DEV logic then
+--    returns exactly what the PROD view returns, row for row, today.
+--    If ALL_COLUMNS differs and WITHOUT_EMPLOYEE_COLUMNS agrees, the
+--    difference is how the employee columns are masked for this role
+--    on each path, not the logic. If both differ, send me the two rows.
+--    Reads the whole fact and the guest bridge twice: use the Large,
+--    allow several minutes.
+-- ---------------------------------------------------------------------
+WITH dev_logic AS (
+    SELECT
+        COMP_DETAIL_FACT.COMP_DETAIL_FACT_SK,
+        COMP_DETAIL_FACT.GUEST_ID ,
+        COALESCE(BRIDGE.PRIMARY_ACCOUNT_NBR, 0) AS GUEST_UNIQUE_ID,
+        COMP_DETAIL_FACT.COMP_NBR,
+        COMP_DETAIL_FACT.CASINO_OUTLET_CD,
+        COMP_DETAIL_FACT.OUTLET_CATEGORY,
+        COMP_DETAIL_FACT.COMPOR_NAME,
+        COMP_DETAIL_FACT.EMPLOYEE_FIRST_NM,
+        COMP_DETAIL_FACT.EMPLOYEE_LAST_NM,
+        COMP_DETAIL_FACT.COMP_CATEGORY,
+        COMP_DETAIL_FACT.LIMIT_TYPE_CD,
+        COMP_DETAIL_FACT.AUTHORIZER_ID ,
+    --  COMP_DETAIL_FACT.REVENUE_CENTER_NBR,
+        COMP_DETAIL_FACT.COMPOR_DEPARTMENT_CD,
+    --  COMP_DETAIL_FACT.COMPOR_LEVEL_CD,
+        COMP_DETAIL_FACT.PROPERTY_CD,
+       /* COMP_DETAIL_FACT.REDEEM_AMT,*/
+        COMP_DETAIL_FACT.ISSUE_COMP_LIMIT_AMT,
+        COMP_DETAIL_FACT.LIMIT_DESC,
+        COMP_DETAIL_FACT.LAST_CHANGE_ISSUE_DTTM,
+        PD.PROPERTY_ID, -- added through lookup to property dim
+        --COMP_DETAIL_FACT.PROPERTY_ID,
+        COMP_DETAIL_FACT.ISSUE_DT,
+        COMP_DETAIL_FACT.ISHDRW,
+        COMP_DETAIL_FACT.SNAPSHOT_CMS_TRIP_WIN_LOSS_AMT,
+        COMP_DETAIL_FACT.SNAPSHOT_CMS_TRIP_COMP_WORTH,
+        COMP_DETAIL_FACT.SNAPSHOT_CMS_PROPERTY_COMP_WORTH,
+        COMP_DETAIL_FACT.SNAPSHOT_CMS_BRAND_COMP_WORTH,
+        COMP_DETAIL_FACT.COMP_AVERAGE_AMT,
+        COMP_DETAIL_FACT.COMP_OVERAGE_PCT,
+        COMP_DETAIL_FACT.COMPOR_AUTHOR_NBR,
+        COMP_DETAIL_FACT.STATUS_CD,
+        COMP_DETAIL_FACT.COMP_STATUS_CD,
+        COMP_DETAIL_FACT.LAST_CHANGE_DT,
+        COMP_DETAIL_FACT.LAST_CHANGE_COMP_LIMIT_AMT,
+        COMP_DETAIL_FACT.LAST_CHANGE_COMP_OVER_AMT,
+        COMP_DETAIL_FACT.LAST_CHANGE_COMP_OVER_PCT,
+        COMP_DETAIL_FACT.SNAPSHOT_CMS_COMP_WORTH_AVAILABLE_AMT,
+        COMP_DETAIL_FACT.SNAPSHOT_CMS_CURRENT_TRIP_THEO_AMT,
+        COMP_DETAIL_FACT.DISCRETIONARY_COMP_FLG,
+        COMP_DETAIL_FACT.ISSUED_BY_CD,
+        COMP_DETAIL_FACT.COMP_TYPE_CD,
+        COMP_DETAIL_FACT.NUMBER_OF_PEOPLE_CNT,
+        COMP_DETAIL_FACT.WINE_COMP_LIMIT_AMT,
+        COMP_DETAIL_FACT.ISSUE_POINT_LIMIT_AMT,
+        COMP_DETAIL_FACT.WINE_POINT_LIMIT_AMT,
+        COMP_DETAIL_FACT.ISSUE_POINT_LIMIT,
+        COMP_DETAIL_FACT.REDEEM_DTTM,
+        COMP_DETAIL_FACT.REDEEM_AUTHORIZATION_CD,
+        COMP_DETAIL_FACT.FOLIO_ID,
+        COMP_DETAIL_FACT.EXTERNAL_TICKET_NBR,
+        COMP_DETAIL_FACT.REDEEM_POINT_AMT,
+        COMP_DETAIL_FACT.COMP_EXCEPTION_CD,
+        COMP_DETAIL_FACT.VOID_AUTHORIZATION_CD,
+        COMP_DETAIL_FACT.VOID_DTTM,
+        COMP_DETAIL_FACT.CREATE_DTTM,
+        COMP_DETAIL_FACT.LAST_DTTM,
+        COMP_DETAIL_FACT.NGC_EXTRACTION_PROCESSED_FLG,
+        COMP_DETAIL_FACT.ISS_REWARD_CREDIT_AMT,
+        COMP_DETAIL_FACT.ISS_REWARD_CREDIT_NBR,
+        COMP_DETAIL_FACT.USED_REWARD_CREDT_AMT,
+        COMP_DETAIL_FACT.USED_REWARD_CREDITS_NBR,
+        COMP_DETAIL_FACT.PLAYER_DEVELOPMENT_FLG,
+        COMP_DETAIL_FACT.SNAPSHOT_CMS_REWARD_CREDIT_BALANCE_AT_ISSUE_AMT,
+        COMP_DETAIL_FACT.ISSUE_COMP_WORTH_AMT,
+        COMP_DETAIL_FACT.USED_COMP_WORTH_AMT,
+        COMP_DETAIL_FACT.UNIQUE_REWARD_LINK_NBR,
+        COMP_DETAIL_FACT.COMP_COMMENTS_DESC,
+        COMP_DETAIL_FACT.SOURCE_SYSTEM_NM,
+        COMP_DETAIL_FACT.TIME_ZONE,
+        COMP_DETAIL_FACT.CREATED_DTTM,
+        COMP_DETAIL_FACT.CREATED_BY,
+        COMP_DETAIL_FACT.UPDATED_DTTM,
+        COMP_DETAIL_FACT.UPDATED_BY,
+        COMP_DETAIL_FACT.DELETE_IND,
+        COMP_DETAIL_FACT.BATCH_ID,
+        COMP_DETAIL_FACT.LAST_DML_CD,
+        COMP_DETAIL_FACT.OPERATION_SEQUENCE_NBR,
+        COMP_DETAIL_FACT.ISSUE_DTTM
+    FROM
+        DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT COMP_DETAIL_FACT
+    LEFT JOIN
+    (
+        SELECT
+            PROPERTY_CD,
+            MAX(PROPERTY_ID) PROPERTY_ID
+        FROM
+            DAAS_PROD.DAAS_CORE.PROPERTY_DIM
+        GROUP BY
+            PROPERTY_CD
+    ) PD
+    ON
+        PD.PROPERTY_CD = COMP_DETAIL_FACT.PROPERTY_CD
+    LEFT JOIN
+        DAAS_PROD.DAAS_CORE.GUEST_XREF_BRIDGE_LKP BRIDGE
+    ON
+        CASE
+            WHEN LENGTH(COMP_DETAIL_FACT.GUEST_ID) = 11 THEN COMP_DETAIL_FACT.GUEST_ID
+            ELSE COMP_DETAIL_FACT.GUEST_ID  + PD.PROPERTY_ID * 100000000
+        END = BRIDGE.XREF_ACCOUNT_NBR
+    WHERE
+        COMP_DETAIL_FACT.DELETE_IND = 'N'
+)
+SELECT 'PROD view as deployed' AS WHAT,
+       COUNT(*)                AS ROWS_RETURNED,
+       HASH_AGG(*)             AS ALL_COLUMNS,
+       HASH_AGG(* EXCLUDE (AUTHORIZER_ID, COMPOR_AUTHOR_NBR, COMPOR_NAME, EMPLOYEE_FIRST_NM, EMPLOYEE_LAST_NM)) AS WITHOUT_EMPLOYEE_COLUMNS
+FROM DAAS_PROD.DAAS_CORE_GAMING_VW.COMP_DETAIL_FACT_VW
+UNION ALL
+SELECT 'DEV text on PROD tables',
+       COUNT(*),
+       HASH_AGG(*),
+       HASH_AGG(* EXCLUDE (AUTHORIZER_ID, COMPOR_AUTHOR_NBR, COMPOR_NAME, EMPLOYEE_FIRST_NM, EMPLOYEE_LAST_NM))
+FROM dev_logic;
+
+
+-- ---------------------------------------------------------------------
+-- 5. WHO READS THE PROD VIEW, AND WHO OWNS IT
+--    Replacing a view is a drop and a create: only the owner role can
+--    do it, and every grant on the old view goes with it unless the new
+--    statement says COPY GRANTS. Look for the OWNERSHIP row (the role
+--    the redeploy has to run as) and for any row granted to a SHARE,
+--    which would mean the view is shared outside the account: the usual
+--    reason a view is made SECURE.
+-- ---------------------------------------------------------------------
+SHOW GRANTS ON VIEW DAAS_PROD.DAAS_CORE_GAMING_VW.COMP_DETAIL_FACT_VW;
+
+
+-- ---------------------------------------------------------------------
+-- 6. A SIDE CHECK THE DEV TEXT PROMPTED (for the v1.14 procs, not the view)
+--    The view builds a guest's bridge account number from the HIGHEST
+--    PROPERTY_ID that PROPERTY_DIM holds for the property code
+--    (MAX(PROPERTY_ID)). The v1.14 bridge rule in the two procs and the
+--    dynamic table builds the same number from the LOWEST
+--    (MIN(PROPERTY_ID)). The two agree only while every property code
+--    has a single id. This counts the codes that have more than one.
+--    Expect 0. If it is not 0, send me the rows of the second query:
+--    the rule and the view would be looking the same guest up under
+--    two different account numbers at those properties.
+-- ---------------------------------------------------------------------
+SELECT COUNT(*) AS PROPERTY_CODES_WITH_MORE_THAN_ONE_ID
+FROM (SELECT PROPERTY_CD
+      FROM DAAS_PROD.DAAS_CORE.PROPERTY_DIM
+      GROUP BY PROPERTY_CD
+      HAVING MIN(PROPERTY_ID) <> MAX(PROPERTY_ID));
+
+SELECT PROPERTY_CD, MIN(PROPERTY_ID) AS LOWEST_ID, MAX(PROPERTY_ID) AS HIGHEST_ID, COUNT(DISTINCT PROPERTY_ID) AS IDS
+FROM DAAS_PROD.DAAS_CORE.PROPERTY_DIM
+GROUP BY PROPERTY_CD
+HAVING MIN(PROPERTY_ID) <> MAX(PROPERTY_ID)
+ORDER BY PROPERTY_CD;
