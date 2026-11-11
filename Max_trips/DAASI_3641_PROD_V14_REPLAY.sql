@@ -7,22 +7,36 @@
 --   1. Deploy v1.4 to PROD (GitHub Actions, from main), right after an hourly run has finished (R4a shows none running).
 --      Nothing changes on deploy alone: v1.4 only acts on a trip the chain touches, and the chain only touches a trip
 --      when something lands on it.
---   2. R0 (the version), R0b (the size, read-only), R0c (the merge task's timeout — the one number that decides whether
---      the replay goes in one UPDATE or two, see below), R1 (the before-picture the post-check needs: scratch tables in
---      DAAS_TEMP_WORK, minutes on Large; not used by R3), R2 / R2b / R2c (previews, read-only).
+--   2. R0 (the version), R0b (the size, read-only), R0c (the pipeline's warehouse and its task time limits — the two
+--      things that decide whether the replay goes in one UPDATE or two, see below), R1 (the before-picture the
+--      post-check needs: scratch tables in DAAS_TEMP_WORK, minutes on Large; not used by R3), R2 / R2b / R2c (previews,
+--      read-only).
 --   3. R3, right after an hourly run has finished: the UPDATE. The next run (TRIP_ROOT_TASK, :15 past every hour,
 --      Pacific) does the rest in one pass: ratings step → merge check (v1.4 nominates) → merge (re-windows) → summaries
 --      → comp worth. R4b watches it.
 --   4. The post-check file.
 --
--- One UPDATE or two. R3 as written replays everything at once: 377,243 trips, 12.07M rating rows, one hourly run. The step that grows with the size is the merge, which rebuilds the trips: 8,880 trips took 18 minutes
--- in UAT, so 377K trips is on the order of several hours to half a day of merge time in one run. That is fine on two
--- conditions: the merge task's USER_TASK_TIMEOUT_MS covers it (R0c; the Snowflake default is one hour, the task's owner
--- can set it up to 24 for the day), and the hourly trip pipeline pausing for the duration is acceptable (the root task
--- skips its firings while a run is going; August's replay paused the same way, with the downstream dynamic tables
--- suspended until it was done). If either is in doubt, run R3 twice: first with its targets limited to R1's batch 1 —
--- a canary of 500 guests, about 3,000 trips — whose run measures PROD's merge rate in an hour; then for everyone else
--- (the two one-line additions are in R3's comment).
+-- One UPDATE or two. R3 as written replays everything at once: 377,243 trips, 12.07M rating rows, one hourly run. The
+-- steps that grow with the size are the ratings step (every replayed rating goes through it) and the merge, which
+-- rebuilds the trips in one transaction: 8,880 trips took 18 minutes of merge in UAT, on UAT's job warehouse, so 377K
+-- trips could be hours of merge time in one run. Whether that fits is decided by two things, and both belong to the
+-- pipeline, not to the session R3 is run from (that warehouse runs the UPDATE and nothing after it). R0c reads both.
+--   The warehouse.  Each step runs on the warehouse named on its job's row in DAAS_COMMON.JOB: the task starts on the
+--                   warehouse in its own definition, then the step's procedure opens with USE WAREHOUSE on the job's
+--                   WAREHOUSE_NAME. For the trip jobs that was DAAS_PROD_IT_WHSRCTORAW_COMPUTE in October. The April
+--                   replay (DAASI-2958) moved the trip chain's jobs to DAAS_PROD_ADHOC_BULK_LOAD_COMPUTE_XL with one
+--                   UPDATE on that table before resuming the tasks, and August did the same for its replay jobs.
+--   The time limit. A step that runs past its task's USER_TASK_TIMEOUT_MS is cancelled by Snowflake: two hours on the
+--                   ratings step, merge check and merge in the task definitions, four on the summary load. A cancelled
+--                   step rolls back whole (the ratings step and the merge each do their data work in one transaction,
+--                   so nothing is left half-done), but its stream is still waiting, so the next hourly run tries the
+--                   same set again, and the steps after it do not run until it gets through.
+-- Both are the architect's to set for the day and to put back (the JOB rows for the warehouse; ALTER TASK ... SET
+-- USER_TASK_TIMEOUT_MS for the limit). The hourly trip pipeline also pauses for as long as the run takes (the root task
+-- waits for a run to finish before it starts the next; the April and August replays paused the same way, with the
+-- downstream dynamic tables suspended until done). If any of this is in doubt, run R3 twice: first with its targets
+-- limited to R1's batch 1 — a canary of 500 guests, about 3,000 trips — whose run measures PROD's ratings-step and
+-- merge rates inside an hour; then for everyone else (the two one-line additions are in R3's comment).
 --
 -- How the replay reaches the trips. An UPDATE on RATINGS_FACT lands in RATINGS_FACT_STREAM. TRIP_RATING_DOMAIN_PIPELINE_PROC
 -- takes every rating in the stream through TRIP_IDENTIFIER_PROC again (its step 9 no longer filters out ratings that are
@@ -114,18 +128,75 @@ GROUP BY ROLLUP (t.MARKET_CD)
 ORDER BY t.MARKET_CD NULLS LAST;
 
 
--- R0c. The task timeouts, by hand: a step that runs past its task's USER_TASK_TIMEOUT_MS is cancelled by Snowflake
---      ("value" is milliseconds; the Snowflake default is 3600000, one hour; a blank "level" means the default applies).
---      The merge step is the one that grows with the batch (see the header): size the batches so the canary's merge time
---      times the size ratio stays well inside this. Task names: SHOW TASKS LIKE 'TRIP%' IN SCHEMA DAAS_PROD.DAAS_COMMON
---      if these are not the exact names.
-SHOW TASKS LIKE 'TRIP%' IN SCHEMA DAAS_PROD.DAAS_COMMON;
-SELECT "name", "state", "schedule", "predecessors", "warehouse"
+-- R0c. The pipeline's warehouse and time limits, read-only (see "One UPDATE or two" in the header). Four small reads.
+--
+-- R0c-1. The warehouse each step will run on: the WAREHOUSE_NAME on the job's row. The wrapper reads it and the step's
+--        procedure opens with USE WAREHOUSE on it, so this, not the task's own warehouse and not the session R3 is run
+--        from, is where the replay's work is done. Keep this output: it is the record of today's values, which is what
+--        to put back if the jobs are moved for the day. (October: DAAS_PROD_IT_WHSRCTORAW_COMPUTE for merge check,
+--        merge, recalculation and the summaries.) LONG_RUNNING_JOB_THRESHOLD is in minutes: batch control compares it
+--        with a batch's running time for the groups in ALERTING_GROUP, so expect the ratings step and the merge to
+--        show up as long-running during the replay.
+SELECT JOB_ID, JOB_NAME, STORED_PROCEDURE_NAME, WAREHOUSE_NAME, LONG_RUNNING_JOB_THRESHOLD, ALERTING_GROUP
+FROM DAAS_PROD.DAAS_COMMON.JOB
+WHERE JOB_NAME LIKE 'TRIP%'
+ORDER BY JOB_NAME;
+
+-- R0c-2. How big those warehouses are (run the two statements together; a warehouse the role holds no privilege on is
+--        simply not listed). UAT's job warehouse is included because the week test's timings were measured on it
+--        (18 minutes of merge for 8,880 trips): the two sizes side by side say how far that number carries over.
+SHOW WAREHOUSES LIKE 'DAAS%';
+SELECT "name", "size", "state"
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" IN (SELECT WAREHOUSE_NAME FROM DAAS_PROD.DAAS_COMMON.JOB WHERE JOB_NAME LIKE 'TRIP%')
+   OR "name" IN (SELECT WAREHOUSE_NAME FROM DAAS_UAT.DAAS_COMMON.JOB WHERE JOB_NAME LIKE 'TRIP%')
+   OR "name" IN ('DAAS_PROD_IT_SNFK_COMPUTE', 'DAAS_PROD_ADHOC_BULK_LOAD_COMPUTE_XL')
+ORDER BY "name";
+
+-- R0c-3. The chain's tasks: all started, each on the warehouse it starts on (run the two statements together).
+--        Expect "state" = started on every row; the root runs at :15 past the hour, Pacific.
+SHOW TASKS LIKE '%TRIP%' IN SCHEMA DAAS_PROD.DAAS_COMMON;
+SELECT "name", "state", "warehouse", "schedule", "predecessors"
 FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
 ORDER BY "name";
-SHOW PARAMETERS LIKE 'USER_TASK_TIMEOUT_MS' IN TASK DAAS_PROD.DAAS_COMMON.TRIP_MERGE_TASK;
-SHOW PARAMETERS LIKE 'USER_TASK_TIMEOUT_MS' IN TASK DAAS_PROD.DAAS_COMMON.TRIP_RATING_TASK;
-SHOW PARAMETERS LIKE 'USER_TASK_TIMEOUT_MS' IN TASK DAAS_PROD.DAAS_COMMON.TRIP_SUMMARY_WRAPPER_TASK;
+
+-- R0c-4. The time limit on each step the replay passes through, read from the task definitions. A step that runs past
+--        its limit is cancelled by Snowflake. On file: 2 hours for the ratings step, merge check, merge, customer merge
+--        and non-gaming revenue; 4 for the summary load; none set on comp worth (blank here = not set on the task, so
+--        the level above it or Snowflake's one-hour default applies). If the role cannot read a task's definition this
+--        fails with 'does not exist or not authorized'; the numbers above then stand as of the definitions on file.
+--        One more limit sits on the warehouse: where STATEMENT_TIMEOUT_IN_SECONDS is also set, the lower of the two
+--        applies (SHOW PARAMETERS LIKE 'STATEMENT_TIMEOUT_IN_SECONDS' IN WAREHOUSE <the name from R0c-1>).
+WITH defs AS (
+    SELECT 1 AS step, 'TRIP_ROOT_TASK' AS task,
+           GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK') AS ddl
+    UNION ALL
+    SELECT 2, 'CORE2CORE_TRIP_RATING_DOMAIN_PIPELINE_TASK',
+           GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_RATING_DOMAIN_PIPELINE_TASK')
+    UNION ALL
+    SELECT 3, 'CORE2CORE_TRIP_MERGE_CHECK_TASK',
+           GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_MERGE_CHECK_TASK')
+    UNION ALL
+    SELECT 4, 'CORE2CORE_TRIP_MERGE_TASK',
+           GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_MERGE_TASK')
+    UNION ALL
+    SELECT 5, 'CORE2CORE_TRIP_CUSTOMER_MERGE_TASK',
+           GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_CUSTOMER_MERGE_TASK')
+    UNION ALL
+    SELECT 6, 'CORE2CORE_TRIP_SUMMARY_LOAD_TASK',
+           GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_SUMMARY_LOAD_TASK')
+    UNION ALL
+    SELECT 7, 'CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK',
+           GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK')
+    UNION ALL
+    SELECT 8, 'CORE2CORE_TRIP_NG_REVENUE_SUMMARY_LOAD_TASK',
+           GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_NG_REVENUE_SUMMARY_LOAD_TASK')
+)
+SELECT step, task,
+       REGEXP_SUBSTR(ddl, 'warehouse *= *([A-Za-z0-9_]+)', 1, 1, 'ie', 1)                                         AS warehouse_the_task_starts_on,
+       ROUND(TRY_TO_NUMBER(REGEXP_SUBSTR(ddl, 'USER_TASK_TIMEOUT_MS *= *([0-9]+)', 1, 1, 'ie', 1)) / 3600000, 1) AS time_limit_hours
+FROM defs
+ORDER BY step;
 
 
 -- R1. The targets and the before-pictures. Five scratch tables in DAAS_TEMP_WORK:
