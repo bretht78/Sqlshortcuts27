@@ -1,47 +1,46 @@
--- DAASI-3641: PROD repair through the pipeline, with TRIP_MERGE_CHECK_PROC v1.4. Two steps change anything:
--- the deploy, and one UPDATE (R3), which carries its own target logic and reads nothing but PROD's own tables.
+-- DAASI-3641: PROD repair through the pipeline, with TRIP_MERGE_CHECK_PROC v1.4. What changes anything: the deploy,
+-- and the UPDATEs of R3, each of which carries its own target logic and reads nothing but PROD's own tables.
 -- Everything else here is read-only, or a scratch table the post-check needs (R1: the before-picture, which must exist
--- before R3 runs because the post-check compares against it; R3 itself does not use it).
+-- before the first UPDATE because the post-check compares against it; no UPDATE uses it).
 --
 -- Order
 --   1. Deploy v1.4 to PROD (GitHub Actions, from main), right after an hourly run has finished (R4a shows none running).
 --      Nothing changes on deploy alone: v1.4 only acts on a trip the chain touches, and the chain only touches a trip
 --      when something lands on it.
---   2. R0 (the version), R0b (the size, read-only), R0c (the pipeline's warehouse and its task time limits) and R0d
---      (how many passes the merge's loop will make on this data) — together the things that decide whether the replay
---      goes in one UPDATE or two, see below — then R1 (the before-picture the post-check needs: scratch tables in
---      DAAS_TEMP_WORK, minutes on Large; not used by R3), R2 / R2b / R2c (previews, read-only).
---   3. R3, right after an hourly run has finished: the UPDATE. The next run (TRIP_ROOT_TASK, :15 past every hour,
---      Pacific) does the rest in one pass: ratings step → merge check (v1.4 nominates) → merge (re-windows) → summaries
---      → comp worth. R4b watches it.
---   4. The post-check file.
+--   2. R0 (the version), R0b (the size), R0c (the pipeline's warehouse and time limits), R0d (how many passes the
+--      merge's loop will make), R0e (the longest runs on record): all read-only. Then R1, once (the before-picture:
+--      scratch tables in DAAS_TEMP_WORK, minutes on Large), and R2 / R2b / R2c (previews, read-only).
+--   3. The replay. Each UPDATE goes right after an hourly run has finished; the next run (TRIP_ROOT_TASK, :15 past every
+--      hour, Pacific) does the rest in one pass: ratings step -> merge check (v1.4 nominates) -> merge (re-windows) ->
+--      summaries -> comp worth. R3b and R4b after each.
+--        R3-C   optional, first: the canary, one guest in a hundred
+--        R3     the main replay: everyone except the long-run guests
+--        R3-L   the long-run guests, then R3-Z an hour later: any time after R3; they do not hold it up
+--   4. The post-check file after each run; R0b at the very end (it must find nothing left to replay).
 --
--- One UPDATE or two. R3 as written replays everything at once: 377,243 trips, 12.07M rating rows, one hourly run. The
--- steps that grow with the size are the ratings step (every replayed rating goes through it) and the merge, which
--- rebuilds the trips in one transaction: 8,880 trips took 18 minutes of merge in UAT on UAT's job warehouse, which
--- R0c shows is the same size as PROD's (both Large, 11 Nov), so that timing carries over like for like. The merge does
--- not scale by trip count, though: it works in passes, and the number of passes is the longest unbroken run of play
--- days of any one guest, divided by the cap (R0d explains and counts them). Whether the run fits is decided by that
--- count and by two things that belong to the pipeline, not to the session R3 is run from (that warehouse runs the
--- UPDATE and nothing after it). R0c reads both.
---   The warehouse.  Each step runs on the warehouse named on its job's row in DAAS_COMMON.JOB: the task starts on the
---                   warehouse in its own definition, then the step's procedure opens with USE WAREHOUSE on the job's
---                   WAREHOUSE_NAME. For the trip jobs that was DAAS_PROD_IT_WHSRCTORAW_COMPUTE in October. The April
---                   replay (DAASI-2958) moved the trip chain's jobs to DAAS_PROD_ADHOC_BULK_LOAD_COMPUTE_XL with one
---                   UPDATE on that table before resuming the tasks, and August did the same for its replay jobs.
---   The time limit. A step that runs past its task's USER_TASK_TIMEOUT_MS is cancelled by Snowflake: two hours on the
---                   ratings step, merge check and merge in the task definitions, four on the summary load. A cancelled
---                   step rolls back whole (the ratings step and the merge each do their data work in one transaction,
---                   so nothing is left half-done), but its stream is still waiting, so the next hourly run tries the
---                   same set again, and the steps after it do not run until it gets through.
--- Both are the architect's to set for the day and to put back (the JOB rows for the warehouse; ALTER TASK ... SET
--- USER_TASK_TIMEOUT_MS for the limit). The hourly trip pipeline also pauses for as long as the run takes (the root task
--- waits for a run to finish before it starts the next; the April and August replays paused the same way, with the
--- downstream dynamic tables suspended until done). If any of this is in doubt, run R3 twice: first with its targets
--- limited to R1's batch 1 — a canary of 500 guests, about 3,000 trips — then for everyone else (the two one-line
--- additions are in R3's comment). The canary is the first time the whole chain carries this replay end to end (UAT
--- could not run the ratings step), and it times the ratings step and a typical guest's merge inside an hour. It is a
--- random draw, so it will not contain the few guests with the longest runs: R0d is what measures those.
+-- Why the replay is split (R0c and R0d, 11 Nov). Each step of the chain has a time limit, two hours on the ratings
+-- step, merge check and merge: a step that runs past it is cancelled by Snowflake. It rolls back whole (the ratings step
+-- and the merge each do their data work in one transaction, so nothing is left half-done), but its stream is still
+-- waiting, so the next hourly run tries the same set again, and the steps after it do not run until it gets through.
+-- The merge is the step at risk. It rebuilds the nominated trips in passes, and the number of passes is the longest
+-- unbroken run of play days of any one guest, divided by the cap (R0d). Replayed in one UPDATE, PROD's targets need 587
+-- passes, because one guest played 587 days in a row at BEM; after 30 passes only 68 of the 58,972 guests are still in
+-- the loop, after 100 four, after 200 that one. The yardstick is the week test: its merge made 98 passes in 18 minutes,
+-- about 11 seconds a pass, on a working set of 498 thousand rows and a warehouse the same size as PROD's (both Large).
+-- At that rate 587 passes is 1 hour 48 minutes of looping alone, and PROD's working set is 13.4 million rows, 27 times
+-- UAT's: one UPDATE does not fit in two hours. Split by run length it does, with room: R3 leaves out the long-run
+-- guests, so no run needs more than 30 passes; R3-L and R3-Z replay those guests in two short steps (R3 explains).
+-- The alternative, for the record: everything in one UPDATE (R3-Z on its own), with the merge task's limit raised to
+-- several hours for the day and the hourly trip pipeline paused for as long as that run takes. Both dials are the
+-- architect's: the limit (ALTER TASK ... SET USER_TASK_TIMEOUT_MS) and the warehouse the steps run on (the
+-- WAREHOUSE_NAME on each job's row in DAAS_COMMON.JOB, DAAS_PROD_IT_WHSRCTORAW_COMPUTE today; the April replay,
+-- DAASI-2958, moved the chain's 19 jobs to DAAS_PROD_ADHOC_BULK_LOAD_COMPUTE_XL for its run). A bigger warehouse
+-- shortens the early passes, when every guest is in the loop, not the long tail of small ones. Whichever way, the
+-- hourly trip pipeline pauses while a run is longer than an hour (the root task waits for a run to finish before it
+-- starts the next; the April and August replays paused the same way, with the downstream dynamic tables suspended).
+--
+-- The canary. R3-C is the first time the whole chain carries this replay end to end in PROD (UAT could not run the
+-- ratings step), on about 590 guests instead of 58,900, and it times the ratings step and the merge inside an hour.
 --
 -- How the replay reaches the trips. An UPDATE on RATINGS_FACT lands in RATINGS_FACT_STREAM. TRIP_RATING_DOMAIN_PIPELINE_PROC
 -- takes every rating in the stream through TRIP_IDENTIFIER_PROC again (its step 9 no longer filters out ratings that are
@@ -63,8 +62,9 @@
 -- and grain, where the later one holds a hotel stay or the earlier one is within its cap. 0.2% of touched trips in the
 -- week test; v1.3 does the same on any replay; the post-check lists each one with its partner.
 --
--- Roles: DAAS_TEAM for the reads and the scratch tables; R3 needs UPDATE on DAAS_PROD.DAAS_CORE.RATINGS_FACT (Pete, or
--- whoever holds it). No session variables; the scratch tables can be dropped after sign-off.
+-- Roles: DAAS_TEAM for the reads and the scratch tables; the R3 statements need UPDATE on
+-- DAAS_PROD.DAAS_CORE.RATINGS_FACT (Pete, or whoever holds it). No session variables; the scratch tables can be dropped
+-- after sign-off.
 
 USE ROLE DAAS_TEAM;
 USE SECONDARY ROLES ALL;
@@ -133,7 +133,7 @@ GROUP BY ROLLUP (t.MARKET_CD)
 ORDER BY t.MARKET_CD NULLS LAST;
 
 
--- R0c. The pipeline's warehouse and time limits, read-only (see "One UPDATE or two" in the header). Four small reads.
+-- R0c. The pipeline's warehouse and time limits, read-only (see "Why the replay is split" in the header). Four small reads.
 --
 -- R0c-1. The warehouse each step will run on: the WAREHOUSE_NAME on the job's row. The wrapper reads it and the step's
 --        procedure opens with USE WAREHOUSE on it, so this, not the task's own warehouse and not the session R3 is run
@@ -242,9 +242,10 @@ ORDER BY step;
 --      how many trips are replayed, and three things follow: (1) it can be read off PROD's data before anything runs,
 --      which is what this does; (2) a bigger warehouse shortens the early passes, when every guest is still in the
 --      loop, not the long tail of small ones; (3) a random canary will almost certainly not contain the guests who
---      set the count, so it cannot measure it. If the count is in the tens, one UPDATE is comfortable. If it is in the
---      hundreds, the guests in R0d-3 are the reason, and replaying them in an UPDATE of their own (a small working set,
---      many quick passes) apart from everyone else (a large working set, few passes) keeps both runs short.
+--      set the count, so it cannot measure it.
+--      11 Nov: 587 passes (BEM 587, WLM 93); 58,972 guests, 1,118,281 guest-days, 13,411,918 transaction rows. Still in
+--      the loop after 10 passes 558 guests, after 30 passes 68, after 100 four, after 200 one. Guard 0. The week test's
+--      guests (R0d-4): 98 passes, 498,425 rows, which its merge re-cut in 18 minutes. Hence the split in R3.
 --
 -- R0d-1. One row per guest, market and business day among what the merge will load for the target trips (every OPENED
 --        transaction of each, as the merge reads them), with the run of consecutive days it belongs to and the pass in
@@ -359,8 +360,32 @@ FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_PASSES
 WHERE GUEST_UNIQUE_ID IN (SELECT GUEST_UNIQUE_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP WHERE GRP = 'EXPOSURE');
 
 
--- R1. The targets and the before-pictures. Five scratch tables in DAAS_TEMP_WORK:
---     _P14_TRIPS       one row per target trip (live BEM/WLM market trip, over its cap, no hotel night) with its batch
+-- R0e. The longest runs on record of the steps that grow with a replay, and how their batches have ended. Read-only.
+--      The April and August replays put tens of millions of replayed ratings through the ratings step: their batches
+--      are the precedent for R3's ratings step (about 12 million rows in one run), and a batch that never reached
+--      SUCCESS or FAILURE is what a step cut off at its time limit leaves behind.
+SELECT j.JOB_NAME, b.BATCH_ID, b.BATCH_STATUS, b.BATCH_START_DATE,
+       ROUND(DATEDIFF(second, b.BATCH_START_DATE, COALESCE(b.BATCH_END_DATE, b.UPDATED_DTTM)) / 60, 1) AS minutes
+FROM DAAS_PROD.DAAS_COMMON.BATCH_S02 b
+JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
+WHERE j.JOB_NAME IN ('TRIP_RATING_DOMAIN_PIPELINE', 'TRIP_MERGE_CHECK', 'TRIP_MERGE', 'TRIP_SUMMARY_WRAPPER')
+QUALIFY ROW_NUMBER() OVER (PARTITION BY j.JOB_NAME
+                           ORDER BY DATEDIFF(second, b.BATCH_START_DATE, COALESCE(b.BATCH_END_DATE, b.UPDATED_DTTM)) DESC) <= 6
+ORDER BY j.JOB_NAME, minutes DESC;
+
+SELECT j.JOB_NAME, b.BATCH_STATUS, COUNT(*) AS batches, MIN(b.BATCH_START_DATE) AS first_one, MAX(b.BATCH_START_DATE) AS last_one
+FROM DAAS_PROD.DAAS_COMMON.BATCH_S02 b
+JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
+WHERE j.JOB_NAME IN ('TRIP_RATING_DOMAIN_PIPELINE', 'TRIP_MERGE_CHECK', 'TRIP_MERGE', 'TRIP_SUMMARY_WRAPPER')
+  AND b.BATCH_START_DATE >= DATEADD(day, -400, CURRENT_TIMESTAMP())
+GROUP BY j.JOB_NAME, b.BATCH_STATUS
+ORDER BY j.JOB_NAME, b.BATCH_STATUS;
+
+
+-- R1. The targets and the before-pictures. Scratch tables in DAAS_TEMP_WORK. Build them once, before the first UPDATE,
+--     and do not rebuild them between runs: they are what the post-check compares every run against.
+--     _P14_TRIPS       one row per target trip (live BEM/WLM market trip, over its cap, no hotel night) with its batch,
+--                      its run and the passes the merge needs for it
 --     _P14_TM_BEFORE   every live trip of the target guests at every grain — the guests' whole footprint, which is what
 --                      the runs can touch (targets, their twins and enterprise trips, and any neighbour the join rule pairs)
 --     _P14_TD_BEFORE   the live TRIP_DETAIL rows of those trips (the ratings R3 replays; the SK-level evidence for the post-check)
@@ -370,64 +395,88 @@ WHERE GUEST_UNIQUE_ID IN (SELECT GUEST_UNIQUE_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DA
 --     _P14_MARKS       the highest trip id, detail id and batch id before the run: everything the runs build sits above them
 --     Same measure as the reach check and as v1.4 itself: TRIP_END_DT - TRIP_START_DT + 1 > cap, cap from the config
 --     function for the trip's start date, the enterprise cap as the fallback, trips holding a live HOTEL detail row exempt.
---     Batches: two literals, CANARY_GUESTS (500) and GUESTS_PER_BATCH (set above the guest count, so batch 2 is everyone
---     else). Minutes on Large (TD_BEFORE is the big one).
+--     Batches, by the very logic the R3 statements carry, so the before-picture and the UPDATEs cannot disagree:
+--       3  the long-run guests: a run of theirs would take the merge's loop more than 30 passes (R3-L, then R3-Z;
+--          LEFT_FOR_R3Z marks the trips the second of the two replays)
+--       1  the canary: one guest in a hundred of the rest, by hash (R3-C)
+--       2  everyone else (R3)
+--     Minutes on Large (TD_BEFORE is the big one).
 CREATE OR REPLACE TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS AS
 WITH ent AS (
     SELECT MAX(VALUE) AS MAX_TRIP_DAYS
     FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
     WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y'
 ),
-multi AS (   -- only a multi-day trip can be over any cap
-    SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, MARKET_CD, TRIP_START_DT, TRIP_END_DT, UPDATED_DTTM,
-           TRIP_END_DT - TRIP_START_DT + 1 AS TRIP_DAYS
+multi AS (
+    SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, MARKET_CD, TRIP_START_DT, TRIP_END_DT, UPDATED_DTTM, TRIP_END_DT - TRIP_START_DT + 1 AS TRIP_DAYS
     FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
-    WHERE DELETE_IND = 'N'
-      AND TRIP_TYPE = 'MARKET'
-      AND MARKET_CD IN ('BEM', 'WLM')
-      AND TRIP_END_DT > TRIP_START_DT
+    WHERE DELETE_IND = 'N' AND TRIP_TYPE = 'MARKET' AND MARKET_CD IN ('BEM', 'WLM') AND TRIP_END_DT > TRIP_START_DT
 ),
-caps AS (    -- one config-function call per market and start date
+caps AS (
     SELECT MARKET_CD, TRIP_START_DT,
-           DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT) AS CAP
+           DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT) AS CAP,
+           DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', MARKET_CD, TRIP_START_DT) AS GAP
     FROM (SELECT DISTINCT MARKET_CD, TRIP_START_DT FROM multi)
 ),
-over_cap AS (
-    SELECT m.*, COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS)) AS MAX_TRIP_DAYS
+targets AS (    /* the trips to replay: live BEM/WLM market trips over their cap with no hotel night */
+    SELECT m.TRIP_MASTER_ID, m.GUEST_UNIQUE_ID, m.MARKET_CD, m.TRIP_START_DT, m.TRIP_END_DT, m.UPDATED_DTTM, m.TRIP_DAYS,
+           COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS)) AS CAP,
+           COALESCE(TRY_TO_NUMBER(c.GAP), 1)                              AS GAP
     FROM multi m
     JOIN caps c ON c.MARKET_CD = m.MARKET_CD AND c.TRIP_START_DT = m.TRIP_START_DT
     CROSS JOIN ent e
     WHERE m.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS))
-      AND NOT EXISTS (SELECT 1
-                      FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
-                      WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID
-                        AND d.DELETE_IND = 'N'
-                        AND d.TRANSACTION_TYPE = 'HOTEL')
+      AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                      WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID AND d.DELETE_IND = 'N' AND d.TRANSACTION_TYPE = 'HOTEL')
 ),
-ratings AS (   -- the live ratings each target holds: what R3 replays
+chained AS (    /* a run: a guest's target trips in a market, each starting within the gap of where the one before ends */
+    SELECT t.*,
+           IFF(DATEDIFF(day, MAX(t.TRIP_END_DT) OVER (PARTITION BY t.GUEST_UNIQUE_ID, t.MARKET_CD
+                                                      ORDER BY t.TRIP_START_DT, t.TRIP_END_DT, t.TRIP_MASTER_ID
+                                                      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+                        t.TRIP_START_DT) <= t.GAP, 0, 1) AS STARTS_A_RUN
+    FROM targets t
+),
+numbered AS (
+    SELECT c.*,
+           SUM(c.STARTS_A_RUN) OVER (PARTITION BY c.GUEST_UNIQUE_ID, c.MARKET_CD
+                                     ORDER BY c.TRIP_START_DT, c.TRIP_END_DT, c.TRIP_MASTER_ID
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RUN_NO
+    FROM chained c
+),
+placed AS (     /* each trip with its run: the passes the merge's loop needs for the whole run, and the trip's place in it */
+    SELECT n.*,
+           CEIL((DATEDIFF(day, MIN(n.TRIP_START_DT) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO),
+                               MAX(n.TRIP_END_DT)   OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)) + 1)
+                / MIN(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO))                AS RUN_PASSES,
+           MAX(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)                        AS RUN_CAP,
+           ROW_NUMBER() OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO
+                              ORDER BY n.TRIP_START_DT, n.TRIP_END_DT, n.TRIP_MASTER_ID)                 AS PLACE_IN_RUN
+    FROM numbered n
+),
+picked AS (     /* a guest's longest run decides the guest's group: more than 30 passes = a long-run guest */
+    SELECT p.*, MAX(p.RUN_PASSES) OVER (PARTITION BY p.GUEST_UNIQUE_ID) AS GUEST_PASSES
+    FROM placed p
+),
+ratings AS (    /* the live ratings each target holds: what the UPDATEs replay */
     SELECT d.TRIP_MASTER_ID, COUNT(DISTINCT d.TRANSACTION_TABLE_SK) AS RATING_ROWS
     FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
-    JOIN over_cap o ON o.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+    JOIN targets o ON o.TRIP_MASTER_ID = d.TRIP_MASTER_ID
     WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
     GROUP BY d.TRIP_MASTER_ID
-),
-guests AS (    -- one batch number per guest: the first CANARY_GUESTS guests (by hash) are batch 1, everyone else batch 2
-               -- (GUESTS_PER_BATCH is larger than the guest count; lower it only if the run has to be split further)
-    SELECT GUEST_UNIQUE_ID,
-           ROW_NUMBER() OVER (ORDER BY ABS(HASH(GUEST_UNIQUE_ID)), GUEST_UNIQUE_ID) AS RN
-    FROM (SELECT DISTINCT GUEST_UNIQUE_ID FROM over_cap)
-),
-batches AS (
-    SELECT GUEST_UNIQUE_ID,
-           IFF(RN <= 500, 1, 2 + FLOOR((RN - 500 - 1) / 1000000)) AS BATCH_NO   /* 500 = CANARY_GUESTS, 1000000 = GUESTS_PER_BATCH */
-    FROM guests
 )
-SELECT o.TRIP_MASTER_ID, o.GUEST_UNIQUE_ID, o.MARKET_CD, o.TRIP_START_DT, o.TRIP_END_DT, o.TRIP_DAYS, o.MAX_TRIP_DAYS,
-       o.UPDATED_DTTM AS UPDATED_DTTM_BEFORE,
+SELECT o.TRIP_MASTER_ID, o.GUEST_UNIQUE_ID, o.MARKET_CD, o.TRIP_START_DT, o.TRIP_END_DT, o.TRIP_DAYS,
+       o.CAP                      AS MAX_TRIP_DAYS,
+       o.UPDATED_DTTM             AS UPDATED_DTTM_BEFORE,
        COALESCE(r.RATING_ROWS, 0) AS RATING_ROWS,
-       b.BATCH_NO
-FROM over_cap o
-JOIN batches b ON b.GUEST_UNIQUE_ID = o.GUEST_UNIQUE_ID
+       CASE WHEN o.GUEST_PASSES > 30                           THEN 3   /* a long-run guest: R3-L, then R3-Z */
+            WHEN MOD(ABS(HASH(o.GUEST_UNIQUE_ID)), 100) = 0    THEN 1   /* the canary: R3-C */
+            ELSE 2 END            AS BATCH_NO,                          /* everyone else: R3 */
+       o.RUN_NO, o.PLACE_IN_RUN, o.RUN_PASSES, o.GUEST_PASSES,
+       (o.GUEST_PASSES > 30 AND o.RUN_PASSES > 30 AND o.RUN_CAP = 1 AND MOD(o.PLACE_IN_RUN, 2) = 0) AS LEFT_FOR_R3Z,
+       IFF(o.GUEST_PASSES > 30 AND o.RUN_PASSES > 30 AND o.RUN_CAP = 1,
+           CEIL(o.TRIP_DAYS / o.CAP), o.RUN_PASSES)                                                 AS PASSES_AS_REPLAYED
+FROM picked o
 LEFT JOIN ratings r ON r.TRIP_MASTER_ID = o.TRIP_MASTER_ID;
 
 CREATE OR REPLACE TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TM_BEFORE AS
@@ -491,9 +540,17 @@ SELECT 'max_batch_id_before', MAX(BATCH_ID) FROM DAAS_PROD.DAAS_COMMON.BATCH_S02
 INSERT INTO DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_MARKS (mark, value)
 SELECT 'max_trip_detail_id_before', MAX(TRIP_DETAIL_ID) FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL;
 
--- R2. Preview of the before-picture: the same targets R3 will find, in total and by batch (1 the canary, 2 everyone
---     else). Expect trips, guests and rating_rows_to_replay to agree with R0b and with what R3 reports.
-SELECT COALESCE(TO_VARCHAR(BATCH_NO), 'all') AS batch,
+-- R2. Preview of the before-picture by batch: the trips the R3 statements will find. Expect trips, guests and
+--     rating_rows_to_replay on the 'all' row to agree with R0b. most_passes_the_merge_needs is the loop's length for
+--     each statement: 30 or less for batches 1 and 2; for 3a and 3b about the longest single trip, or WLM's longest run
+--     (replayed whole: 93 by day on 11 Nov). most_passes_if_replayed_whole is what one unrestricted UPDATE would need
+--     (587 by day on 11 Nov). These are counted from the trips' dates, R0d from the transactions' days: these can only
+--     be equal or higher, so a guest R0d would keep in the main group may sit in batch 3 here, never the other way.
+SELECT CASE WHEN BATCH_NO IS NULL THEN 'all'
+            WHEN BATCH_NO = 1 THEN '1  the canary (R3-C)'
+            WHEN BATCH_NO = 2 THEN '2  everyone else (R3)'
+            WHEN LEFT_FOR_R3Z THEN '3b long-run guests, the trips left for R3-Z'
+            ELSE                   '3a long-run guests, the trips R3-L replays' END AS batch,
        COUNT(*)                                  AS trips,
        COUNT_IF(RATING_ROWS > 0)                 AS trips_the_replay_reaches,
        COUNT_IF(RATING_ROWS = 0)                 AS trips_with_no_live_rating,
@@ -501,12 +558,12 @@ SELECT COALESCE(TO_VARCHAR(BATCH_NO), 'all') AS batch,
        COUNT_IF(MARKET_CD = 'BEM')               AS bem_trips,
        COUNT_IF(MARKET_CD = 'WLM')               AS wlm_trips,
        SUM(RATING_ROWS)                          AS rating_rows_to_replay,
-       MAX(TRIP_DAYS)                            AS longest_days,
-       MIN(TRIP_START_DT)                        AS earliest_start,
-       MAX(TRIP_START_DT)                        AS latest_start
+       MAX(PASSES_AS_REPLAYED)                   AS most_passes_the_merge_needs,
+       MAX(RUN_PASSES)                           AS most_passes_if_replayed_whole,
+       MAX(TRIP_DAYS)                            AS longest_days
 FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS
-GROUP BY ROLLUP (BATCH_NO)
-ORDER BY BATCH_NO NULLS LAST;
+GROUP BY GROUPING SETS ((BATCH_NO, LEFT_FOR_R3Z), ())
+ORDER BY 1;
 
 -- R2b. What else the runs will re-cut: the target guests' other live trips (property and enterprise grains, other
 --      markets) that are over their cap with no hotel night today. The ratings step rewrites every master holding a
@@ -549,16 +606,318 @@ WHERE j.JOB_NAME LIKE 'TRIP%'
 ORDER BY b.BATCH_ID;
 
 
--- R3. THE ONE WRITE, self-contained: it reads nothing but PROD's own tables. The replay: every live rating of every live
---     BEM/WLM market trip that is over its cap with no hotel night (the same measure as R0b and v1.4 itself) is marked
---     on RATINGS_FACT, which puts it in RATINGS_FACT_STREAM for the next hourly run. Rows updated must equal R0b's
---     ratings_fact_rows_to_update. The platform's replay pattern (REPLAY_COUNTER up by one, UPDATED_DTTM and UPDATED_BY
+-- R3. THE WRITES. Each statement is self-contained: it reads nothing but PROD's own tables. The three grouped
+--     statements share one piece of logic, word for word, which is also what R1 used for its batches: the live BEM/WLM
+--     market trips over their cap with no hotel night (the same measure as R0b and v1.4 itself), strung into runs (a
+--     guest's target trips in a market that follow one another without a break), with the passes the merge's loop
+--     needs for each run (R0d). A guest whose longest run needs more than 30 passes is a long-run guest.
+--       R3-C  optional, first: the canary. One guest in a hundred of the main group. If it is skipped, R3 covers them.
+--       R3    the main replay: everyone except the long-run guests. No run needs more than 30 passes.
+--       R3-L  the long-run guests, first step: everything of theirs except every second trip of a long run at a
+--             one-day cap. A long BEM run is a string of adjacent trips cut at the old 30-day cap. Replayed together
+--             they are one run of hundreds of days for the loop; replayed as every other trip, each is on its own and
+--             needs at most its own length in passes. At a one-day cap the result is the same either way, because
+--             every play day becomes its own trip whichever trips it arrives with (checked against a re-implementation
+--             of the loop: 300 runs, 0 differences). At WLM's three-day cap it is not the same, so a WLM run is never
+--             split: it is replayed whole (the longest needs 93 passes).
+--       R3-Z  an hour after R3-L: the statement as first written, with no grouping. It replays whatever is still over
+--             its cap, which by then is the trips R3-L left.
+--     What each does to a row: the platform's replay pattern (REPLAY_COUNTER up by one, UPDATED_DTTM and UPDATED_BY
 --     stamped; the pipeline's own rating step copies UPDATED_DTTM into TRIP_DETAIL.TRANSACTION_MODIFIED_DTTM, as on any
 --     replay). Only ratings are replayed: the merge step re-windows everything a nominated trip holds — offers, comps,
 --     POS, cage, free play alike — from TRIP_DETAIL (week test, 847,653 transaction-nights, 0 lost, 0 doubled), so one
 --     transaction type is enough to touch the trip, and ratings are the one every reachable target holds.
---     For the canary first, add to the targets CTE:  AND m.GUEST_UNIQUE_ID IN (SELECT GUEST_UNIQUE_ID FROM
---     DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_TRIPS WHERE BATCH_NO = 1)  — and NOT IN for the rest after its run.
+--     Each UPDATE goes right after an hourly run has finished (R4a); the next run does the rest. R3b and R4b after
+--     each, then the post-check. When all are done, R0b is the closing check: trips_the_replay_reaches at 0.
+
+-- R3-0. Read-only: what each statement would update now, counted by the statements' own logic. The rating_rows of the
+--       four lines add up to R0b's ratings_fact_rows_to_update, and each line is what its UPDATE must report as rows
+--       updated (R3 reports lines 1 and 2 together if R3-C is skipped).
+WITH ent AS (
+    SELECT MAX(VALUE) AS MAX_TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+    WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y'
+),
+multi AS (
+    SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, MARKET_CD, TRIP_START_DT, TRIP_END_DT, TRIP_END_DT - TRIP_START_DT + 1 AS TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+    WHERE DELETE_IND = 'N' AND TRIP_TYPE = 'MARKET' AND MARKET_CD IN ('BEM', 'WLM') AND TRIP_END_DT > TRIP_START_DT
+),
+caps AS (
+    SELECT MARKET_CD, TRIP_START_DT,
+           DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT) AS CAP,
+           DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', MARKET_CD, TRIP_START_DT) AS GAP
+    FROM (SELECT DISTINCT MARKET_CD, TRIP_START_DT FROM multi)
+),
+targets AS (    /* the trips to replay: live BEM/WLM market trips over their cap with no hotel night */
+    SELECT m.TRIP_MASTER_ID, m.GUEST_UNIQUE_ID, m.MARKET_CD, m.TRIP_START_DT, m.TRIP_END_DT, m.TRIP_DAYS,
+           COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS)) AS CAP,
+           COALESCE(TRY_TO_NUMBER(c.GAP), 1)                              AS GAP
+    FROM multi m
+    JOIN caps c ON c.MARKET_CD = m.MARKET_CD AND c.TRIP_START_DT = m.TRIP_START_DT
+    CROSS JOIN ent e
+    WHERE m.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS))
+      AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                      WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID AND d.DELETE_IND = 'N' AND d.TRANSACTION_TYPE = 'HOTEL')
+),
+chained AS (    /* a run: a guest's target trips in a market, each starting within the gap of where the one before ends */
+    SELECT t.*,
+           IFF(DATEDIFF(day, MAX(t.TRIP_END_DT) OVER (PARTITION BY t.GUEST_UNIQUE_ID, t.MARKET_CD
+                                                      ORDER BY t.TRIP_START_DT, t.TRIP_END_DT, t.TRIP_MASTER_ID
+                                                      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+                        t.TRIP_START_DT) <= t.GAP, 0, 1) AS STARTS_A_RUN
+    FROM targets t
+),
+numbered AS (
+    SELECT c.*,
+           SUM(c.STARTS_A_RUN) OVER (PARTITION BY c.GUEST_UNIQUE_ID, c.MARKET_CD
+                                     ORDER BY c.TRIP_START_DT, c.TRIP_END_DT, c.TRIP_MASTER_ID
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RUN_NO
+    FROM chained c
+),
+placed AS (     /* each trip with its run: the passes the merge's loop needs for the whole run, and the trip's place in it */
+    SELECT n.*,
+           CEIL((DATEDIFF(day, MIN(n.TRIP_START_DT) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO),
+                               MAX(n.TRIP_END_DT)   OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)) + 1)
+                / MIN(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO))                AS RUN_PASSES,
+           MAX(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)                        AS RUN_CAP,
+           ROW_NUMBER() OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO
+                              ORDER BY n.TRIP_START_DT, n.TRIP_END_DT, n.TRIP_MASTER_ID)                 AS PLACE_IN_RUN
+    FROM numbered n
+),
+picked AS (     /* a guest's longest run decides the guest's group: more than 30 passes = a long-run guest */
+    SELECT p.*, MAX(p.RUN_PASSES) OVER (PARTITION BY p.GUEST_UNIQUE_ID) AS GUEST_PASSES
+    FROM placed p
+)
+SELECT CASE WHEN t.GUEST_PASSES <= 30 AND MOD(ABS(HASH(t.GUEST_UNIQUE_ID)), 100) = 0 THEN '1  R3-C (the canary)'
+            WHEN t.GUEST_PASSES <= 30                                                THEN '2  R3 (everyone else)'
+            WHEN NOT (t.RUN_PASSES > 30 AND t.RUN_CAP = 1 AND MOD(t.PLACE_IN_RUN, 2) = 0) THEN '3a R3-L (long-run guests)'
+            ELSE                                                                          '3b R3-Z (what R3-L leaves)'
+       END                                    AS statement,
+       COUNT(DISTINCT d.TRANSACTION_TABLE_SK) AS rating_rows,
+       COUNT(DISTINCT t.TRIP_MASTER_ID)       AS trips,
+       COUNT(DISTINCT t.GUEST_UNIQUE_ID)      AS guests,
+       MAX(IFF(t.GUEST_PASSES > 30 AND t.RUN_PASSES > 30 AND t.RUN_CAP = 1,
+               CEIL(t.TRIP_DAYS / t.CAP), t.RUN_PASSES)) AS most_passes_the_merge_needs
+FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+JOIN picked t ON t.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
+GROUP BY 1
+ORDER BY 1;
+
+-- R3-C. The canary (optional, first): R3 with one more line. About 590 guests.
+UPDATE DAAS_PROD.DAAS_CORE.RATINGS_FACT RF
+SET RF.REPLAY_COUNTER = COALESCE(RF.REPLAY_COUNTER, 0) + 1,
+    RF.UPDATED_DTTM   = CURRENT_TIMESTAMP(),
+    RF.UPDATED_BY     = CURRENT_USER()
+WHERE RF.RATINGS_FACT_SK IN (
+    WITH ent AS (
+        SELECT MAX(VALUE) AS MAX_TRIP_DAYS
+        FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+        WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y'
+    ),
+    multi AS (
+        SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, MARKET_CD, TRIP_START_DT, TRIP_END_DT, TRIP_END_DT - TRIP_START_DT + 1 AS TRIP_DAYS
+        FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+        WHERE DELETE_IND = 'N' AND TRIP_TYPE = 'MARKET' AND MARKET_CD IN ('BEM', 'WLM') AND TRIP_END_DT > TRIP_START_DT
+    ),
+    caps AS (
+        SELECT MARKET_CD, TRIP_START_DT,
+               DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT) AS CAP,
+               DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', MARKET_CD, TRIP_START_DT) AS GAP
+        FROM (SELECT DISTINCT MARKET_CD, TRIP_START_DT FROM multi)
+    ),
+    targets AS (    /* the trips to replay: live BEM/WLM market trips over their cap with no hotel night */
+        SELECT m.TRIP_MASTER_ID, m.GUEST_UNIQUE_ID, m.MARKET_CD, m.TRIP_START_DT, m.TRIP_END_DT, m.TRIP_DAYS,
+               COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS)) AS CAP,
+               COALESCE(TRY_TO_NUMBER(c.GAP), 1)                              AS GAP
+        FROM multi m
+        JOIN caps c ON c.MARKET_CD = m.MARKET_CD AND c.TRIP_START_DT = m.TRIP_START_DT
+        CROSS JOIN ent e
+        WHERE m.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS))
+          AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                          WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID AND d.DELETE_IND = 'N' AND d.TRANSACTION_TYPE = 'HOTEL')
+    ),
+    chained AS (    /* a run: a guest's target trips in a market, each starting within the gap of where the one before ends */
+        SELECT t.*,
+               IFF(DATEDIFF(day, MAX(t.TRIP_END_DT) OVER (PARTITION BY t.GUEST_UNIQUE_ID, t.MARKET_CD
+                                                          ORDER BY t.TRIP_START_DT, t.TRIP_END_DT, t.TRIP_MASTER_ID
+                                                          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+                            t.TRIP_START_DT) <= t.GAP, 0, 1) AS STARTS_A_RUN
+        FROM targets t
+    ),
+    numbered AS (
+        SELECT c.*,
+               SUM(c.STARTS_A_RUN) OVER (PARTITION BY c.GUEST_UNIQUE_ID, c.MARKET_CD
+                                         ORDER BY c.TRIP_START_DT, c.TRIP_END_DT, c.TRIP_MASTER_ID
+                                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RUN_NO
+        FROM chained c
+    ),
+    placed AS (     /* each trip with its run: the passes the merge's loop needs for the whole run, and the trip's place in it */
+        SELECT n.*,
+               CEIL((DATEDIFF(day, MIN(n.TRIP_START_DT) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO),
+                                   MAX(n.TRIP_END_DT)   OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)) + 1)
+                    / MIN(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO))                AS RUN_PASSES,
+               MAX(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)                        AS RUN_CAP,
+               ROW_NUMBER() OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO
+                                  ORDER BY n.TRIP_START_DT, n.TRIP_END_DT, n.TRIP_MASTER_ID)                 AS PLACE_IN_RUN
+        FROM numbered n
+    ),
+    picked AS (     /* a guest's longest run decides the guest's group: more than 30 passes = a long-run guest */
+        SELECT p.*, MAX(p.RUN_PASSES) OVER (PARTITION BY p.GUEST_UNIQUE_ID) AS GUEST_PASSES
+        FROM placed p
+    )
+    SELECT d.TRANSACTION_TABLE_SK
+    FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+    JOIN picked t ON t.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+    WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
+      AND t.GUEST_PASSES <= 30   /* the main group ... */
+      AND MOD(ABS(HASH(t.GUEST_UNIQUE_ID)), 100) = 0   /* ... one guest in a hundred */
+);
+
+-- R3. The main replay: everyone except the long-run guests (after R3-C, everyone of them it did not take: the canary's
+--     trips are no longer over their cap).
+UPDATE DAAS_PROD.DAAS_CORE.RATINGS_FACT RF
+SET RF.REPLAY_COUNTER = COALESCE(RF.REPLAY_COUNTER, 0) + 1,
+    RF.UPDATED_DTTM   = CURRENT_TIMESTAMP(),
+    RF.UPDATED_BY     = CURRENT_USER()
+WHERE RF.RATINGS_FACT_SK IN (
+    WITH ent AS (
+        SELECT MAX(VALUE) AS MAX_TRIP_DAYS
+        FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+        WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y'
+    ),
+    multi AS (
+        SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, MARKET_CD, TRIP_START_DT, TRIP_END_DT, TRIP_END_DT - TRIP_START_DT + 1 AS TRIP_DAYS
+        FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+        WHERE DELETE_IND = 'N' AND TRIP_TYPE = 'MARKET' AND MARKET_CD IN ('BEM', 'WLM') AND TRIP_END_DT > TRIP_START_DT
+    ),
+    caps AS (
+        SELECT MARKET_CD, TRIP_START_DT,
+               DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT) AS CAP,
+               DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', MARKET_CD, TRIP_START_DT) AS GAP
+        FROM (SELECT DISTINCT MARKET_CD, TRIP_START_DT FROM multi)
+    ),
+    targets AS (    /* the trips to replay: live BEM/WLM market trips over their cap with no hotel night */
+        SELECT m.TRIP_MASTER_ID, m.GUEST_UNIQUE_ID, m.MARKET_CD, m.TRIP_START_DT, m.TRIP_END_DT, m.TRIP_DAYS,
+               COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS)) AS CAP,
+               COALESCE(TRY_TO_NUMBER(c.GAP), 1)                              AS GAP
+        FROM multi m
+        JOIN caps c ON c.MARKET_CD = m.MARKET_CD AND c.TRIP_START_DT = m.TRIP_START_DT
+        CROSS JOIN ent e
+        WHERE m.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS))
+          AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                          WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID AND d.DELETE_IND = 'N' AND d.TRANSACTION_TYPE = 'HOTEL')
+    ),
+    chained AS (    /* a run: a guest's target trips in a market, each starting within the gap of where the one before ends */
+        SELECT t.*,
+               IFF(DATEDIFF(day, MAX(t.TRIP_END_DT) OVER (PARTITION BY t.GUEST_UNIQUE_ID, t.MARKET_CD
+                                                          ORDER BY t.TRIP_START_DT, t.TRIP_END_DT, t.TRIP_MASTER_ID
+                                                          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+                            t.TRIP_START_DT) <= t.GAP, 0, 1) AS STARTS_A_RUN
+        FROM targets t
+    ),
+    numbered AS (
+        SELECT c.*,
+               SUM(c.STARTS_A_RUN) OVER (PARTITION BY c.GUEST_UNIQUE_ID, c.MARKET_CD
+                                         ORDER BY c.TRIP_START_DT, c.TRIP_END_DT, c.TRIP_MASTER_ID
+                                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RUN_NO
+        FROM chained c
+    ),
+    placed AS (     /* each trip with its run: the passes the merge's loop needs for the whole run, and the trip's place in it */
+        SELECT n.*,
+               CEIL((DATEDIFF(day, MIN(n.TRIP_START_DT) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO),
+                                   MAX(n.TRIP_END_DT)   OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)) + 1)
+                    / MIN(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO))                AS RUN_PASSES,
+               MAX(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)                        AS RUN_CAP,
+               ROW_NUMBER() OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO
+                                  ORDER BY n.TRIP_START_DT, n.TRIP_END_DT, n.TRIP_MASTER_ID)                 AS PLACE_IN_RUN
+        FROM numbered n
+    ),
+    picked AS (     /* a guest's longest run decides the guest's group: more than 30 passes = a long-run guest */
+        SELECT p.*, MAX(p.RUN_PASSES) OVER (PARTITION BY p.GUEST_UNIQUE_ID) AS GUEST_PASSES
+        FROM placed p
+    )
+    SELECT d.TRANSACTION_TABLE_SK
+    FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+    JOIN picked t ON t.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+    WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
+      AND t.GUEST_PASSES <= 30   /* everyone except the long-run guests */
+);
+
+-- R3-L. The long-run guests, first step. Any time after R3.
+UPDATE DAAS_PROD.DAAS_CORE.RATINGS_FACT RF
+SET RF.REPLAY_COUNTER = COALESCE(RF.REPLAY_COUNTER, 0) + 1,
+    RF.UPDATED_DTTM   = CURRENT_TIMESTAMP(),
+    RF.UPDATED_BY     = CURRENT_USER()
+WHERE RF.RATINGS_FACT_SK IN (
+    WITH ent AS (
+        SELECT MAX(VALUE) AS MAX_TRIP_DAYS
+        FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+        WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y'
+    ),
+    multi AS (
+        SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, MARKET_CD, TRIP_START_DT, TRIP_END_DT, TRIP_END_DT - TRIP_START_DT + 1 AS TRIP_DAYS
+        FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+        WHERE DELETE_IND = 'N' AND TRIP_TYPE = 'MARKET' AND MARKET_CD IN ('BEM', 'WLM') AND TRIP_END_DT > TRIP_START_DT
+    ),
+    caps AS (
+        SELECT MARKET_CD, TRIP_START_DT,
+               DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT) AS CAP,
+               DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', MARKET_CD, TRIP_START_DT) AS GAP
+        FROM (SELECT DISTINCT MARKET_CD, TRIP_START_DT FROM multi)
+    ),
+    targets AS (    /* the trips to replay: live BEM/WLM market trips over their cap with no hotel night */
+        SELECT m.TRIP_MASTER_ID, m.GUEST_UNIQUE_ID, m.MARKET_CD, m.TRIP_START_DT, m.TRIP_END_DT, m.TRIP_DAYS,
+               COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS)) AS CAP,
+               COALESCE(TRY_TO_NUMBER(c.GAP), 1)                              AS GAP
+        FROM multi m
+        JOIN caps c ON c.MARKET_CD = m.MARKET_CD AND c.TRIP_START_DT = m.TRIP_START_DT
+        CROSS JOIN ent e
+        WHERE m.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS))
+          AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                          WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID AND d.DELETE_IND = 'N' AND d.TRANSACTION_TYPE = 'HOTEL')
+    ),
+    chained AS (    /* a run: a guest's target trips in a market, each starting within the gap of where the one before ends */
+        SELECT t.*,
+               IFF(DATEDIFF(day, MAX(t.TRIP_END_DT) OVER (PARTITION BY t.GUEST_UNIQUE_ID, t.MARKET_CD
+                                                          ORDER BY t.TRIP_START_DT, t.TRIP_END_DT, t.TRIP_MASTER_ID
+                                                          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+                            t.TRIP_START_DT) <= t.GAP, 0, 1) AS STARTS_A_RUN
+        FROM targets t
+    ),
+    numbered AS (
+        SELECT c.*,
+               SUM(c.STARTS_A_RUN) OVER (PARTITION BY c.GUEST_UNIQUE_ID, c.MARKET_CD
+                                         ORDER BY c.TRIP_START_DT, c.TRIP_END_DT, c.TRIP_MASTER_ID
+                                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RUN_NO
+        FROM chained c
+    ),
+    placed AS (     /* each trip with its run: the passes the merge's loop needs for the whole run, and the trip's place in it */
+        SELECT n.*,
+               CEIL((DATEDIFF(day, MIN(n.TRIP_START_DT) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO),
+                                   MAX(n.TRIP_END_DT)   OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)) + 1)
+                    / MIN(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO))                AS RUN_PASSES,
+               MAX(n.CAP) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO)                        AS RUN_CAP,
+               ROW_NUMBER() OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO
+                                  ORDER BY n.TRIP_START_DT, n.TRIP_END_DT, n.TRIP_MASTER_ID)                 AS PLACE_IN_RUN
+        FROM numbered n
+    ),
+    picked AS (     /* a guest's longest run decides the guest's group: more than 30 passes = a long-run guest */
+        SELECT p.*, MAX(p.RUN_PASSES) OVER (PARTITION BY p.GUEST_UNIQUE_ID) AS GUEST_PASSES
+        FROM placed p
+    )
+    SELECT d.TRANSACTION_TABLE_SK
+    FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+    JOIN picked t ON t.TRIP_MASTER_ID = d.TRIP_MASTER_ID
+    WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
+      AND t.GUEST_PASSES > 30   /* the long-run guests ... */
+      /* ... less every second trip of a run of theirs that is long and at a one-day cap */
+      AND NOT (t.RUN_PASSES > 30 AND t.RUN_CAP = 1 AND MOD(t.PLACE_IN_RUN, 2) = 0)
+);
+
+-- R3-Z. An hour after R3-L, once its run has finished: the statement as first written. It replays whatever is still over
+--       its cap: the trips R3-L left.
 UPDATE DAAS_PROD.DAAS_CORE.RATINGS_FACT RF
 SET RF.REPLAY_COUNTER = COALESCE(RF.REPLAY_COUNTER, 0) + 1,
     RF.UPDATED_DTTM   = CURRENT_TIMESTAMP(),
@@ -594,7 +953,8 @@ WHERE RF.RATINGS_FACT_SK IN (
     WHERE d.TRANSACTION_TABLE = 'RATINGS_FACT' AND d.DELETE_IND = 'N' AND d.TRANSACTION_SUB_TYPE = 'OPENED'
 );
 
--- R3b. Right after R3: the stream has the rows and the root task will fire at :15. Expect TRUE and rows = rows updated.
+-- R3b. Right after each UPDATE: the stream has the rows and the root task will fire at :15. Expect TRUE and rows =
+--      rows updated.
 SELECT SYSTEM$STREAM_HAS_DATA('DAAS_PROD.DAAS_CORE.RATINGS_FACT_STREAM') AS ratings_stream_has_data;
 SELECT COUNT(*) AS replayed_rows_waiting
 FROM DAAS_PROD.DAAS_CORE.RATINGS_FACT_STREAM
