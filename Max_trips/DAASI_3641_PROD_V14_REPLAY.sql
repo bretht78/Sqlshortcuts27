@@ -7,10 +7,10 @@
 --   1. Deploy v1.4 to PROD (GitHub Actions, from main), right after an hourly run has finished (R4a shows none running).
 --      Nothing changes on deploy alone: v1.4 only acts on a trip the chain touches, and the chain only touches a trip
 --      when something lands on it.
---   2. R0 (the version), R0b (the size, read-only), R0c (the pipeline's warehouse and its task time limits — the two
---      things that decide whether the replay goes in one UPDATE or two, see below), R1 (the before-picture the
---      post-check needs: scratch tables in DAAS_TEMP_WORK, minutes on Large; not used by R3), R2 / R2b / R2c (previews,
---      read-only).
+--   2. R0 (the version), R0b (the size, read-only), R0c (the pipeline's warehouse and its task time limits) and R0d
+--      (how many passes the merge's loop will make on this data) — together the things that decide whether the replay
+--      goes in one UPDATE or two, see below — then R1 (the before-picture the post-check needs: scratch tables in
+--      DAAS_TEMP_WORK, minutes on Large; not used by R3), R2 / R2b / R2c (previews, read-only).
 --   3. R3, right after an hourly run has finished: the UPDATE. The next run (TRIP_ROOT_TASK, :15 past every hour,
 --      Pacific) does the rest in one pass: ratings step → merge check (v1.4 nominates) → merge (re-windows) → summaries
 --      → comp worth. R4b watches it.
@@ -18,9 +18,12 @@
 --
 -- One UPDATE or two. R3 as written replays everything at once: 377,243 trips, 12.07M rating rows, one hourly run. The
 -- steps that grow with the size are the ratings step (every replayed rating goes through it) and the merge, which
--- rebuilds the trips in one transaction: 8,880 trips took 18 minutes of merge in UAT, on UAT's job warehouse, so 377K
--- trips could be hours of merge time in one run. Whether that fits is decided by two things, and both belong to the
--- pipeline, not to the session R3 is run from (that warehouse runs the UPDATE and nothing after it). R0c reads both.
+-- rebuilds the trips in one transaction: 8,880 trips took 18 minutes of merge in UAT on UAT's job warehouse, which
+-- R0c shows is the same size as PROD's (both Large, 11 Nov), so that timing carries over like for like. The merge does
+-- not scale by trip count, though: it works in passes, and the number of passes is the longest unbroken run of play
+-- days of any one guest, divided by the cap (R0d explains and counts them). Whether the run fits is decided by that
+-- count and by two things that belong to the pipeline, not to the session R3 is run from (that warehouse runs the
+-- UPDATE and nothing after it). R0c reads both.
 --   The warehouse.  Each step runs on the warehouse named on its job's row in DAAS_COMMON.JOB: the task starts on the
 --                   warehouse in its own definition, then the step's procedure opens with USE WAREHOUSE on the job's
 --                   WAREHOUSE_NAME. For the trip jobs that was DAAS_PROD_IT_WHSRCTORAW_COMPUTE in October. The April
@@ -35,8 +38,10 @@
 -- USER_TASK_TIMEOUT_MS for the limit). The hourly trip pipeline also pauses for as long as the run takes (the root task
 -- waits for a run to finish before it starts the next; the April and August replays paused the same way, with the
 -- downstream dynamic tables suspended until done). If any of this is in doubt, run R3 twice: first with its targets
--- limited to R1's batch 1 — a canary of 500 guests, about 3,000 trips — whose run measures PROD's ratings-step and
--- merge rates inside an hour; then for everyone else (the two one-line additions are in R3's comment).
+-- limited to R1's batch 1 — a canary of 500 guests, about 3,000 trips — then for everyone else (the two one-line
+-- additions are in R3's comment). The canary is the first time the whole chain carries this replay end to end (UAT
+-- could not run the ratings step), and it times the ratings step and a typical guest's merge inside an hour. It is a
+-- random draw, so it will not contain the few guests with the longest runs: R0d is what measures those.
 --
 -- How the replay reaches the trips. An UPDATE on RATINGS_FACT lands in RATINGS_FACT_STREAM. TRIP_RATING_DOMAIN_PIPELINE_PROC
 -- takes every rating in the stream through TRIP_IDENTIFIER_PROC again (its step 9 no longer filters out ratings that are
@@ -153,11 +158,33 @@ WHERE "name" IN (SELECT WAREHOUSE_NAME FROM DAAS_PROD.DAAS_COMMON.JOB WHERE JOB_
    OR "name" IN ('DAAS_PROD_IT_SNFK_COMPUTE', 'DAAS_PROD_ADHOC_BULK_LOAD_COMPUTE_XL')
 ORDER BY "name";
 
--- R0c-3. The chain's tasks: all started, each on the warehouse it starts on (run the two statements together).
---        Expect "state" = started on every row; the root runs at :15 past the hour, Pacific.
+-- R0c-3. The 20 tasks of the hourly chain (run the two statements together). Expect 20 rows, "state" = started on each,
+--        the root on its :15 Pacific schedule. The schema holds some 50 other trip tasks (on-demand, initial-load and
+--        one-off fix tasks); they are suspended, are not part of the chain, and are left out here.
+--        11 Nov: 20 of 20 started, each child after the predecessor the pipeline source shows.
 SHOW TASKS LIKE '%TRIP%' IN SCHEMA DAAS_PROD.DAAS_COMMON;
 SELECT "name", "state", "warehouse", "schedule", "predecessors"
 FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
+WHERE "name" IN ('TRIP_ROOT_TASK',
+                 'CORE2CORE_TRIP_FILTERED_TXNS_TASK',
+                 'CORE2CORE_TRIP_RATING_DOMAIN_PIPELINE_TASK',
+                 'CORE2CORE_TRIP_HOTEL_DOMAIN_PIPELINE_TASK',
+                 'CORE2CORE_TRIP_POS_DOMAIN_PIPELINE_TASK',
+                 'CORE2CORE_TRIP_OFFER_DOMAIN_PIPELINE_TASK',
+                 'CORE2CORE_TRIP_COMP_DOMAIN_PIPELINE_TASK',
+                 'CORE2CORE_TRIP_MARKERS_DOMAIN_PIPELINE_TASK',
+                 'CORE2CORE_TRIP_FREEPLAY_DOMAIN_PIPELINE_TASK',
+                 'CORE2CORE_TRIP_RECALCULATION_TASK',
+                 'CORE2CORE_TRIP_MERGE_CHECK_TASK',
+                 'CORE2CORE_TRIP_MERGE_TASK',
+                 'CORE2CORE_TRIP_CUSTOMER_MERGE_CHECK_GUEST_GUESTXREF_TASK',
+                 'CORE2CORE_TRIP_CUSTOMER_MERGE_CHECK_TRIP_MASTER_TASK',
+                 'CORE2CORE_TRIP_CUSTOMER_MERGE_TASK',
+                 'CORE2CORE_TRIP_SUMMARY_POS_TENDER_LOAD_TASK',
+                 'CORE2CORE_TRIP_SUMMARY_LOAD_TASK',
+                 'CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK',
+                 'CORE2CORE_TRIP_INACTIVE_TXNS_ARCHIVAL_TASK',
+                 'CORE2CORE_TRIP_NG_REVENUE_SUMMARY_LOAD_TASK')
 ORDER BY "name";
 
 -- R0c-4. The time limit on each step the replay passes through, read from the task definitions. A step that runs past
@@ -167,6 +194,10 @@ ORDER BY "name";
 --        fails with 'does not exist or not authorized'; the numbers above then stand as of the definitions on file.
 --        One more limit sits on the warehouse: where STATEMENT_TIMEOUT_IN_SECONDS is also set, the lower of the two
 --        applies (SHOW PARAMETERS LIKE 'STATEMENT_TIMEOUT_IN_SECONDS' IN WAREHOUSE <the name from R0c-1>).
+--        11 Nov: 2.0 hours on the root, ratings step, merge check, merge, customer merge and non-gaming revenue; 4.0 on
+--        the summary load; comp worth blank. For comp worth's effective value: SHOW PARAMETERS LIKE
+--        'USER_TASK_TIMEOUT_MS' IN TASK DAAS_PROD.DAAS_COMMON.CORE2CORE_TRIP_COMP_WORTH_LOAD_TASK ("value" is
+--        milliseconds; a blank "level" means Snowflake's default of 3600000, one hour).
 WITH defs AS (
     SELECT 1 AS step, 'TRIP_ROOT_TASK' AS task,
            GET_DDL('TASK', 'DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK') AS ddl
@@ -197,6 +228,135 @@ SELECT step, task,
        ROUND(TRY_TO_NUMBER(REGEXP_SUBSTR(ddl, 'USER_TASK_TIMEOUT_MS *= *([0-9]+)', 1, 1, 'ie', 1)) / 3600000, 1) AS time_limit_hours
 FROM defs
 ORDER BY step;
+
+
+-- R0d. How many passes will the merge make? Read-only; the first statement takes a few minutes on Large and builds a
+--      TEMPORARY table (it lives only in this worksheet's session and leaves nothing behind; if the session has
+--      been idle and the later statements say the table does not exist, run R0d-1 again).
+--
+--      Why this number. The merge rebuilds the nominated trips in a loop (TRIP_FIND_START_DATE_END_DATE_PROC). Each
+--      pass takes, for every guest at once, each unbroken run of play days among the nominated trips and maps the first
+--      cap-days of it (1 day at BEM, 3 at WLM); the rest of the run waits for the next pass. A 5-day BEM trip is done
+--      in 5 passes; a guest who played 300 days in a row at BEM, cut into 30-day trips at the time, needs 300, long
+--      after every other guest is finished. So the loop's length is set by the longest run of any one guest, not by
+--      how many trips are replayed, and three things follow: (1) it can be read off PROD's data before anything runs,
+--      which is what this does; (2) a bigger warehouse shortens the early passes, when every guest is still in the
+--      loop, not the long tail of small ones; (3) a random canary will almost certainly not contain the guests who
+--      set the count, so it cannot measure it. If the count is in the tens, one UPDATE is comfortable. If it is in the
+--      hundreds, the guests in R0d-3 are the reason, and replaying them in an UPDATE of their own (a small working set,
+--      many quick passes) apart from everyone else (a large working set, few passes) keeps both runs short.
+--
+-- R0d-1. One row per guest, market and business day among what the merge will load for the target trips (every OPENED
+--        transaction of each, as the merge reads them), with the run of consecutive days it belongs to and the pass in
+--        which the loop will map it. Cap and gap come from the pipeline's own config function, per day, as in the loop.
+CREATE OR REPLACE TEMPORARY TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_PASSES AS
+WITH ent AS (
+    SELECT MAX(VALUE) AS MAX_TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_CONFIG
+    WHERE CONFIG_SUBTYPE = 'ENTERPRISE' AND KEY = 'MAX_TRIP_DAYS' AND ACTIVE_FLG = 'Y'
+),
+multi AS (
+    SELECT TRIP_MASTER_ID, GUEST_UNIQUE_ID, MARKET_CD, TRIP_START_DT, TRIP_END_DT - TRIP_START_DT + 1 AS TRIP_DAYS
+    FROM DAAS_PROD.DAAS_CORE.TRIP_MASTER
+    WHERE DELETE_IND = 'N' AND TRIP_TYPE = 'MARKET' AND MARKET_CD IN ('BEM', 'WLM') AND TRIP_END_DT > TRIP_START_DT
+),
+caps AS (
+    SELECT MARKET_CD, TRIP_START_DT,
+           DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, TRIP_START_DT) AS CAP
+    FROM (SELECT DISTINCT MARKET_CD, TRIP_START_DT FROM multi)
+),
+targets AS (   -- R3's own targets
+    SELECT m.TRIP_MASTER_ID, m.GUEST_UNIQUE_ID, m.MARKET_CD
+    FROM multi m
+    JOIN caps c ON c.MARKET_CD = m.MARKET_CD AND c.TRIP_START_DT = m.TRIP_START_DT
+    CROSS JOIN ent e
+    WHERE m.TRIP_DAYS > COALESCE(TRY_TO_NUMBER(c.CAP), TRY_TO_NUMBER(e.MAX_TRIP_DAYS))
+      AND NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_CORE.TRIP_DETAIL d
+                      WHERE d.TRIP_MASTER_ID = m.TRIP_MASTER_ID AND d.DELETE_IND = 'N' AND d.TRANSACTION_TYPE = 'HOTEL')
+),
+days AS (      -- what the merge loads for them, by business day
+    SELECT t.GUEST_UNIQUE_ID, t.MARKET_CD, d.BUSINESS_START_DT AS PLAY_DT, COUNT(*) AS DETAIL_ROWS
+    FROM targets t
+    JOIN DAAS_PROD.DAAS_CORE.TRIP_DETAIL d ON d.TRIP_MASTER_ID = t.TRIP_MASTER_ID
+    WHERE d.TRANSACTION_SUB_TYPE = 'OPENED'
+    GROUP BY 1, 2, 3
+),
+cfg AS (       -- the cap and the gap in force on each day, from the function the loop itself calls
+    SELECT MARKET_CD, PLAY_DT,
+           TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('MAX_TRIP_DAYS', MARKET_CD, PLAY_DT)) AS CAP,
+           TRY_TO_NUMBER(DAAS_PROD.DAAS_COMMON.TRIP_CONFIG_UDF_MARKET('TRIP_GAP_DAYS', MARKET_CD, PLAY_DT)) AS GAP
+    FROM (SELECT DISTINCT MARKET_CD, PLAY_DT FROM days)
+),
+edges AS (     -- a new run starts where a day is more than gap-days after the guest's previous day
+    SELECT x.GUEST_UNIQUE_ID, x.MARKET_CD, x.PLAY_DT, x.DETAIL_ROWS, c.CAP, c.GAP,
+           IFF(DATEDIFF(day, LAG(x.PLAY_DT) OVER (PARTITION BY x.GUEST_UNIQUE_ID, x.MARKET_CD ORDER BY x.PLAY_DT), x.PLAY_DT) <= c.GAP,
+               0, 1) AS STARTS_A_RUN
+    FROM days x
+    JOIN cfg c ON c.MARKET_CD = x.MARKET_CD AND c.PLAY_DT = x.PLAY_DT
+),
+numbered AS (
+    SELECT e.*,
+           SUM(e.STARTS_A_RUN) OVER (PARTITION BY e.GUEST_UNIQUE_ID, e.MARKET_CD ORDER BY e.PLAY_DT
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RUN_NO
+    FROM edges e
+),
+placed AS (
+    SELECT n.*,
+           MIN(n.PLAY_DT) OVER (PARTITION BY n.GUEST_UNIQUE_ID, n.MARKET_CD, n.RUN_NO) AS RUN_START_DT
+    FROM numbered n
+)
+SELECT GUEST_UNIQUE_ID, MARKET_CD, RUN_NO, RUN_START_DT, PLAY_DT, DETAIL_ROWS, CAP, GAP,
+       DATEDIFF(day, RUN_START_DT, PLAY_DT) + 1               AS DAY_IN_RUN,
+       CEIL((DATEDIFF(day, RUN_START_DT, PLAY_DT) + 1) / CAP) AS PASS_NO   /* the pass that maps this day */
+FROM placed;
+
+-- R0d-2. The forecast. The right-hand columns are the same on every row: the number of passes the loop will make (and
+--        per market), the longest run in days, and a guard: guest_days_with_no_cap_LOOK must be 0 (a day the config
+--        does not cover would never map, and the loop would not end). The left-hand columns are the loop's profile:
+--        after each number of passes, how many guests, guest-days and transaction rows are still waiting. Row 0 is
+--        everything the merge loads for the targets. A profile that empties in a few passes with a long thin tail is
+--        the case described above.
+WITH headline AS (
+    SELECT MAX(PASS_NO)                               AS passes_the_merge_will_make,
+           MAX(IFF(MARKET_CD = 'BEM', PASS_NO, NULL)) AS bem_passes,
+           MAX(IFF(MARKET_CD = 'WLM', PASS_NO, NULL)) AS wlm_passes,
+           MAX(DAY_IN_RUN)                            AS longest_run_days,
+           COUNT_IF(CAP IS NULL)                      AS guest_days_with_no_cap_LOOK
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_PASSES
+),
+marks AS (
+    SELECT column1 AS after_pass
+    FROM VALUES (0), (1), (2), (3), (5), (10), (15), (30), (60), (100), (200), (400), (800), (1600)
+)
+SELECT k.after_pass,
+       COUNT(DISTINCT IFF(p.PASS_NO > k.after_pass, p.GUEST_UNIQUE_ID, NULL)) AS guests_still_in_the_loop,
+       COUNT_IF(p.PASS_NO > k.after_pass)                                      AS guest_days_still_to_map,
+       COALESCE(SUM(IFF(p.PASS_NO > k.after_pass, p.DETAIL_ROWS, 0)), 0)       AS transaction_rows_still_to_map,
+       h.passes_the_merge_will_make, h.bem_passes, h.wlm_passes, h.longest_run_days, h.guest_days_with_no_cap_LOOK
+FROM marks k
+CROSS JOIN DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_PASSES p
+CROSS JOIN headline h
+GROUP BY k.after_pass, h.passes_the_merge_will_make, h.bem_passes, h.wlm_passes, h.longest_run_days, h.guest_days_with_no_cap_LOOK
+ORDER BY k.after_pass;
+
+-- R0d-3. The runs that set the count: the 20 longest, with the guest, the market, the dates and the passes each needs.
+SELECT GUEST_UNIQUE_ID, MARKET_CD, RUN_START_DT, MAX(PLAY_DT) AS run_end_dt, MAX(DAY_IN_RUN) AS run_days,
+       MAX(PASS_NO) AS passes, SUM(DETAIL_ROWS) AS transaction_rows
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_PASSES
+GROUP BY GUEST_UNIQUE_ID, MARKET_CD, RUN_NO, RUN_START_DT
+ORDER BY passes DESC, transaction_rows DESC
+LIMIT 20;
+
+-- R0d-4. The yardstick (optional; needs the week test's guest list, still in UAT's scratch schema). The week test's
+--        batch 1 re-cut the 34 exposure guests' trips in 18 minutes of merge on a Large warehouse, the same size as
+--        PROD's. The passes that run needed, counted the same way on the same guests' PROD trips: 18 minutes divided by
+--        this number is UAT's time per pass on a small working set, the floor for a pass in PROD.
+SELECT COUNT(DISTINCT GUEST_UNIQUE_ID) AS week_test_guests_found,
+       MAX(PASS_NO)                    AS passes_their_recut_needed,
+       COUNT(*)                        AS guest_days,
+       SUM(DETAIL_ROWS)                AS transaction_rows
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI_3641_P14_PASSES
+WHERE GUEST_UNIQUE_ID IN (SELECT GUEST_UNIQUE_ID FROM DAAS_UAT.DAAS_TEMP_WORK.DAASI_3641_WT_POP WHERE GRP = 'EXPOSURE');
 
 
 -- R1. The targets and the before-pictures. Five scratch tables in DAAS_TEMP_WORK:
