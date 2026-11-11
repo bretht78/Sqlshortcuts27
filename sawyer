@@ -1,0 +1,77 @@
+/* =====================================================================
+   DAASI-3640 | 30b: the UPDATE. For the role that can update
+   DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT and read its two streams.
+   (Rev 2, 11/11 evening: narrowed. It adds the text that is missing
+   and never replaces a comment with nothing.)
+
+   What it does: on the comps that are missing text today, it writes the
+   remarks (COMMENTS_EXTENDED, the new column) and, where the comp's own
+   comment is not showing, the comment (COMP_COMMENTS_DESC). The list of
+   those comps, with the text each one gets, is the work table
+   DAASI3640_UPD_SCOPE that 30 part S builds, and step 1 counts it:
+   1.2 to 1.3 million of 265 million are expected. The comps whose
+   comment the new rule would only blank or shorten (about 6.6 million)
+   are not in the run and keep what they show.
+   It stamps UPDATED_DTTM, UPDATED_BY and LAST_DML_CD the way the load
+   stamps an update. No other column is touched. MD5_CHECKSUM is left
+   alone on purpose: the load compares it on its next touch of a comp
+   and rewrites that row from raw. (It must never be set to NULL: the
+   load would then skip the row for good.)
+
+   When: the load task suspended with no run executing, trips has
+   drained both streams on the fact, TRIP_ROOT_TASK kept from firing
+   until step 3 is done, and 30 parts A, B and S run. Chris says when.
+   The three steps go one after the other, without a pause.
+
+   The task statements around it, as templates:
+     ALTER TASK DAAS_PROD.DAAS_COMMON.RAW2CORE_HETCMS_COMP_DETAIL_FACT_TASK SUSPEND
+     ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK SUSPEND
+     (steps 1 to 3 below, then Chris runs 30 part C)
+     ALTER TASK DAAS_PROD.DAAS_COMMON.TRIP_ROOT_TASK RESUME
+     ALTER TASK DAAS_PROD.DAAS_COMMON.RAW2CORE_HETCMS_COMP_DETAIL_FACT_TASK RESUME
+   ===================================================================== */
+
+-- 1. Before. The rows the UPDATE will change. It must equal ROWS_THIS_RUN_UPDATES from 30 (S2),
+--    and it shows that this role can read the list. If it answers "does not exist or not
+--    authorized", the list's owner (DAAS_TEAM) grants the read:
+--      GRANT SELECT ON TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE TO ROLE <this role>
+SELECT COUNT(*) AS rows_to_update
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE
+WHERE IN_THIS_RUN;
+
+-- 2. The UPDATE. One statement, one transaction. "number of rows updated" must equal
+--    ROWS_TO_UPDATE. It finds each row by its own key and changes it only if it is still active
+--    and still reads what the list saw, so it cannot touch a row that moved in between.
+--    Use a Large. Run it once.
+UPDATE DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT f
+SET COMP_COMMENTS_DESC = s.TO_COMMENT,
+    COMMENTS_EXTENDED  = s.TO_REMARKS,
+    UPDATED_DTTM       = CURRENT_TIMESTAMP,
+    UPDATED_BY         = CURRENT_USER,
+    LAST_DML_CD        = 'U'
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE s
+WHERE f.COMP_DETAIL_FACT_SK = s.COMP_DETAIL_FACT_SK
+  AND s.IN_THIS_RUN
+  AND f.DELETE_IND = 'N'
+  AND f.COMP_COMMENTS_DESC IS NOT DISTINCT FROM s.OLD_COMMENT
+  AND f.COMMENTS_EXTENDED  IS NOT DISTINCT FROM s.OLD_REMARKS;
+
+-- 3. The two streams emptied, straight after step 2. The UPDATE has put every changed row into
+--    both, and nothing else is in them: the load is suspended and trips had drained them. This
+--    is Snowflake's own way of moving a stream past what it holds: a statement that reads the
+--    stream and keeps nothing. The stream, its owner and its grants stay as they are.
+--    (Recreating the two streams does the same job. If done that way: CREATE OR REPLACE STREAM
+--    ... COPY GRANTS, run as the role that owns the stream today, because the role that
+--    recreates a stream becomes its owner and COPY GRANTS does not carry ownership.)
+CREATE OR REPLACE TEMPORARY TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UNUSED_COMP_DOMAIN AS
+SELECT * FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT_COMP_DOMAIN_STREAM WHERE 1 = 0;
+
+CREATE OR REPLACE TEMPORARY TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UNUSED_FP_DOMAIN AS
+SELECT * FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT_FP_DOMAIN_STREAM WHERE 1 = 0;
+
+--    Both streams now read 0. Then Chris runs 30 part C, and the tasks are resumed after it.
+SELECT 'COMP_DOMAIN' AS STREAM, COUNT(*) AS ROWS_WAITING
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT_COMP_DOMAIN_STREAM
+UNION ALL
+SELECT 'FP_DOMAIN', COUNT(*)
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT_FP_DOMAIN_STREAM;
