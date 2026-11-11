@@ -1,0 +1,503 @@
+/* =====================================================================
+   DAASI-3640 | 30: the comp text that is missing from the fact, added
+   by one UPDATE.
+
+   Rev 2 (11/11, evening): the run is narrowed. Rev 1 changed every comp
+   whose text differs from the v1.14 rules, 7.9 million of them. From
+   the review with Pete on 11/11: that is too many, only the rows that
+   need it are to change, and a comment is not to be replaced with
+   nothing. Rev 1 is kept in archive_v1.14/.
+
+   What the 7.9 million are. Two kinds of comp:
+     text missing     The remarks (CMS's second note field, which the
+                      load never read) and comments typed in CMS after
+                      the comp was loaded. Expected: 1.2 to 1.3 million.
+     text to remove   A note that was written on another comp. CMS
+                      reuses comp numbers and the old load matched notes
+                      by number alone, so the v1.14 rule gives these
+                      comps no such note. Expected: about 6.6 million.
+   This run does the first kind only. It writes a text only where the
+   comp's own text has a line the fact does not hold today, and it never
+   blanks a comment. Part S builds the list of those comps, gives the
+   exact count (S2) and shows what it is made of (S3).
+
+   What it leaves. The comps of the second kind keep the note they show
+   today. The v1.14 load takes such a note away by itself the next time
+   it loads the comp (a change in CMS, or CMS's own purge of the comp
+   at 100 days), so the notes that stay for good are those on comps CMS
+   has already purged. Taking them out of history is a decision for
+   Pete and Tracy: her sample of 11/10 showed them removed. Also not in
+   this run, as in rev 1: the comps CMS deleted stay active, host names
+   are not refreshed, and the purge-list rows (23) are not needed.
+
+   The streams. Two streams on the fact feed trips
+   (COMP_DETAIL_FACT_COMP_DOMAIN_STREAM and ..._FP_DOMAIN_STREAM). The
+   UPDATE puts every row it changes into both, and trips has no use for
+   a comment. So the order is Pete's: trips drains the streams first,
+   then the UPDATE, then the streams are emptied (or recreated), and
+   only then is the load resumed. Emptied before the resume, the streams
+   lose nothing real: the load is suspended, so the UPDATE is the only
+   thing in them. Trips reprocesses none of the rows.
+
+   The window, in order. The load stays suspended from 1 to 8.
+     1  Pete   the load task suspended, no run executing
+     2  Pete   trips has drained both streams, and TRIP_ROOT_TASK will
+               not fire again before step 6 (suspended for the window)
+     3  Chris  part A; B1 (the backup, taken now); B2 only if there is
+               no key yet; S1 and S2 (the list and its count)
+     4  Pete   30b step 1: the count, which must equal S2's
+               ROWS_THIS_RUN_UPDATES
+     5  Pete   30b step 2: the UPDATE
+     6  Pete   30b step 3: the two streams emptied
+     7  Chris  part C: the checks. All of them before the resume.
+     8  Pete   the load task and TRIP_ROOT_TASK resumed
+   For the number alone, ahead of the window: S1, S2 and S3 can be run
+   at any time. They read the fact and write one work table. S1 is then
+   run again inside the window, so that the list is of that moment.
+   Parts A, B, S and C read, or write only to DAAS_TEMP_WORK, and run as
+   DAAS_TEAM. Use a Large for B2, S1 and C2.
+
+   Names. Every object is written with its database. For a rehearsal
+   in UAT, replace DAAS_PROD. with DAAS_UAT. throughout, in this file
+   and in 30b. If PROD work tables are kept somewhere other than
+   DAAS_PROD.DAAS_TEMP_WORK, replace that one name throughout, in both.
+
+   Part S and the UPDATE have not run on Snowflake yet, so the rehearsal
+   in UAT comes first.
+   ===================================================================== */
+
+
+/* ---------------------------------------------------------------------
+   A. BEFORE (read-only)
+   --------------------------------------------------------------------- */
+
+-- A1. The deploy is in: the fact has the remarks column (1).
+SELECT COUNT(*) AS has_column
+FROM DAAS_PROD.INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'DAAS_CORE' AND TABLE_NAME = 'COMP_DETAIL_FACT' AND COLUMN_NAME = 'COMMENTS_EXTENDED';
+
+-- A2. The load is suspended: "state" reads suspended. (No row means this role cannot see the
+--     task, and Pete confirms it.)
+SHOW TASKS LIKE 'RAW2CORE_HETCMS_COMP_DETAIL_FACT_TASK' IN SCHEMA DAAS_PROD.DAAS_COMMON;
+
+-- A3. Trips has drained both streams: 0 and 0. A SELECT does not consume a stream.
+SELECT 'COMP_DOMAIN' AS STREAM, COUNT(*) AS ROWS_WAITING
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT_COMP_DOMAIN_STREAM
+UNION ALL
+SELECT 'FP_DOMAIN', COUNT(*)
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT_FP_DOMAIN_STREAM;
+
+
+/* ---------------------------------------------------------------------
+   B. BACKUP AND ANSWER KEY (nothing in the fact changes yet)
+   --------------------------------------------------------------------- */
+
+-- B1. Zero-copy backup of the fact, taken inside the window with the load suspended, so that it
+--     is the fact exactly as the UPDATE finds it. Plain CREATE, so a rerun cannot overwrite it.
+--     Keep it for 90 days.
+--     If it answers "already exists", a backup from an earlier sitting is there, and it is out
+--     of date as soon as the load has run since. While 30b has not run it protects nothing, so
+--     drop it and take it again:
+--       DROP TABLE DAAS_PROD.DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UPD;
+--     Never after 30b has run: from then on it is the only copy of the text as it was.
+CREATE TABLE DAAS_PROD.DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UPD
+  CLONE DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT;
+
+--     The backup is the fact of this moment: two rows, the same two values.
+SELECT '1. the fact' AS what, COUNT(*) AS rows_, MAX(UPDATED_DTTM) AS last_change
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT
+UNION ALL
+SELECT '2. the backup', COUNT(*), MAX(UPDATED_DTTM)
+FROM DAAS_PROD.DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UPD;
+
+-- B2. The answer key: for every active HETCMS comp, the comment and remarks the fact holds now
+--     (OLD_) and the ones the v1.14 rules give (NEW_), with the row's own key
+--     (COMP_DETAIL_FACT_SK). The statement is rev 1's, unchanged. Reads the bridge (251M rows):
+--     use a Large.
+--     A key built at an earlier sitting can stay. S1 leaves out every row the load has rewritten
+--     since, and those rows already read as the rules say. Build it again if it is more than a
+--     few days old.
+CREATE OR REPLACE TRANSIENT TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_KEY AS
+WITH comps AS (
+    SELECT COMP_DETAIL_FACT_SK, COMP_NBR, ISHDRW, PROPERTY_CD, CASINO_OUTLET_CD, GUEST_ID, ISSUE_DT,
+           COMP_COMMENTS_DESC AS OLD_COMMENT,
+           COMMENTS_EXTENDED  AS OLD_REMARKS,
+           UPDATED_DTTM       AS OLD_UPDATED_DTTM,
+           BATCH_ID           AS OLD_BATCH_ID,
+           MD5_CHECKSUM       AS OLD_MD5
+    FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT
+    WHERE DELETE_IND = 'N'
+      AND SOURCE_SYSTEM_NM = 'HETCMS'
+),
+comments AS (   -- v1.14 rule: own lines (the line's guest held the comp), plus bridged lines: for a
+                -- comp the feed first saw after its issue date, a line whose guest never held any
+                -- comp on that number, written by the same person (same primary account in the
+                -- bridge) and not older than the comp. The holder's own line wins on a line number.
+    SELECT CNUMRW, ISHDRW, PROPERTY_CODE,
+           LISTAGG(CMNTCM, '|') WITHIN GROUP (ORDER BY CSEQCM) AS CMNTCM
+    FROM (
+        SELECT CNUMRW, ISHDRW, PROPERTY_CODE, CSEQCM, CMNTCM
+        FROM (
+            SELECT H.CNUMRW, H.ISHDRW, H.PROPERTY_CODE, L.CSEQCM, L.CMNTCM, 1 AS MATCH_RANK,
+                   L.OPERATION_DATE, L.OPERATION_SEQUENCE_NBR, L.CREATED_DATE
+            FROM (SELECT DISTINCT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
+                  FROM DAAS_PROD.DAAS_RAW_HETCMS.CMPRW_RAW) H
+            JOIN (SELECT SYIDCM, "CMP#CM", CSEQCM, CMNTCM, PROPERTY_CODE,
+                         OPERATION_DATE, OPERATION_SEQUENCE_NBR, CREATED_DATE
+                  FROM DAAS_PROD.DAAS_RAW_HETCMS.ECPCMPCM_RAW
+                  QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+                          ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1) L
+              ON L.SYIDCM = H.SYIDRW AND L."CMP#CM" = H.CNUMRW AND L.PROPERTY_CODE = H.PROPERTY_CODE
+            UNION ALL
+            SELECT H.CNUMRW, H.ISHDRW, H.PROPERTY_CODE, L.CSEQCM, L.CMNTCM, 2 AS MATCH_RANK,
+                   L.OPERATION_DATE, L.OPERATION_SEQUENCE_NBR, L.CREATED_DATE
+            FROM (SELECT SYIDCM, "CMP#CM", CSEQCM, CMNTCM, PROPERTY_CODE,
+                         OPERATION_DATE, OPERATION_SEQUENCE_NBR, CREATED_DATE,
+                         MIN(OPERATION_DATE) OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE) AS FIRST_SEEN
+                  FROM DAAS_PROD.DAAS_RAW_HETCMS.ECPCMPCM_RAW
+                  QUALIFY ROW_NUMBER() OVER (PARTITION BY SYIDCM, "CMP#CM", CSEQCM, PROPERTY_CODE
+                          ORDER BY OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1) L
+            JOIN (SELECT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW
+                  FROM (SELECT CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW,
+                               MIN(OPERATION_DATE) OVER (PARTITION BY CNUMRW, ISHDRW, PROPERTY_CODE) AS FIRST_SEEN
+                        FROM DAAS_PROD.DAAS_RAW_HETCMS.CMPRW_RAW)
+                  WHERE FIRST_SEEN::DATE > DATEADD(DAY, 1, DECODE(ISHDRW, 0, '1899-12-31'::DATE, ISHDRW + '1899-12-31'::DATE))
+                  GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE, SYIDRW) H
+              ON L."CMP#CM" = H.CNUMRW AND L.PROPERTY_CODE = H.PROPERTY_CODE
+            JOIN (SELECT PROPERTY_CD, MIN(PROPERTY_ID)::VARCHAR AS PROPERTY_ID
+                  FROM DAAS_PROD.DAAS_CORE.PROPERTY_DIM GROUP BY PROPERTY_CD) P
+              ON P.PROPERTY_CD = H.PROPERTY_CODE
+            JOIN DAAS_PROD.DAAS_CORE.GUEST_XREF_BRIDGE_LKP BL
+              ON BL.XREF_ACCOUNT_NBR = P.PROPERTY_ID || LPAD(L.SYIDCM::VARCHAR, 8, '0')
+            JOIN DAAS_PROD.DAAS_CORE.GUEST_XREF_BRIDGE_LKP BH
+              ON BH.XREF_ACCOUNT_NBR = P.PROPERTY_ID || LPAD(H.SYIDRW::VARCHAR, 8, '0')
+             AND BH.PRIMARY_ACCOUNT_NBR = BL.PRIMARY_ACCOUNT_NBR
+            WHERE NOT EXISTS (SELECT 1 FROM DAAS_PROD.DAAS_RAW_HETCMS.CMPRW_RAW N
+                              WHERE N.CNUMRW = L."CMP#CM" AND N.PROPERTY_CODE = L.PROPERTY_CODE AND N.SYIDRW = L.SYIDCM)
+              AND L.FIRST_SEEN::DATE >= DATEADD(DAY, -1, DECODE(H.ISHDRW, 0, '1899-12-31'::DATE, H.ISHDRW + '1899-12-31'::DATE))
+        )
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY CNUMRW, ISHDRW, PROPERTY_CODE, CSEQCM
+                ORDER BY MATCH_RANK, OPERATION_DATE DESC, OPERATION_SEQUENCE_NBR DESC, CREATED_DATE DESC) = 1
+    )
+    GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE
+),
+remarks AS (    -- remarks rule: a remark line belongs to the comp live on its number when written
+    SELECT CNUMRW, ISHDRW, PROPERTY_CODE,
+           LEFT(LISTAGG(EXPLRM, '|') WITHIN GROUP (ORDER BY SEQNRM), 4000) AS COMMENTS_EXTENDED
+    FROM (
+        SELECT C.CNUMRW, C.ISHDRW, C.PROPERTY_CODE, R.SEQNRM, R.EXPLRM
+        FROM (SELECT CNUMRW, ISHDRW, PROPERTY_CODE, FIRST_SEEN,
+                     LAG(FIRST_SEEN)  OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS PREV_FIRST_SEEN,
+                     LEAD(FIRST_SEEN) OVER (PARTITION BY CNUMRW, PROPERTY_CODE ORDER BY FIRST_SEEN, ISHDRW) AS NEXT_FIRST_SEEN
+              FROM (SELECT CNUMRW, ISHDRW, PROPERTY_CODE, MIN(OPERATION_DATE) AS FIRST_SEEN
+                    FROM DAAS_PROD.DAAS_RAW_HETCMS.CMPRW_RAW
+                    GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE)) C
+        JOIN DAAS_PROD.DAAS_RAW_HETCMS.CMPRM_RAW R
+          ON R.CNUMRM = C.CNUMRW
+         AND R.PROPERTY_CODE = C.PROPERTY_CODE
+         AND (C.PREV_FIRST_SEEN IS NULL OR R.OPERATION_DATE >= DATEADD(SECOND, -60, C.FIRST_SEEN))
+         AND (C.NEXT_FIRST_SEEN IS NULL OR R.OPERATION_DATE <  DATEADD(SECOND, -60, C.NEXT_FIRST_SEEN))
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY C.CNUMRW, C.ISHDRW, C.PROPERTY_CODE, R.SEQNRM
+                ORDER BY R.OPERATION_DATE DESC, R.OPERATION_SEQUENCE_NBR DESC, R.CREATED_DATE DESC) = 1
+    )
+    GROUP BY CNUMRW, ISHDRW, PROPERTY_CODE
+)
+SELECT s.*,
+       c.CMNTCM            AS NEW_COMMENT,
+       r.COMMENTS_EXTENDED AS NEW_REMARKS,
+       (c.CMNTCM IS DISTINCT FROM s.OLD_COMMENT OR r.COMMENTS_EXTENDED IS DISTINCT FROM s.OLD_REMARKS) AS WILL_CHANGE
+FROM comps s
+LEFT JOIN comments c ON c.CNUMRW = s.COMP_NBR AND c.ISHDRW = s.ISHDRW AND c.PROPERTY_CODE = s.PROPERTY_CD
+LEFT JOIN remarks  r ON r.CNUMRW = s.COMP_NBR AND r.ISHDRW = s.ISHDRW AND r.PROPERTY_CODE = s.PROPERTY_CD;
+
+-- B3. Everything that differs, for reference: the comps rev 1 would have changed
+--     (COMPS_THAT_DIFFER, about 7.9 million on 11/11). The count of this run is S2's.
+SELECT COUNT(*)                                                               AS active_comps,
+       COUNT_IF(WILL_CHANGE)                                                  AS comps_that_differ,
+       COUNT_IF(NEW_COMMENT IS NULL     AND OLD_COMMENT IS NOT NULL)          AS rule_gives_no_comment,
+       COUNT_IF(NEW_COMMENT IS NOT NULL AND OLD_COMMENT IS NOT NULL
+                AND NEW_COMMENT <> OLD_COMMENT)                               AS rule_gives_another_comment,
+       COUNT_IF(NEW_COMMENT IS NOT NULL AND OLD_COMMENT IS NULL)              AS comment_to_add,
+       COUNT_IF(NEW_REMARKS IS NOT NULL)                                      AS comps_with_remarks
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_KEY;
+
+-- B4. Only if the load has already run under v1.14 since the deploy: the comps it has written,
+--     against the answer key. Every remark in the fact was written by v1.14 (the column arrived
+--     with it), so the earliest row carrying one marks its first load. Both DIFFER counts should
+--     be 0 or a handful. It shows the load and the key agree, so a comp the load touches later
+--     gets the same text this UPDATE gives it. All zeros means the load has not run under v1.14
+--     yet.
+SELECT MIN(t.FIRST_V114_ROW)                                    AS first_v114_row,
+       COUNT(e.COMP_NBR)                                        AS comps_loaded_by_v114,
+       COUNT_IF(e.NEW_COMMENT IS DISTINCT FROM e.OLD_COMMENT)   AS comments_differ,
+       COUNT_IF(e.NEW_REMARKS IS DISTINCT FROM e.OLD_REMARKS)   AS remarks_differ
+FROM (SELECT MIN(OLD_UPDATED_DTTM) AS FIRST_V114_ROW
+      FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_KEY
+      WHERE OLD_REMARKS IS NOT NULL) t
+LEFT JOIN DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_KEY e
+  ON e.OLD_UPDATED_DTTM >= t.FIRST_V114_ROW;
+
+
+/* ---------------------------------------------------------------------
+   S. THE SCOPE: which comps this run updates, and how many
+   Nothing in the fact changes here either.
+   --------------------------------------------------------------------- */
+
+-- S1. The list. One row for every comp whose text differs from the rules and whose row in the
+--     fact still reads what the key saw (a comp the load has rewritten since is left out: it is
+--     right already). Texts are compared line by line, a line being what stands between two |
+--     marks, so "$95" is not found inside "$95 BASED ON PLAY".
+--       WRITE_REMARKS   the comp's remarks have a line the fact's remarks do not hold
+--       WRITE_COMMENT   the comp's own comment has a line the fact's comment does not hold
+--       IN_THIS_RUN     one of the two is true. A comp where neither is true gains nothing: the
+--                       rule would only take text away from it, and it is left as it is.
+--       TO_COMMENT, TO_REMARKS   what the row reads after the UPDATE. A column that is not
+--                       written keeps today's value, so a comp that gets its remarks while it
+--                       shows another comp's note keeps that note (S3 counts those).
+--       SHOWS_LINES_NOT_ITS_OWN   the fact's comment has a line that the comp's own comment
+--                       does not have: text the rule would take away.
+--       WHAT            the kind of difference, for S3.
+--     Use a Large.
+CREATE OR REPLACE TRANSIENT TABLE DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE AS
+WITH differ AS (        -- text differs from the rules, and the row still reads what the key saw
+    SELECT k.COMP_DETAIL_FACT_SK, k.COMP_NBR, k.ISHDRW, k.PROPERTY_CD, k.CASINO_OUTLET_CD, k.GUEST_ID, k.ISSUE_DT,
+           k.OLD_COMMENT, k.OLD_REMARKS, k.NEW_COMMENT, k.NEW_REMARKS
+    FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_KEY k
+    JOIN DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT f
+      ON f.COMP_DETAIL_FACT_SK = k.COMP_DETAIL_FACT_SK
+    WHERE k.WILL_CHANGE
+      AND f.DELETE_IND = 'N'
+      AND f.COMP_COMMENTS_DESC IS NOT DISTINCT FROM k.OLD_COMMENT
+      AND f.COMMENTS_EXTENDED  IS NOT DISTINCT FROM k.OLD_REMARKS
+),
+own_comment_lines AS (  -- lines of the comp's own comment that the fact's comment does not hold
+    SELECT d.COMP_DETAIL_FACT_SK, COUNT(*) AS LINES_MISSING
+    FROM differ d, LATERAL FLATTEN(INPUT => SPLIT(d.NEW_COMMENT, '|')) x
+    WHERE TRIM(x.VALUE::VARCHAR) <> ''
+      AND POSITION('|' || x.VALUE::VARCHAR || '|' IN '|' || COALESCE(d.OLD_COMMENT, '') || '|') = 0
+    GROUP BY d.COMP_DETAIL_FACT_SK
+),
+shown_comment_lines AS ( -- lines the fact's comment holds that are not in the comp's own comment
+    SELECT d.COMP_DETAIL_FACT_SK, COUNT(*) AS NOT_ITS_OWN
+    FROM differ d, LATERAL FLATTEN(INPUT => SPLIT(d.OLD_COMMENT, '|')) x
+    WHERE TRIM(x.VALUE::VARCHAR) <> ''
+      AND POSITION('|' || x.VALUE::VARCHAR || '|' IN '|' || COALESCE(d.NEW_COMMENT, '') || '|') = 0
+    GROUP BY d.COMP_DETAIL_FACT_SK
+),
+remark_lines AS (       -- lines of the comp's remarks: not in the fact's remarks, and not said by the comment it shows
+    SELECT d.COMP_DETAIL_FACT_SK,
+           COUNT_IF(POSITION('|' || x.VALUE::VARCHAR || '|' IN '|' || COALESCE(d.OLD_REMARKS, '') || '|') = 0) AS LINES_MISSING,
+           COUNT_IF(POSITION('|' || x.VALUE::VARCHAR || '|' IN '|' || COALESCE(d.OLD_COMMENT, '') || '|') = 0) AS NOT_IN_THE_COMMENT
+    FROM differ d, LATERAL FLATTEN(INPUT => SPLIT(d.NEW_REMARKS, '|')) x
+    WHERE TRIM(x.VALUE::VARCHAR) <> ''
+    GROUP BY d.COMP_DETAIL_FACT_SK
+),
+marked AS (
+    SELECT d.COMP_DETAIL_FACT_SK, d.COMP_NBR, d.ISHDRW, d.PROPERTY_CD, d.CASINO_OUTLET_CD, d.GUEST_ID, d.ISSUE_DT,
+           d.OLD_COMMENT, d.OLD_REMARKS, d.NEW_COMMENT, d.NEW_REMARKS,
+           COALESCE(c.LINES_MISSING, 0) > 0                                 AS WRITE_COMMENT,
+           COALESCE(r.LINES_MISSING, 0) > 0                                 AS WRITE_REMARKS,
+           COALESCE(r.NOT_IN_THE_COMMENT, 0) > 0                            AS REMARKS_SAY_MORE,
+           COALESCE(o.NOT_ITS_OWN, 0) > 0                                   AS SHOWS_LINES_NOT_ITS_OWN,
+           NULLIF(TRIM(REPLACE(d.NEW_COMMENT, '|', '')), '') IS NOT NULL    AS HAS_OWN_COMMENT
+    FROM differ d
+    LEFT JOIN own_comment_lines   c ON c.COMP_DETAIL_FACT_SK = d.COMP_DETAIL_FACT_SK
+    LEFT JOIN shown_comment_lines o ON o.COMP_DETAIL_FACT_SK = d.COMP_DETAIL_FACT_SK
+    LEFT JOIN remark_lines        r ON r.COMP_DETAIL_FACT_SK = d.COMP_DETAIL_FACT_SK
+)
+SELECT m.COMP_DETAIL_FACT_SK, m.COMP_NBR, m.ISHDRW, m.PROPERTY_CD, m.CASINO_OUTLET_CD, m.GUEST_ID, m.ISSUE_DT,
+       m.OLD_COMMENT, m.OLD_REMARKS, m.NEW_COMMENT, m.NEW_REMARKS,
+       m.WRITE_COMMENT, m.WRITE_REMARKS, m.SHOWS_LINES_NOT_ITS_OWN,
+       IFF(m.WRITE_COMMENT, m.NEW_COMMENT, m.OLD_COMMENT) AS TO_COMMENT,
+       IFF(m.WRITE_REMARKS, m.NEW_REMARKS, m.OLD_REMARKS) AS TO_REMARKS,
+       (m.WRITE_COMMENT OR m.WRITE_REMARKS)
+           -- AND m.ISSUE_DT >= '2025-01-01'    -- a floor on the issue date: only if one is wanted (S4 shows the years)
+           AS IN_THIS_RUN,
+       CASE WHEN m.WRITE_COMMENT AND m.SHOWS_LINES_NOT_ITS_OWN
+                THEN '4. Comment missing, other text in its place: the comp''s own comment replaces it'
+            WHEN m.WRITE_COMMENT
+                THEN '3. Comment missing or incomplete: lines added'
+            WHEN m.WRITE_REMARKS AND m.REMARKS_SAY_MORE
+                THEN '1. Remarks missing: the report gains text'
+            WHEN m.WRITE_REMARKS
+                THEN '2. Remarks missing, same words as the comment: only the new column fills'
+            WHEN m.SHOWS_LINES_NOT_ITS_OWN AND NOT m.HAS_OWN_COMMENT
+                THEN '5. A note the rule does not give this comp: it would be blanked'
+            WHEN m.SHOWS_LINES_NOT_ITS_OWN
+                THEN '6. Lines the rule does not give this comp: they would be dropped'
+            ELSE     '7. Other: nothing to add'
+       END AS WHAT
+FROM marked m;
+
+-- S2. THE NUMBER. ROWS_THIS_RUN_UPDATES is what the UPDATE will report, and what 30b step 1
+--     must show. Expect 1.2 to 1.3 million, with LEFT_AS_THEY_ARE near 6.6 million and
+--     ALL_THAT_DIFFER near B3's COMPS_THAT_DIFFER.
+--     Four things must hold or the UPDATE does not go ahead: COMMENTS_BLANKED is 0 (no row goes
+--     from a comment to none), LONGEST_COMMENT is 1000 or less and LONGEST_REMARKS 4000 or less
+--     (the column widths), and ROWS_WITHOUT_OWN_KEY is 0 (the UPDATE finds each row by
+--     COMP_DETAIL_FACT_SK).
+SELECT COUNT_IF(IN_THIS_RUN)                                                      AS rows_this_run_updates,
+       COUNT_IF(NOT IN_THIS_RUN)                                                  AS left_as_they_are,
+       COUNT(*)                                                                   AS all_that_differ,
+       COUNT_IF(IN_THIS_RUN
+                AND NULLIF(TRIM(REPLACE(OLD_COMMENT, '|', '')), '') IS NOT NULL
+                AND NULLIF(TRIM(REPLACE(TO_COMMENT,  '|', '')), '') IS NULL)      AS comments_blanked,
+       MAX(IFF(IN_THIS_RUN, LENGTH(TO_COMMENT), NULL))                            AS longest_comment,
+       MAX(IFF(IN_THIS_RUN, LENGTH(TO_REMARKS), NULL))                            AS longest_remarks,
+       COUNT(*) - COUNT(DISTINCT COMP_DETAIL_FACT_SK)                             AS rows_without_own_key
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE;
+
+-- S3. What the number is made of, and what is left. Kinds 1 to 4 are this run: text that is
+--     missing today. Kinds 5 to 7 gain nothing and are left as they are (7 is blank text against
+--     no text, and the like). By the 10/29 count, 99.93% of the notes in kind 5 were written on
+--     another comp that had the same number.
+--     KEEP_LINES_THE_RULE_WOULD_REMOVE: comps of kinds 1 and 2 that get their remarks while the
+--     comment they show stays, although the rule would take it away. They read "that note, then
+--     the remarks" until the notes of kind 5 are dealt with.
+--     Kind 2 changes nothing a reader of the report sees (the remark repeats the comment, and
+--     the report shows a repeated line once). It is in so that the new column is complete.
+SELECT WHAT,
+       IFF(IN_THIS_RUN, 'yes', 'no')                                                    AS this_run,
+       COUNT(*)                                                                         AS comps,
+       COUNT_IF(IN_THIS_RUN AND NOT WRITE_COMMENT AND SHOWS_LINES_NOT_ITS_OWN)          AS keep_lines_the_rule_would_remove
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE
+GROUP BY WHAT, IN_THIS_RUN
+ORDER BY WHAT, this_run DESC;
+
+-- S4. Optional: the same by year of issue, if a floor on the issue date is wanted. The floor is
+--     the commented line in S1: take the dashes off, set the date, run S1 and S2 again.
+SELECT YEAR(ISSUE_DT)                  AS issue_year,
+       COUNT_IF(IN_THIS_RUN)           AS this_run_updates,
+       COUNT_IF(NOT IN_THIS_RUN)       AS left_as_they_are
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE
+GROUP BY 1
+ORDER BY 1 DESC;
+
+-- S5. Optional, a second opinion on the text before it is written, once the dynamic table has
+--     refreshed since the deploy ("data_timestamp" later than "created_on" in the first
+--     statement). The dynamic table is deployed code that builds the same two texts from raw by
+--     itself, with no reference to the fact or to this list. Where this run writes a comment or
+--     remarks, the dynamic table should already read the same: both DIFFER counts 0, or a
+--     handful where raw has moved since its last refresh. NOT_ACTIVE_IN_DT counts comps the fact
+--     holds active that CMS has deleted (the dynamic table applies the deletion, the fact has
+--     not): they get their text like the rest and stay active. If this role cannot read the
+--     dynamic table, Pete runs it.
+SHOW DYNAMIC TABLES LIKE 'COMP_DETAIL_FACT_DT' IN SCHEMA DAAS_PROD.DAAS_CORE_GAMING;
+
+SELECT COUNT(*)                                                             AS rows_this_run_updates,
+       COUNT_IF(d.COMP_NBR IS NULL)                                         AS not_active_in_dt,
+       COUNT_IF(d.COMP_NBR IS NOT NULL AND s.WRITE_COMMENT
+                AND d.COMP_COMMENTS_DESC IS DISTINCT FROM s.TO_COMMENT)     AS comment_differs,
+       COUNT_IF(d.COMP_NBR IS NOT NULL AND s.WRITE_REMARKS
+                AND d.COMMENTS_EXTENDED  IS DISTINCT FROM s.TO_REMARKS)     AS remarks_differ
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE s
+LEFT JOIN DAAS_PROD.DAAS_CORE_GAMING.COMP_DETAIL_FACT_DT d
+  ON  d.COMP_NBR = s.COMP_NBR AND d.ISHDRW = s.ISHDRW AND d.PROPERTY_CD = s.PROPERTY_CD
+  AND d.CASINO_OUTLET_CD = s.CASINO_OUTLET_CD AND d.DELETE_IND = 'N'
+WHERE s.IN_THIS_RUN;
+
+
+/* ---------------------------------------------------------------------
+   The UPDATE and the emptying of the streams are in 30b, for the role
+   that runs them. The UPDATE is repeated here for reference, commented
+   out so that it cannot be run in passing from this file.
+   --------------------------------------------------------------------- */
+--  UPDATE DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT f
+--  SET COMP_COMMENTS_DESC = s.TO_COMMENT,
+--      COMMENTS_EXTENDED  = s.TO_REMARKS,
+--      UPDATED_DTTM       = CURRENT_TIMESTAMP,
+--      UPDATED_BY         = CURRENT_USER,
+--      LAST_DML_CD        = 'U'
+--  FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE s
+--  WHERE f.COMP_DETAIL_FACT_SK = s.COMP_DETAIL_FACT_SK
+--    AND s.IN_THIS_RUN
+--    AND f.DELETE_IND = 'N'
+--    AND f.COMP_COMMENTS_DESC IS NOT DISTINCT FROM s.OLD_COMMENT
+--    AND f.COMMENTS_EXTENDED  IS NOT DISTINCT FROM s.OLD_REMARKS;
+
+
+/* ---------------------------------------------------------------------
+   C. AFTER (read-only). Run all of it before the load is resumed.
+   --------------------------------------------------------------------- */
+
+-- C1. Every comp of the run now reads what the list says. ROWS_THIS_RUN_UPDATES as in S2, and
+--     the other three 0.
+SELECT COUNT(*)                                                       AS rows_this_run_updates,
+       COUNT_IF(f.COMP_DETAIL_FACT_SK IS NULL)                        AS row_not_found,
+       COUNT_IF(f.COMP_COMMENTS_DESC IS DISTINCT FROM s.TO_COMMENT)   AS comment_wrong,
+       COUNT_IF(f.COMMENTS_EXTENDED  IS DISTINCT FROM s.TO_REMARKS)   AS remarks_wrong
+FROM DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE s
+LEFT JOIN DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT f
+  ON f.COMP_DETAIL_FACT_SK = s.COMP_DETAIL_FACT_SK
+WHERE s.IN_THIS_RUN;
+
+-- C2. Nothing else moved. The whole fact against the backup, over every column except the five
+--     the UPDATE writes. Two rows with the same two numbers: not one other value changed, in any
+--     row. Use a Large. (As DAAS_TEAM the masked employee columns read as their mask on both
+--     sides. For those the proof is the UPDATE itself, which does not name them.)
+SELECT '1. the fact now' AS what, COUNT(*) AS rows_,
+       HASH_AGG(* EXCLUDE (COMP_COMMENTS_DESC, COMMENTS_EXTENDED, UPDATED_DTTM, UPDATED_BY, LAST_DML_CD)) AS every_other_column
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT
+UNION ALL
+SELECT '2. the backup', COUNT(*),
+       HASH_AGG(* EXCLUDE (COMP_COMMENTS_DESC, COMMENTS_EXTENDED, UPDATED_DTTM, UPDATED_BY, LAST_DML_CD))
+FROM DAAS_PROD.DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UPD;
+
+-- C3. The text moved only where it was meant to, and no comment was replaced with nothing. This
+--     reads the fact against the backup, not the list: the first two numbers are equal, and
+--     equal to ROWS_THIS_RUN_UPDATES, and COMMENTS_BLANKED is 0.
+SELECT COUNT(*)                                                                    AS rows_whose_text_changed,
+       COUNT_IF(s.IN_THIS_RUN)                                                     AS of_them_in_this_run,
+       COUNT_IF(NULLIF(TRIM(REPLACE(b.COMP_COMMENTS_DESC, '|', '')), '') IS NOT NULL
+                AND NULLIF(TRIM(REPLACE(f.COMP_COMMENTS_DESC, '|', '')), '') IS NULL) AS comments_blanked
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT f
+JOIN DAAS_PROD.DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UPD b
+  ON b.COMP_DETAIL_FACT_SK = f.COMP_DETAIL_FACT_SK
+LEFT JOIN DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE s
+  ON s.COMP_DETAIL_FACT_SK = f.COMP_DETAIL_FACT_SK
+WHERE f.COMP_COMMENTS_DESC IS DISTINCT FROM b.COMP_COMMENTS_DESC
+   OR f.COMMENTS_EXTENDED  IS DISTINCT FROM b.COMMENTS_EXTENDED;
+
+-- C4. The examples from the ticket. Tracy's two UTU comps: 7009616 reads "$95" with remarks
+--     "$95 BASED ON PLAY|PER HUAIBI LI", and 4369229 reads "$80" with "$80 BASED ON LOSS 3/1|PER
+--     HUAIBI LI". The merge case 7613391 (UTU, issued 2022-12-11) keeps its comment "TP". Her
+--     five from 10/4 are not touched by this run: they read as they did before it (under the
+--     full rule they would read blank and blank). Comment text can name people: not for the
+--     ticket.
+SELECT COMP_NBR, PROPERTY_CD, GUEST_ID, ISSUE_DT, COMP_COMMENTS_DESC, COMMENTS_EXTENDED, UPDATED_DTTM, UPDATED_BY
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT
+WHERE DELETE_IND = 'N'
+  AND ((PROPERTY_CD = 'UTU' AND COMP_NBR IN (7009616, 4369229, 7613391))
+       OR (PROPERTY_CD, COMP_NBR) IN (('GBI', 2884740), ('CLV', 5901079), ('UBA', 3254281),
+                                      ('LUS', 1905058), ('NOR', 7762024)))
+ORDER BY PROPERTY_CD, COMP_NBR, ISSUE_DT;
+
+-- C5. The streams are empty again after 30b step 3: 0 and 0. Then the load can be resumed.
+SELECT 'COMP_DOMAIN' AS STREAM, COUNT(*) AS ROWS_WAITING
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT_COMP_DOMAIN_STREAM
+UNION ALL
+SELECT 'FP_DOMAIN', COUNT(*)
+FROM DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT_FP_DOMAIN_STREAM;
+
+
+/* ---------------------------------------------------------------------
+   D. UNDO (only if needed, and for the role that ran the UPDATE)
+   Puts the five columns back from the backup on the rows the UPDATE
+   changed, and only where they still read what the UPDATE wrote, so
+   nothing the load has done since is undone. It is a mass update too:
+   the load suspended, and the streams emptied afterwards, as above.
+   ---------------------------------------------------------------------
+UPDATE DAAS_PROD.DAAS_CORE.COMP_DETAIL_FACT f
+SET COMP_COMMENTS_DESC = b.COMP_COMMENTS_DESC,
+    COMMENTS_EXTENDED  = b.COMMENTS_EXTENDED,
+    UPDATED_DTTM       = b.UPDATED_DTTM,
+    UPDATED_BY         = b.UPDATED_BY,
+    LAST_DML_CD        = b.LAST_DML_CD
+FROM DAAS_PROD.DAAS_TEMP_WORK.COMP_DETAIL_FACT_BKP_DAASI3640_UPD b
+JOIN DAAS_PROD.DAAS_TEMP_WORK.DAASI3640_UPD_SCOPE s
+  ON s.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK
+WHERE f.COMP_DETAIL_FACT_SK = b.COMP_DETAIL_FACT_SK
+  AND s.IN_THIS_RUN
+  AND f.COMP_COMMENTS_DESC IS NOT DISTINCT FROM s.TO_COMMENT
+  AND f.COMMENTS_EXTENDED  IS NOT DISTINCT FROM s.TO_REMARKS;
+   --------------------------------------------------------------------- */
