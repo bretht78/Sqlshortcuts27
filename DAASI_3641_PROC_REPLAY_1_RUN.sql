@@ -43,8 +43,8 @@
 -- that by batch, and R puts it right. B never calls the trips unless the rating rows are in, and calls nothing
 -- for a batch while an earlier one has not gone through.
 -- What the timing rests on: PROD's source for the trip jobs, and Snowflake's rule that a stream read inside a
--- transaction returns the changes up to the transaction's start and no later ones. A6 checks the one part of
--- the source I have not read, the procedures the summary step calls. Batch 1's PC4 is the proof from the data.
+-- transaction returns the changes up to the transaction's start and no later ones. A6 checks the last part of
+-- the source, the procedures the summary step calls. Batch 1's PC4 is the proof from the data.
 --
 -- Seven batches, one per hourly run (A5's figures of 13 Nov):
 --   1       the long runs, as section 1 of the other file: 1,112 trips of 68 guests and 7,354 rating rows, 93
@@ -54,16 +54,47 @@
 --           rating rows each, 30 passes at most
 -- 378,798 trips and 1,055,306 rating rows in all, none of them in RATINGS_FACT.
 -- What a batch costs the run that carries it: the merge step re-cuts the batch's trips (on 11 Nov it re-cut
--- 141,228 on its own in under 4 minutes), and the summary step, which takes 16 to 40 minutes of an ordinary
+-- 141,228 on its own in under 4 minutes), and the summary step, which takes 10 to 40 minutes of an ordinary
 -- hour, then summarises everything rebuilt. A run still going at :15 is not a failure: the next start is skipped,
--- as at 18:15 on 13 Nov, and B waits for the run to end. Batches 1 and 2 are small. For batches 3 to 7, C4 reads
--- off what 11 Nov's run cost, which is the yardstick.
+-- as at 18:15 on 13 Nov, and B waits for the run to end.
+--
+-- WHERE IT STANDS (14 Nov, noon Central): batches 1 and 2 are done and right. Batch 3 is next: the first of the
+-- five main batches, and the largest.
+-- Batch 1 was called on 13 Nov at 21:58 Pacific, in an idle chain, so both calls went in together. The 22:15 run
+-- carried it: all 1,112 trips retired and re-cut into 5,526, none over its cap (PC1), and comp worth equal to the
+-- property side to the cent, $22,766.40 in BEM and $7,987.02 in WLM (PC4).
+-- Batch 2 was called on 14 Nov in the summary step of the 06:15 Pacific run. The 07:15 run carried it: all 12,056
+-- trips retired and re-cut into 49,430, none over its cap (PC1), and comp worth equal to the property side to the
+-- cent, $258,484.28 in BEM and $16,266.57 in WLM, with no trip left out (PC4). That run took 2 hours 19 minutes,
+-- its summary step 81.6 of them; the 08:15 and 09:15 starts were skipped.
+-- What a batch costs the trip jobs (C4 to C7). The procedure's update rewrites every micro-partition that holds
+-- one of the batch's rows, and the next run's summary step first has to find what changed in all that was
+-- rewritten. TRIP_DETAIL has 49,861 micro-partitions, about 300 GB. Batch 1's 7,354 rating rows, scattered over
+-- the table, rewrote one in seven of them (41.7 GB, in 167 seconds); batch 2's 54,511 about two thirds; a main
+-- batch's 200,000 rewrite nearly all. So the most a batch can ask of that step is a read of the whole table, and
+-- the pipeline has that to do anyway after the nightly archival step: on 12 Nov, with no batch, the run after it
+-- read 266.8 GB, nine tenths of the table, in 14.8 minutes.
+-- The run that carried batch 1 was that same run a night later. It took 147 minutes against 97. Its read was the
+-- same size (265.8 GB) but took 44.6 minutes, and C8 does not say why: neither read waited for the warehouse or
+-- for a lock. Another 25 minutes of its summary step was the digital-play procedure, which takes 15 to 31 minutes
+-- every fourth hour, batch or no batch.
+-- What to expect of a main batch, going by batch 2: a summary step of an hour and a half to two and a half hours
+-- (its task's limit is 4) and a run of about three, so two or three hourly starts skipped each time. If a summary
+-- step passes two and a half hours, call nothing more and bring the architect in. Three rules.
+-- Keep a batch away from the archival step: not called between the 20:15 Pacific run and the end of the 22:15 one.
+-- Start it with 30 minutes or more left before :15 (B checks this now): a main batch's rating rows take about 20
+-- minutes to call, and both calls have to be in before the next run starts. An ordinary hour seldom has that
+-- room, its summary step starts around :45. A long run makes it: one still going at :15 skips that start, and
+-- when it ends the chain is idle until the next :15. The run that carries a batch is such a run, so the next
+-- batch can go in when it ends.
+-- And the architect should hear of it before batch 3: the trip data runs two to three hours late each time a
+-- batch is carried, and there are five more.
 --
 -- Order of work:
 --   before   DAASI_3641_PROD_REPLAY_1_PRECHECK.sql: its P2 with rows 5 and 10 at ok (13 Nov: rows 5, 6, 7, 10 ok)
 --   A        once: the before-pictures, the two lists, the count; then A6, who reads the streams
---   B        the batch statement: a dry run, then batch 1 to 7, one in each hourly run's summary step
---   C        C1 the run, C2 where every batch stands; C4 once, before batch 3
+--   B        the batch statement: a dry run, then batch 1 to 7, each ahead of the hourly run that carries it
+--   C        C1 the run, C2 where every batch stands; C4 to C8, what a batch costs the trip jobs
 --   part 2   the post-check (DAASI_3641_PROC_REPLAY_2_POSTCHECK.sql): after batch 1, and after batch 7
 --   R        only if a batch's trips rode a later run than their rating rows
 --   Z        after sign-off: drop the scratch tables
@@ -73,14 +104,13 @@
 -- first call, the less ordinary activity it has to set aside.
 --
 -- Needs: SELECT on the trip tables and the batch log, CREATE TABLE in DAAS_TEMP_WORK, and the right to call the
--- procedure. Run in PROD on 13 Nov with role DAAS_TEAM: A1 to A5, and a dry run of B's first version (both
--- calls went through, 0 rows updated). No batch has been called.
+-- procedure. Run in PROD with role DAAS_TEAM on 13 and 14 Nov: A1 to A6, B's dry runs, batches 1 and 2.
 --
 -- Not in this route, because the team's role cannot do it: suspending the trip dynamic tables and the TIBCO tasks
 -- around the replay, as the April and August runbooks did, and moving the trip jobs to the XL warehouse. Each
--- batch reaches downstream as one hour's changes, a large one, and the run that carries a main batch will be a
--- long one. Both are worth a word with the architect before batch 3. What else a run does (neighbours, guests
--- merged away, the archival step) is in the other file's header.
+-- batch reaches downstream as one hour's changes, a large one, and the run that carries a batch is a long one:
+-- batch 1's took two and a half hours, batch 2's two hours twenty. What else a run does (neighbours, guests merged
+-- away, the archival step) is in the other file's header.
 
 USE ROLE DAAS_TEAM;
 USE SECONDARY ROLES ALL;
@@ -289,86 +319,91 @@ ORDER BY n;
 
 -- A6. Who reads the streams (once, before batch 1; read-only). B's timing rests on three streams being read where
 --     PROD's source shows it: the rating rows' stream once, at the start of the summary step; the trips' stream by
---     merge check, emptied by the two merge steps; the summary step's own stream on the trips, near its end. The
---     source I read holds the trip jobs' own procedures, not the ones they call. This lists every procedure in
---     DAAS_COMMON whose text names one of the three streams, and the called ones whether they name one or not.
---     Expect 'ok' on every row: the four I read, naming what the source shows, and the called ones naming none.
---     On a row with LOOK, or if the query fails, send me the result before batch 1.
-WITH listed AS (
-    SELECT DISTINCT UPPER(TRIM(SPLIT_PART(STORED_PROCEDURE_NAME, '.', -1))) AS PROCEDURE_NAME,
-           'called by the summary step, by transaction type' AS WHAT_IT_IS, 'N' AS TEXT_READ_BEFORE
-    FROM DAAS_PROD.DAAS_CORE.TRIP_SUMMARY_CONFIG
-    WHERE STORED_PROCEDURE_NAME IS NOT NULL AND (ACTIVE_FLG = 'Y' OR TRANSACTION_TYPE = 'PROPERTY_LST')
-    UNION ALL SELECT 'TRIP_DIGITAL_PLAY_PROC', 'called by the summary step', 'N'
-    UNION ALL SELECT 'TRIP_IDENTIFIER_PROC', 'called by the steps before merge check', 'N'
-    UNION ALL SELECT 'TRIP_FIND_START_DATE_END_DATE_PROC', 'called by the steps before merge check and by the merge steps', 'N'
-    UNION ALL SELECT 'TRIP_SUMMARY_WRAPPER_PROC', 'the summary step', 'Y'
-    UNION ALL SELECT 'TRIP_MERGE_CHECK_PROC', 'merge check', 'Y'
-    UNION ALL SELECT 'TRIP_MERGE_PROC', 'the merge step', 'Y'
-    UNION ALL SELECT 'TRIP_CUSTOMER_MERGE_PROC', 'the customer merge step', 'Y'
-),
-texts AS (
-    SELECT PROCEDURE_NAME, BODY IS NOT NULL AS READABLE,
-           COALESCE(CONTAINS(BODY, 'TRIP_DETAIL_SUMMARY_STREAM'), FALSE) AS RATING_ROWS_STREAM,
-           COALESCE(CONTAINS(BODY, 'TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'), FALSE) AS MERGE_CHECKS_STREAM,
-           COALESCE(CONTAINS(BODY, 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM'), FALSE) AS SUMMARY_STEPS_TRIP_STREAM
-    FROM (SELECT PROCEDURE_NAME, UPPER(PROCEDURE_DEFINITION) AS BODY
-          FROM DAAS_PROD.INFORMATION_SCHEMA.PROCEDURES
-          WHERE PROCEDURE_SCHEMA = 'DAAS_COMMON')
+--     merge check, emptied by the two merge steps; the summary step's own stream on the trips, near its end. I have
+--     read the trip jobs' own procedures and the two helpers the earlier steps call. This reads the nine the
+--     summary step calls: one per transaction type, and the digital-play one. Expect 'ok: names none of the three'
+--     on all nine. 13 Nov: the eight per transaction type name no stream at all; they work from the temp table the
+--     step fills from its stream (DAAS_TEMP.TRIP_DETAIL_TMP). The digital-play one reads the digital transactions'
+--     stream and the step's temp copy of its trip stream, a table named after the stream ('its temp copy only');
+--     I read its text in full. On a row with LOOK, or if the query fails, send me the result before batch 1.
+--     (It reads each text with GET_DDL, as A1 does: the catalogue view shows a procedure's text only to its owner.)
+WITH texts AS (
+    SELECT 'TRIP_RATING_SUMMARY_LOAD_PROC' AS PROCEDURE_NAME, UPPER(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_RATING_SUMMARY_LOAD_PROC()')) AS BODY
+    UNION ALL SELECT 'TRIP_HOTEL_SUMMARY_LOAD_PROC', UPPER(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_HOTEL_SUMMARY_LOAD_PROC()'))
+    UNION ALL SELECT 'TRIP_POS_SUMMARY_LOAD_PROC', UPPER(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_POS_SUMMARY_LOAD_PROC()'))
+    UNION ALL SELECT 'TRIP_OFFER_SUMMARY_LOAD_PROC', UPPER(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_OFFER_SUMMARY_LOAD_PROC()'))
+    UNION ALL SELECT 'TRIP_COMP_SUMMARY_LOAD_PROC', UPPER(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_COMP_SUMMARY_LOAD_PROC()'))
+    UNION ALL SELECT 'TRIP_MARKERS_SUMMARY_LOAD_PROC', UPPER(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_MARKERS_SUMMARY_LOAD_PROC()'))
+    UNION ALL SELECT 'TRIP_FREEPLAY_SUMMARY_LOAD_PROC', UPPER(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_FREEPLAY_SUMMARY_LOAD_PROC()'))
+    UNION ALL SELECT 'TRIP_SUMMARY_PROPERTY_LIST_LOAD_PROC', UPPER(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_SUMMARY_PROPERTY_LIST_LOAD_PROC()'))
+    UNION ALL SELECT 'TRIP_DIGITAL_PLAY_PROC', UPPER(GET_DDL('PROCEDURE', 'DAAS_PROD.DAAS_COMMON.TRIP_DIGITAL_PLAY_PROC(FLOAT, VARCHAR, VARCHAR, VARCHAR, VARCHAR)'))
 )
-SELECT COALESCE(l.PROCEDURE_NAME, t.PROCEDURE_NAME) AS procedure_name,
-       COALESCE(l.WHAT_IT_IS, 'not one of the trip jobs'' procedures I know of') AS what_it_is,
-       IFF(t.RATING_ROWS_STREAM, 'names it', '-') AS rating_rows_stream,
-       IFF(t.MERGE_CHECKS_STREAM, 'names it', '-') AS merge_checks_stream,
-       IFF(t.SUMMARY_STEPS_TRIP_STREAM, 'names it', '-') AS summary_steps_trip_stream,
-       CASE WHEN t.PROCEDURE_NAME IS NULL THEN 'LOOK: this role does not see it in DAAS_COMMON'
-            WHEN NOT t.READABLE THEN 'LOOK: this role cannot read its text'
-            WHEN l.TEXT_READ_BEFORE = 'Y' THEN 'ok: as read in the source'
-            WHEN l.PROCEDURE_NAME IS NOT NULL AND NOT (t.RATING_ROWS_STREAM OR t.MERGE_CHECKS_STREAM OR t.SUMMARY_STEPS_TRIP_STREAM) THEN 'ok: names none of the three'
-            ELSE 'LOOK: send me this row'
+SELECT PROCEDURE_NAME AS procedure_name, LENGTH(BODY) AS characters_read,
+       IFF(CONTAINS(BODY, 'TRIP_DETAIL_SUMMARY_STREAM'), 'names it', '-') AS rating_rows_stream,
+       IFF(CONTAINS(BODY, 'TRIP_MASTER_TRIP_MERGE_CHECK_STREAM'), 'names it', '-') AS merge_checks_stream,
+       CASE WHEN REGEXP_COUNT(BODY, 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM')
+                 > REGEXP_COUNT(BODY, 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM_TEMP') THEN 'names it'
+            WHEN CONTAINS(BODY, 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM_TEMP') THEN 'its temp copy only'
+            ELSE '-' END AS summary_steps_trip_stream,
+       REGEXP_COUNT(BODY, '_STREAM') AS times_the_word_stream_is_in_a_name,
+       CASE WHEN COALESCE(LENGTH(BODY), 0) < 500 THEN 'LOOK: its text did not come back'
+            WHEN CONTAINS(BODY, 'TRIP_DETAIL_SUMMARY_STREAM')
+                 OR CONTAINS(BODY, 'TRIP_MASTER_TRIP_MERGE_CHECK_STREAM')
+                 OR REGEXP_COUNT(BODY, 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM')
+                    > REGEXP_COUNT(BODY, 'TRIP_MASTER_DAILY_SUMMARY_WRAPPER_STREAM_TEMP') THEN 'LOOK: send me this row'
+            ELSE 'ok: names none of the three'
        END AS verdict
-FROM listed l
-FULL OUTER JOIN texts t ON t.PROCEDURE_NAME = l.PROCEDURE_NAME
-WHERE l.PROCEDURE_NAME IS NOT NULL OR t.RATING_ROWS_STREAM OR t.MERGE_CHECKS_STREAM OR t.SUMMARY_STEPS_TRIP_STREAM
-ORDER BY COALESCE(l.TEXT_READ_BEFORE, 'A'), COALESCE(l.PROCEDURE_NAME, t.PROCEDURE_NAME);
+FROM texts
+ORDER BY PROCEDURE_NAME;
 
 
 -- ===================================================================================================
 -- B. The batch statement. Run it once as it is (a dry run), then once for each batch, 1 to 7.
 -- ===================================================================================================
+-- 14 Nov: batches 1 and 2 are done; 3 to 7 are the main batches. Their rating rows' call is the long one, about
+-- 20 minutes against batch 1's 3, because it rewrites nearly the whole table. So B now starts a batch only with
+-- v_need minutes (30) left before the next :15 Pacific, in a summary step as well as after it: the call has to
+-- end, and the trips be called, before the next run starts. That is the one change to B since it called batches
+-- 1 and 2: a check before anything is called, and v_need at 30 where it was 15.
+-- When to start: run the dry run. Its 'timing' row says whether a batch started at that moment would go. Two
+-- moments do. A run in its summary step with 30 minutes left to :15: seldom in an ordinary hour, whose summary
+-- step starts around :45. Or an idle chain between :25 and :45: that is what a run still going at :15 leaves
+-- behind when it ends, because that start is skipped. A run that carries a batch is one of those.
+-- Not in the summary step of a run that is carrying a batch, even if the dry run would go: that step lasts an
+-- hour or two, B gives the trips up after v_max_wait (60 minutes), and the rating rows could then ride the next
+-- run alone. Let that run end, read PC1 and PC4 for its batch, then start the next.
 -- As it stands, v_batch is 0: the dry run. It runs every statement a real batch runs, with conditions that match
 -- no row: the checks, both calls, the look at the run between them. With nothing changed, that shows this role
 -- may call the procedure, that the procedure may update both tables and read both lists, and that the statement
 -- runs here. Expect 'dry run ok' on the last row. Its 'timing' row says what a real batch would do if it were
 -- started at that moment.
--- For a batch, set v_batch and start it when C1 shows TRIP_SUMMARY_WRAPPER in progress for 3 minutes or more
--- (on 13 Nov that was from :46 and from :51 past the hour). It calls the rating rows at once, waits for the
--- summary step to finish, calls the trips and returns. It is one statement and stays running until then (the
--- step took 16 and 40 minutes on 13 Nov), so leave the worksheet open. If it is cut off while it waits, nothing
--- is half done: the rating rows are in, the trips are not, and it is run again in the next run's summary step.
--- If the worksheet loses the result, C2 says where the batch stands: 'next' means the trips are not in, 'called'
--- means both calls are. Started when the summary step is already over, it makes both calls at once if :15 is at
--- least 15 minutes off.
+-- For a batch, set v_batch and start it when the dry run says a batch would go. In a summary step it calls the
+-- rating rows at once, waits for the step to finish, calls the trips and returns; started after the summary
+-- step, it makes both calls at once. It is one statement and stays running until then, so leave the worksheet
+-- open. If it is cut off while it waits, nothing is half done: the rating rows are in, the trips are not, and it
+-- is run again. Running it again calls the rating rows again, which is harmless but, for a main batch, another
+-- 20 minutes of rewriting. If the worksheet loses the result, C2 says where the batch stands: 'next' means the
+-- trips are not in, 'called' means both calls are.
 -- The procedure's updates run on this session's warehouse (the first row names it): use the largest this role
 -- may use.
 -- Read the rows it returns top to bottom. The last one says how it ended:
---   called        both calls are in, ahead of the run that carries the batch. Next: when C1 shows that run in
---                 its summary step, C2; then the next batch
---   WAIT          nothing was called: the run has not reached its summary step, or the step is over and :15 is
---                 under 15 minutes away or under 10 minutes past. Run it again later
+--   called        both calls are in, ahead of the run that carries the batch. Next: C2 when C1 shows that run in
+--                 its summary step; PC1 and PC4 when it has ended; then the next batch
+--   WAIT          nothing was called: the run has not reached its summary step, or :15 is under 30 minutes
+--                 away, or the run is over and :15 is under 10 minutes past. Run it again later
 --   STOP          the row says why: a batch out of turn, a batch already through, a call the procedure refused,
---                 or the rating rows in and the trips not (harmless: run it again in the next summary step)
+--                 or the rating rows in and the trips not (harmless: run it again when the dry run would go)
 --   LOOK          the trips went in late or unconfirmed; the row says what to check
 -- The limit it gives the procedure is the number of rows listed for the batch, so a call can never update more
 -- than its list. v_ticket is what the procedure writes on the rows and in its log; change it if the replay has
 -- a ticket of its own. v_need, v_need_trips and v_max_wait are the margins, in minutes. Each run reports how long
 -- its calls took: keep v_need_trips two minutes or more above the trips' call time, and v_need five above both
--- calls' time. Go by a main batch's times for that: batch 1's are a floor.
+-- calls' time. Batch 3 gives the first main batch's times.
 EXECUTE IMMEDIATE $$
 DECLARE
     v_batch      INTEGER DEFAULT 0;              -- <<< 0: the dry run. Then 1, 2 ... 7: the batch to call
     v_ticket     VARCHAR DEFAULT 'DAASI-3641';   -- the procedure writes it on every row it updates and in its log
-    v_need       INTEGER DEFAULT 15;             -- started after the summary step: minutes that must be left before the next :15 Pacific
+    v_need       INTEGER DEFAULT 30;             -- minutes that must be left before the next :15 Pacific when a batch is started
     v_need_trips INTEGER DEFAULT 4;              -- minutes that must still be left before :15 when the trips are called
     v_max_wait   INTEGER DEFAULT 60;             -- minutes it waits for the summary step to finish before it gives the trips up
     v_log        VARCHAR DEFAULT '';
@@ -434,7 +469,9 @@ BEGIN
     IF (v_batch = 0) THEN
         v_log := v_log || 'timing~|~info~|~a real batch started now would '
                        || IFF(STARTSWITH(v_phase, 'WAIT'), 'wait: this run has not taken its rows yet',
-                          IFF(STARTSWITH(v_phase, 'summary'), 'call the rating rows now and the trips when the summary step has finished',
+                          IFF(STARTSWITH(v_phase, 'summary'),
+                              IFF(v_left < v_need, 'wait: the run is in its summary step, but :15 is too close for the rating rows call',
+                                  'call the rating rows now and the trips when the summary step has finished'),
                           IFF(v_left > 50 OR v_left < v_need, 'wait: the summary step is over and :15 is too close', 'make both calls now'))) || '#ROW#';
     ELSE
         IF (v_trips = 0) THEN
@@ -468,6 +505,12 @@ BEGIN
                                || ' are wanted for both calls). Nothing was called: run this again when the next run is in its summary step#ROW#';
                 RAISE stop_here;
             END IF;
+        ELSEIF (v_left < v_need) THEN
+            -- in the summary step: the rating rows call has to end, and the trips be called, before the next run starts
+            v_log := v_log || 'timing~|~WAIT~|~the run is in its summary step, but only ' || v_left || ' minutes are left to the next :15 Pacific (' || v_need
+                           || ' are wanted, so that the rating rows call ends before it). Nothing was called: run this again after :15 if the summary step '
+                           || 'is still going then, or when the run has finished#ROW#';
+            RAISE stop_here;
         END IF;
     END IF;
 
@@ -667,29 +710,155 @@ WHERE j.JOB_NAME LIKE 'TRIP%'
   AND b.BATCH_START_DATE >= DATEADD(hour, -3, CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ)
 ORDER BY e.BATCH_ID;
 
--- C4. (Once, before batch 3; read-only.) The yardstick: one row per hourly run from 11 Nov noon to 12 Nov noon
---     Pacific, with the minutes of the run and of its four heavy steps. The run that re-cut 141,228 trips on its
---     own when v1.4 went live is the row with the long merge step. Its summary and comp worth minutes, and the
---     next row's, are what a run of about a main batch's size cost the trip jobs (as many transaction rows,
---     twice the trips). Send me those rows with batch 2's result, before batch 3.
-SELECT r.RUN_STARTED AS run_started_pacific,
-       ROUND(DATEDIFF(second, r.RUN_STARTED, MAX(r.ENDED)) / 60, 1)   AS run_minutes,
-       ROUND(SUM(IFF(r.JOB_NAME = 'TRIP_MERGE_CHECK', r.SECONDS, 0)) / 60, 1)     AS merge_check_minutes,
-       ROUND(SUM(IFF(r.JOB_NAME = 'TRIP_MERGE', r.SECONDS, 0)) / 60, 1)           AS merge_minutes,
-       ROUND(SUM(IFF(r.JOB_NAME = 'TRIP_SUMMARY_WRAPPER', r.SECONDS, 0)) / 60, 1) AS summary_minutes,
-       ROUND(SUM(IFF(r.JOB_NAME = 'TRIP_COMP_WORTH', r.SECONDS, 0)) / 60, 1)      AS comp_worth_minutes,
-       COUNT_IF(r.BATCH_STATUS <> 'SUCCESS')                                  AS steps_not_at_success
-FROM (SELECT j.JOB_NAME, b.BATCH_STATUS, COALESCE(b.BATCH_END_DATE, b.UPDATED_DTTM) AS ENDED,
-             DATEDIFF(second, b.BATCH_START_DATE, COALESCE(b.BATCH_END_DATE, b.UPDATED_DTTM)) AS SECONDS,
-             MAX(IFF(j.JOB_NAME = 'TRIP_FILTERED_TXNS', b.BATCH_START_DATE, NULL))
-                 OVER (ORDER BY b.BATCH_START_DATE ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RUN_STARTED
-      FROM DAAS_PROD.DAAS_COMMON.BATCH_S02 b
-      JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
-      WHERE j.JOB_NAME LIKE 'TRIP%'
-        AND b.BATCH_START_DATE >= '2026-11-11 12:00' AND b.BATCH_START_DATE < '2026-11-12 12:00') r
-WHERE r.RUN_STARTED IS NOT NULL
-GROUP BY r.RUN_STARTED
-ORDER BY r.RUN_STARTED;
+-- C4. (Read-only.) The runs since 11 Nov noon Pacific, one row each: the minutes of the run and of its four heavy
+--     steps, and what the summary step wrote, by its own counts in the batch log (trip summaries and daily
+--     summaries, inserted and updated). The rows that matter most: the run of 11 Nov that re-cut 141,228 trips on
+--     its own when v1.4 went live (the long merge step), and the runs that carried a batch (started 13 Nov 22:15
+--     and 14 Nov 07:15). Minutes against rows written says whether the summary step's time follows the amount it
+--     summarises. A row an hour: please download the result and attach it.
+WITH runs AS (
+    SELECT r.RUN_STARTED,
+           ROUND(DATEDIFF(second, r.RUN_STARTED, MAX(r.ENDED)) / 60, 1)   AS RUN_MINUTES,
+           ROUND(SUM(IFF(r.JOB_NAME = 'TRIP_MERGE_CHECK', r.SECONDS, 0)) / 60, 1)     AS MERGE_CHECK_MINUTES,
+           ROUND(SUM(IFF(r.JOB_NAME = 'TRIP_MERGE', r.SECONDS, 0)) / 60, 1)           AS MERGE_MINUTES,
+           ROUND(SUM(IFF(r.JOB_NAME = 'TRIP_SUMMARY_WRAPPER', r.SECONDS, 0)) / 60, 1) AS SUMMARY_MINUTES,
+           ROUND(SUM(IFF(r.JOB_NAME = 'TRIP_COMP_WORTH', r.SECONDS, 0)) / 60, 1)      AS COMP_WORTH_MINUTES,
+           COUNT_IF(r.BATCH_STATUS <> 'SUCCESS')                                  AS STEPS_NOT_AT_SUCCESS,
+           MAX(IFF(r.JOB_NAME = 'TRIP_SUMMARY_WRAPPER', r.BATCH_ID, NULL))        AS SUMMARY_BATCH_ID
+    FROM (SELECT j.JOB_NAME, b.BATCH_ID, b.BATCH_STATUS, COALESCE(b.BATCH_END_DATE, b.UPDATED_DTTM) AS ENDED,
+                 DATEDIFF(second, b.BATCH_START_DATE, COALESCE(b.BATCH_END_DATE, b.UPDATED_DTTM)) AS SECONDS,
+                 MAX(IFF(j.JOB_NAME = 'TRIP_FILTERED_TXNS', b.BATCH_START_DATE, NULL))
+                     OVER (ORDER BY b.BATCH_START_DATE ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RUN_STARTED
+          FROM DAAS_PROD.DAAS_COMMON.BATCH_S02 b
+          JOIN DAAS_PROD.DAAS_COMMON.JOB j ON j.JOB_ID = b.JOB_ID
+          WHERE j.JOB_NAME LIKE 'TRIP%' AND b.BATCH_START_DATE >= '2026-11-11 12:00') r
+    WHERE r.RUN_STARTED IS NOT NULL
+    GROUP BY r.RUN_STARTED
+),
+m AS (
+    SELECT BATCH_ID,
+           MAX(IFF(LOWER(BATCH_METRIC_CD) = 'summary_insert_count', TRY_TO_NUMBER(BATCH_METRIC_VALUE::VARCHAR), NULL)) AS TRIP_SUMMARIES_INSERTED,
+           MAX(IFF(LOWER(BATCH_METRIC_CD) = 'summary_update_count', TRY_TO_NUMBER(BATCH_METRIC_VALUE::VARCHAR), NULL)) AS TRIP_SUMMARIES_UPDATED,
+           MAX(IFF(LOWER(BATCH_METRIC_CD) = 'daily_summary_insert_count', TRY_TO_NUMBER(BATCH_METRIC_VALUE::VARCHAR), NULL)) AS DAILY_SUMMARIES_INSERTED,
+           MAX(IFF(LOWER(BATCH_METRIC_CD) = 'daily_summary_update_count', TRY_TO_NUMBER(BATCH_METRIC_VALUE::VARCHAR), NULL)) AS DAILY_SUMMARIES_UPDATED
+    FROM DAAS_PROD.DAAS_COMMON.BATCH_METRICS_S02
+    WHERE BATCH_ID IN (SELECT SUMMARY_BATCH_ID FROM runs)
+    GROUP BY BATCH_ID
+)
+SELECT runs.RUN_STARTED AS run_started_pacific, runs.RUN_MINUTES AS run_minutes, runs.MERGE_CHECK_MINUTES AS merge_check_minutes,
+       runs.MERGE_MINUTES AS merge_minutes, runs.SUMMARY_MINUTES AS summary_minutes, runs.COMP_WORTH_MINUTES AS comp_worth_minutes,
+       runs.STEPS_NOT_AT_SUCCESS AS steps_not_at_success, runs.SUMMARY_BATCH_ID AS summary_batch_id,
+       m.TRIP_SUMMARIES_INSERTED AS trip_summaries_inserted,
+       m.TRIP_SUMMARIES_UPDATED AS trip_summaries_updated,
+       m.DAILY_SUMMARIES_INSERTED AS daily_summaries_inserted,
+       m.DAILY_SUMMARIES_UPDATED AS daily_summaries_updated
+FROM runs
+LEFT JOIN m ON m.BATCH_ID = runs.SUMMARY_BATCH_ID
+ORDER BY runs.RUN_STARTED;
+
+-- C5. (Read-only; now, before batch 3.) Where the 81.6 minutes went: the statements of the summary step that
+--     carried batch 2, a minute or longer, in the order they ran, with the partitions each scanned. The step's
+--     batch id is the start of its query tag: 48016798 here, from C1. (Batch 1's step was 48007498, and took 94.7.)
+--     The INSERT INTO DAAS_TEMP.TRIP_DETAIL_TMP line is the read of the rating rows' stream; the CALL lines are
+--     the procedures per transaction type, each over its own statements, and the digital-play procedure. For a
+--     later batch, put in the batch id C1 shows for that run's TRIP_SUMMARY_WRAPPER. The account's query history
+--     can run 45 minutes behind.
+SELECT TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', q.START_TIME), 'DD HH24:MI:SS') AS started_pacific,
+       ROUND(q.TOTAL_ELAPSED_TIME / 60000, 1) AS minutes,
+       q.WAREHOUSE_SIZE AS warehouse_size,
+       q.PARTITIONS_SCANNED AS partitions_scanned, q.PARTITIONS_TOTAL AS partitions_total,
+       ROUND(q.BYTES_SCANNED / 1073741824, 1) AS gb_scanned,
+       q.ROWS_PRODUCED AS rows_produced,
+       q.QUERY_TAG AS query_tag,
+       REPLACE(REPLACE(LEFT(q.QUERY_TEXT, 220), CHAR(10), ' '), CHAR(9), ' ') AS statement
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q
+WHERE q.QUERY_TAG LIKE '48016798%'
+  AND q.START_TIME >= '2026-11-13'
+  AND q.TOTAL_ELAPSED_TIME >= 60000
+ORDER BY q.START_TIME;
+
+-- C6. (Read-only.) Every summary step since 11 Nov noon, one row each: what its read of the rating rows' stream
+--     cost (minutes, micro-partitions, GB, changed rows found), and the minutes of the procedures per
+--     transaction type and of the digital-play procedure. It shows what that read costs on an ordinary hour, after
+--     the nightly archival, and in the run of 11 Nov that re-cut 141,228 trips. About 45 rows: please download
+--     the result and attach it.
+SELECT SPLIT_PART(q.QUERY_TAG, '_', 1) AS summary_batch_id,
+       TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', MIN(q.START_TIME)), 'YYYY-MM-DD HH24:MI') AS step_started_pacific,
+       ROUND(MAX(IFF(q.QUERY_TEXT ILIKE '%INSERT INTO DAAS_TEMP.TRIP_DETAIL_TMP%', q.TOTAL_ELAPSED_TIME, NULL)) / 60000, 1) AS stream_read_minutes,
+       MAX(IFF(q.QUERY_TEXT ILIKE '%INSERT INTO DAAS_TEMP.TRIP_DETAIL_TMP%', q.PARTITIONS_SCANNED, NULL)) AS stream_read_partitions,
+       ROUND(MAX(IFF(q.QUERY_TEXT ILIKE '%INSERT INTO DAAS_TEMP.TRIP_DETAIL_TMP%', q.BYTES_SCANNED, NULL)) / 1073741824, 1) AS stream_read_gb,
+       MAX(IFF(q.QUERY_TEXT ILIKE '%INSERT INTO DAAS_TEMP.TRIP_DETAIL_TMP%', q.ROWS_PRODUCED, NULL)) AS changed_rows_found,
+       ROUND(SUM(IFF(q.QUERY_TEXT ILIKE 'CALL DAAS_COMMON.TRIP_%SUMMARY%LOAD_PROC()%', q.TOTAL_ELAPSED_TIME, 0)) / 60000, 1) AS per_type_procedures_minutes,
+       ROUND(SUM(IFF(q.QUERY_TEXT ILIKE 'CALL DAAS_COMMON.TRIP_DIGITAL_PLAY_PROC%', q.TOTAL_ELAPSED_TIME, 0)) / 60000, 1) AS digital_play_minutes,
+       MAX(q.WAREHOUSE_SIZE) AS warehouse_size
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q
+WHERE q.START_TIME >= '2026-11-11 12:00'
+  AND ENDSWITH(q.QUERY_TAG, '_TRIP_SUMMARY_WRAPPER_PROC')
+GROUP BY SPLIT_PART(q.QUERY_TAG, '_', 1)
+ORDER BY 2;
+
+-- C7. (Read-only; now, before batch 3, and after each batch.) What the procedure's own updates did, a row each:
+--     how many micro-partitions the table has (partitions_total), how long the update took (seconds), and how much
+--     it read and wrote again (gb_written). Batch 1's two rows gave the table's size and how far a batch's rows
+--     are scattered. Batch 2's give the time for two thirds of the table; a main batch's rating rows write about
+--     half as much again, and its trips the same as batch 2's (nearly all of TRIP_MASTER either way).
+SELECT TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', q.START_TIME), 'DD HH24:MI:SS') AS started_pacific,
+       IFF(q.QUERY_TEXT ILIKE '%DAAS_CORE.TRIP_DETAIL %', 'TRIP_DETAIL', 'TRIP_MASTER') AS table_updated,
+       q.ROWS_UPDATED AS rows_updated,
+       ROUND(q.TOTAL_ELAPSED_TIME / 1000) AS seconds,
+       q.PARTITIONS_SCANNED AS partitions_scanned, q.PARTITIONS_TOTAL AS partitions_total,
+       ROUND(q.BYTES_SCANNED / 1073741824, 1) AS gb_scanned,
+       ROUND(q.BYTES_WRITTEN / 1073741824, 1) AS gb_written,
+       q.WAREHOUSE_SIZE AS warehouse_size
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q
+WHERE q.START_TIME >= '2026-11-13'
+  AND q.QUERY_TYPE = 'UPDATE'
+  AND q.QUERY_TEXT ILIKE 'UPDATE DAAS_CORE.TRIP_%REPLAY_COUNTER%DAASI_3641_REPLAY_%'
+  AND q.ROWS_UPDATED > 0
+ORDER BY q.START_TIME;
+
+-- C8. (Read-only.) The big reads of the rating rows' stream side by side: for each, the minutes it spent waiting
+--     for the warehouse, blocked by a lock, compiling and running, how much it read from the warehouse's cache,
+--     what it spilled to disk, and what else ran on that warehouse meanwhile. Two rows are a pair: the run after
+--     the archival step on 12 Nov (14.8 minutes, no batch) and on 13 Nov (44.6 minutes, with batch 1), the same
+--     266 GB both times. What differs between those two rows is why batch 1's run was slow.
+WITH reads AS (
+    SELECT q.QUERY_ID, SPLIT_PART(q.QUERY_TAG, '_', 1) AS SUMMARY_BATCH_ID, q.WAREHOUSE_NAME, q.START_TIME, q.END_TIME,
+           q.TOTAL_ELAPSED_TIME, q.COMPILATION_TIME, q.EXECUTION_TIME, q.TRANSACTION_BLOCKED_TIME,
+           q.QUEUED_OVERLOAD_TIME + q.QUEUED_PROVISIONING_TIME + q.QUEUED_REPAIR_TIME AS QUEUED_TIME,
+           q.BYTES_SCANNED, q.PERCENTAGE_SCANNED_FROM_CACHE, q.BYTES_SPILLED_TO_LOCAL_STORAGE, q.BYTES_SPILLED_TO_REMOTE_STORAGE
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q
+    WHERE q.START_TIME >= '2026-11-11 12:00'
+      AND ENDSWITH(q.QUERY_TAG, '_TRIP_SUMMARY_WRAPPER_PROC')
+      AND q.QUERY_TEXT ILIKE '%INSERT INTO DAAS_TEMP.TRIP_DETAIL_TMP%'
+      AND q.BYTES_SCANNED / 1073741824 >= 50
+)
+SELECT r.SUMMARY_BATCH_ID AS summary_batch_id,
+       TO_VARCHAR(CONVERT_TIMEZONE('America/Los_Angeles', r.START_TIME), 'YYYY-MM-DD HH24:MI') AS started_pacific,
+       r.WAREHOUSE_NAME AS warehouse_name,
+       ROUND(r.BYTES_SCANNED / 1073741824, 1)                     AS gb_read,
+       ROUND(r.TOTAL_ELAPSED_TIME / 60000, 1)                     AS minutes_in_all,
+       ROUND(r.QUEUED_TIME / 60000, 1)                            AS minutes_waiting_for_the_warehouse,
+       ROUND(r.TRANSACTION_BLOCKED_TIME / 60000, 1)               AS minutes_blocked_by_a_lock,
+       ROUND(r.COMPILATION_TIME / 60000, 1)                       AS minutes_compiling,
+       ROUND(r.EXECUTION_TIME / 60000, 1)                         AS minutes_running,
+       ROUND(r.PERCENTAGE_SCANNED_FROM_CACHE * 100)               AS percent_read_from_the_warehouse_cache,
+       ROUND(r.BYTES_SPILLED_TO_LOCAL_STORAGE / 1073741824, 1)    AS gb_spilled_to_local_disk,
+       ROUND(r.BYTES_SPILLED_TO_REMOTE_STORAGE / 1073741824, 1)   AS gb_spilled_to_remote_storage,
+       COUNT(o.QUERY_ID)                                          AS other_statements_on_the_warehouse_meanwhile,
+       ROUND(COALESCE(SUM(DATEDIFF(second, GREATEST(o.START_TIME, r.START_TIME), LEAST(o.END_TIME, r.END_TIME))), 0) / 60, 1)
+                                                                  AS their_minutes_meanwhile
+FROM reads r
+LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY o
+       ON o.WAREHOUSE_NAME = r.WAREHOUSE_NAME
+      AND o.QUERY_ID <> r.QUERY_ID
+      AND o.START_TIME >= '2026-11-11'
+      AND o.START_TIME < r.END_TIME
+      AND o.END_TIME > r.START_TIME
+      AND o.EXECUTION_TIME >= 1000
+GROUP BY r.QUERY_ID, r.SUMMARY_BATCH_ID, r.START_TIME, r.WAREHOUSE_NAME, r.BYTES_SCANNED, r.TOTAL_ELAPSED_TIME, r.QUEUED_TIME, r.TRANSACTION_BLOCKED_TIME,
+         r.COMPILATION_TIME, r.EXECUTION_TIME, r.PERCENTAGE_SCANNED_FROM_CACHE, r.BYTES_SPILLED_TO_LOCAL_STORAGE, r.BYTES_SPILLED_TO_REMOTE_STORAGE
+ORDER BY r.START_TIME;
 
 
 -- ===================================================================================================
