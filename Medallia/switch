@@ -1,0 +1,91 @@
+-- DAASI-3811  Medallia Files - Add Luxury Experience Tag
+-- The evaluation the ticket asks for: would switching the hotel procedure from the original
+-- hotel reservations fact to the Coalesce version give the same results?
+-- Three read-only queries. Run in a PROD worksheet as DAAS_TEAM.
+--
+--   ORIGINAL         = DAAS_CORE_HOTEL_VW.HOTEL_GUEST_RESERVATIONS_FACT_VW  (what the Medallia procedures read today)
+--   COALESCE VERSION = DAAS_CORE_HOTEL.HOTEL_RESERVATIONS_VW                (where DAASI-3810 added LOYALTY)
+
+------------------------------------------------------------------------------------------------
+-- 1. Same reservations? Week by week.
+--    Takes the reservations the hotel procedure draws from (not cancelled, grouped by the week
+--    they checked out) and looks each one up in the Coalesce version.
+--      WOULD_BE_DROPPED = reservations a switch would remove from the survey file.
+--      WITH_A_TAG       = reservations that carry a Luxury Experience tag.
+--    The weeks of 10/05, 10/12 and 10/19 checked out before the Coalesce version stopped loading
+--    on 10/28, so they show its coverage when it was healthy. Later weeks show the stall.
+------------------------------------------------------------------------------------------------
+WITH COALESCE_VERSION AS (
+    SELECT PROPERTY_CD
+          ,RESERVATION_ID
+          ,MAX(NULLIF(TRIM(LOYALTY), '')) AS LOYALTY
+    FROM DAAS_PROD.DAAS_CORE_HOTEL.HOTEL_RESERVATIONS_VW
+    WHERE DELETE_IND = 'N'
+    GROUP BY 1, 2
+)
+,ORIGINAL AS (
+    SELECT DISTINCT PROPERTY_CD, RESERVATION_ID, DEPARTURE_DT
+    FROM DAAS_PROD.DAAS_CORE_HOTEL_VW.HOTEL_GUEST_RESERVATIONS_FACT_VW
+    WHERE DELETE_IND = 'N'
+      AND RESERVATION_STATUS_CD != 'X'
+      AND DEPARTURE_DT BETWEEN '2026-10-05'::DATE AND CURRENT_DATE - 1
+)
+SELECT DATE_TRUNC('WEEK', O.DEPARTURE_DT)::DATE              AS CHECKOUT_WEEK
+      ,COUNT(*)                                              AS RESERVATIONS_IN_ORIGINAL
+      ,COUNT(C.RESERVATION_ID)                               AS ALSO_IN_COALESCE_VERSION
+      ,COUNT(*) - COUNT(C.RESERVATION_ID)                    AS WOULD_BE_DROPPED
+      ,ROUND(100 * COUNT(C.RESERVATION_ID) / COUNT(*), 1)    AS PCT_KEPT
+      ,COUNT(C.LOYALTY)                                      AS WITH_A_TAG
+FROM ORIGINAL O
+LEFT JOIN COALESCE_VERSION C
+       ON C.PROPERTY_CD    = O.PROPERTY_CD
+      AND C.RESERVATION_ID = O.RESERVATION_ID
+GROUP BY 1
+ORDER BY 1;
+
+------------------------------------------------------------------------------------------------
+-- 2. Same fields?
+--    The three Medallia procedures read 18 fields from the original. This lists each one and
+--    whether the Coalesce version has a column of the same name.
+--    MISSING does not prove the information is absent (it may sit under another name), but it
+--    does mean a switch is more than changing the table name.
+------------------------------------------------------------------------------------------------
+SELECT P.COLUMN_NAME                                       AS FIELD_THE_PROCEDURES_READ
+      ,IFF(C.COLUMN_NAME IS NULL, 'MISSING', 'present')    AS IN_COALESCE_VERSION
+FROM (VALUES ('GUEST_UNIQUE_ID'), ('PROPERTY_CD'), ('RESERVATION_ID'), ('RESERVATION_STATUS_CD')
+            ,('ARRIVAL_DT'), ('DEPARTURE_DT'), ('CHECK_IN_DTTM'), ('CHECK_OUT_DTTM')
+            ,('CHECK_IN_AGENT'), ('CHECK_OUT_AGENT'), ('RESERVATIONS_AGENT'), ('DATE_RESERVATION_MADE')
+            ,('WING_CD'), ('ROOM_NBR'), ('ACCOMMODATION_TYPE'), ('RATE_PLAN'), ('ROOM_RT'), ('GROUP_CD')
+     ) AS P (COLUMN_NAME)
+LEFT JOIN DAAS_PROD.INFORMATION_SCHEMA.COLUMNS C
+       ON C.TABLE_SCHEMA = 'DAAS_CORE_HOTEL'
+      AND C.TABLE_NAME   = 'HOTEL_RESERVATIONS_VW'
+      AND C.COLUMN_NAME  = P.COLUMN_NAME
+ORDER BY 2, 1;
+
+------------------------------------------------------------------------------------------------
+-- 3. The other direction. Does the Coalesce version hold any reservation the original lacks?
+--    That is the only thing union logic could add over a plain left join from the original.
+--      NOT_IN_ORIGINAL            = reservations found only in the Coalesce version.
+--      TAGGED_AND_NOT_IN_ORIGINAL = tagged reservations a left join from the original would miss.
+------------------------------------------------------------------------------------------------
+WITH ORIGINAL AS (
+    SELECT DISTINCT PROPERTY_CD, RESERVATION_ID
+    FROM DAAS_PROD.DAAS_CORE_HOTEL_VW.HOTEL_GUEST_RESERVATIONS_FACT_VW
+)
+,COALESCE_VERSION AS (
+    SELECT PROPERTY_CD
+          ,RESERVATION_ID
+          ,MAX(NULLIF(TRIM(LOYALTY), '')) AS LOYALTY
+    FROM DAAS_PROD.DAAS_CORE_HOTEL.HOTEL_RESERVATIONS_VW
+    WHERE DELETE_IND = 'N'
+      AND ARRIVAL_DT BETWEEN '2026-10-05'::DATE AND CURRENT_DATE - 1
+    GROUP BY 1, 2
+)
+SELECT COUNT(*)                                                       AS RESERVATIONS_IN_COALESCE_VERSION
+      ,COUNT_IF(O.RESERVATION_ID IS NULL)                             AS NOT_IN_ORIGINAL
+      ,COUNT_IF(O.RESERVATION_ID IS NULL AND C.LOYALTY IS NOT NULL)   AS TAGGED_AND_NOT_IN_ORIGINAL
+FROM COALESCE_VERSION C
+LEFT JOIN ORIGINAL O
+       ON O.PROPERTY_CD    = C.PROPERTY_CD
+      AND O.RESERVATION_ID = C.RESERVATION_ID;
