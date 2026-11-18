@@ -1,0 +1,122 @@
+-- DAASI-3811  Medallia Files - Add Luxury Experience Tag
+-- SAMPLE FILES FOR MARLENE (acceptance criterion 3).
+--
+-- Builds both files as they will look after the change, from a day that has already been sent: that
+-- day's archived rows, in file column order, plus the new LOYALTY column from the same lookup the
+-- procedures use. Nothing has to be deployed first, and no production table or task is touched.
+-- The files are written with the same format options as the daily export (pipe-delimited, header row,
+-- no quotes, empty for NULL).
+--
+-- THESE FILES HOLD GUEST NAMES, EMAIL ADDRESSES AND PHONE NUMBERS.
+-- Move them only the way the daily files move. Do not attach them to the ticket or paste rows into a chat.
+-- (If your role sees masked values in the archive tables, the samples will hold the masked values.)
+--
+-- What to tell Marlene: one new column, LOYALTY, at the end of both files. It holds LUX on Luxury
+-- Experience hotel stays and is empty on every other row. No existing column moves or changes.
+
+
+-- 1. Pick the day for each file. Run PROOF 1 in validation/2_ticket_proof.sql and take the newest
+--    FILE_DATE where ROWS_THAT_GET_LUX is above 0, so the sample shows real LUX values.
+SET INVITATION_FILE_DATE = '2026-11-16';
+SET PROSPECT_FILE_DATE   = '2026-11-16';
+
+
+-- 2. What the two samples will hold. ROWS_WITH_LUX should be above 0 for the days you picked.
+SELECT 'Invitation sample' AS SAMPLE_FILE, COUNT(*) AS ROW_COUNT, COUNT(LUX.LOYALTY) AS ROWS_WITH_LUX
+    FROM DAAS_PROD.DAAS_CORE.MEDALLIA_V_CUSTOMER_INVITATION_ARCHIVE A
+    LEFT JOIN (
+        SELECT PROPERTY_CD, RESERVATION_ID, MAX(TRIM(LOYALTY)) AS LOYALTY
+        FROM DAAS_PROD.DAAS_CORE_HOTEL.LMS73_HOTEL_RESERVATIONS_FACT
+        WHERE DELETE_IND = 'N'
+        AND TRIM(LOYALTY) IN ('LUX')
+        GROUP BY PROPERTY_CD, RESERVATION_ID
+    ) LUX
+        ON LUX.PROPERTY_CD = A.UNIT_ID
+        AND LUX.RESERVATION_ID = TRY_TO_NUMBER(A.RESERVATION_NUMBER)
+    WHERE A.SNOWFLAKE_CREATED_DT = (SELECT MAX(SNOWFLAKE_CREATED_DT)
+                                    FROM DAAS_PROD.DAAS_CORE.MEDALLIA_V_CUSTOMER_INVITATION_ARCHIVE
+                                    WHERE TO_DATE(SNOWFLAKE_CREATED_DT) = TO_DATE($INVITATION_FILE_DATE))
+UNION ALL
+SELECT 'Prospect sample', COUNT(*), COUNT(LUX.LOYALTY)
+    FROM DAAS_PROD.HPDB.MEDALLIA_PROSPECT_INVITATION_FILE_ARCHIVE A
+    LEFT JOIN (
+        SELECT PROPERTY_CD, RESERVATION_ID, MAX(TRIM(LOYALTY)) AS LOYALTY
+        FROM DAAS_PROD.DAAS_CORE_HOTEL.LMS73_HOTEL_RESERVATIONS_FACT
+        WHERE DELETE_IND = 'N'
+        AND TRIM(LOYALTY) IN ('LUX')
+        GROUP BY PROPERTY_CD, RESERVATION_ID
+    ) LUX
+        ON LUX.PROPERTY_CD = A.UNIT_ID
+        AND LUX.RESERVATION_ID = TRY_TO_NUMBER(A.RESERVATION_NUMBER)
+    WHERE A.CREATED_DTTM = (SELECT MAX(CREATED_DTTM)
+                            FROM DAAS_PROD.HPDB.MEDALLIA_PROSPECT_INVITATION_FILE_ARCHIVE
+                            WHERE TO_DATE(CREATED_DTTM) = TO_DATE($PROSPECT_FILE_DATE));
+
+
+-- 3. Write the two files to your own user stage, a private Snowflake file area nothing else reads.
+--    Do not point these at @DAAS_EXT_STG_OUTBOUND/Medallia/: that is where the real daily files are
+--    picked up. If Andrew sent Marlene an ORIGIN_UNIT_ID sample earlier this month, the location he
+--    used is the better choice; swap it in for @~/DAASI-3811/.
+COPY INTO @~/DAASI-3811/CaesarsCustomerInvitation_SAMPLE.csv
+FROM (
+    SELECT A.TRANSACTION_ID, A.TRANSACTION_DATE, A.PROPERTY_MARKET_CD, A.UNIT_ID, A.ORIGIN_UNIT_ID,
+           A.CLUBCARD_YN, A.CUSTOMER_ID, A.GUEST_ID, A.PROP_ID, A.FIRST_NAME, A.LAST_NAME, A.GENDER,
+           A.EMAIL_ADDRESS, A.PHONE_NUMBER, A.AGE, A.CITY_NAME, A.STATE_PROVINCE_CODE, A.ZIP_CODE,
+           A.ZIP_PLUS_4, A.TIER_CODE, A.HOTEL_FLAG, A.CASINO_FLAG, A.ROOM_NUMBER, A.RESERVATION_NUMBER,
+           A.ROOM_TYPE_BOOKED, A.ROOM_TYPE_RECEIVED, A.RATE_PLAN_CD, A.RESERVATION_DATE, A.RESERVATION_AGENT,
+           A.CHECK_IN_DATE, A.CHECK_OUT_DATE, A.CHECKIN_AGENT_ID, A.CHECKOUT_AGENT_ID, A.WING_CD,
+           A.ROOM_BLOCK_CD, A.HOTEL_COMP_FLAG_YN, A.HOST_NAME, A.HOST_CODE, A.HOSTED_YN, A.ADR,
+           A.PROPERTY_WINLOSS, A.HOSP_POS_SPEND, A.ROOM_REV_AMT, A.THEO_AMT, A.D_ARRIVAL_DT, A.D_DEPARTURE_DT,
+           A.I_CHECKIN_HR, A.I_CHECKIN_MIN,
+           LUX.LOYALTY AS LOYALTY
+    FROM DAAS_PROD.DAAS_CORE.MEDALLIA_V_CUSTOMER_INVITATION_ARCHIVE A
+    LEFT JOIN (
+        SELECT PROPERTY_CD, RESERVATION_ID, MAX(TRIM(LOYALTY)) AS LOYALTY
+        FROM DAAS_PROD.DAAS_CORE_HOTEL.LMS73_HOTEL_RESERVATIONS_FACT
+        WHERE DELETE_IND = 'N'
+        AND TRIM(LOYALTY) IN ('LUX')
+        GROUP BY PROPERTY_CD, RESERVATION_ID
+    ) LUX
+        ON LUX.PROPERTY_CD = A.UNIT_ID
+        AND LUX.RESERVATION_ID = TRY_TO_NUMBER(A.RESERVATION_NUMBER)
+    WHERE A.SNOWFLAKE_CREATED_DT = (SELECT MAX(SNOWFLAKE_CREATED_DT)
+                                    FROM DAAS_PROD.DAAS_CORE.MEDALLIA_V_CUSTOMER_INVITATION_ARCHIVE
+                                    WHERE TO_DATE(SNOWFLAKE_CREATED_DT) = TO_DATE($INVITATION_FILE_DATE))
+)
+FILE_FORMAT = (TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY = 'NONE' COMPRESSION = NONE NULL_IF = '' FIELD_DELIMITER = '|' EMPTY_FIELD_AS_NULL = FALSE ENCODING = 'iso-8859-1')
+HEADER = TRUE SINGLE = TRUE MAX_FILE_SIZE = 5368709120 OVERWRITE = TRUE;
+
+COPY INTO @~/DAASI-3811/CaesarsProspectInvitation_SAMPLE.csv
+FROM (
+    SELECT A.TRANSACTION_ID, A.TRANSACTION_SOURCE_SYSTEM, A.TRANSACTION_DATE, A.PROPERTY_MARKET_CD, A.UNIT_ID,
+           A.ORIGIN_UNIT_ID, A.CLUBCARD_YN, A.PROSPECT_ID, A.GUEST_ID, A.PROP_ID, A.FIRST_NAME, A.LAST_NAME,
+           A.GENDER, A.EMAIL_ADDRESS, A.PHONE_NUMBER, A.AGE, A.CITY_NAME, A.STATE_PROVINCE_CODE, A.ZIP_CODE,
+           A.ZIP_PLUS_4, A.TIER_CODE, A.HOTEL_FLAG, A.CASINO_FLAG, A.ROOM_NUMBER, A.RESERVATION_NUMBER,
+           A.ROOM_TYPE_BOOKED, A.ROOM_TYPE_RECEIVED, A.RATE_PLAN_CD, A.RESERVATION_DATE, A.RESERVATION_AGENT,
+           A.CHECK_IN_DATE, A.CHECK_OUT_DATE, A.CHECKIN_AGENT_ID, A.CHECKOUT_AGENT_ID, A.WING_CD,
+           A.ROOM_BLOCK_CD, A.HOTEL_COMP_FLAG_YN, A.HOST_NAME, A.HOST_CODE, A.HOSTED_YN, A.ADR,
+           A.PROPERTY_WINLOSS, A.HOSP_POS_SPEND, A.ROOM_REV_AMT, A.THEO_AMT, A.D_ARRIVAL_DT, A.D_DEPARTURE_DT,
+           A.I_CHECKIN_HR, A.I_CHECKIN_MIN,
+           LUX.LOYALTY AS LOYALTY
+    FROM DAAS_PROD.HPDB.MEDALLIA_PROSPECT_INVITATION_FILE_ARCHIVE A
+    LEFT JOIN (
+        SELECT PROPERTY_CD, RESERVATION_ID, MAX(TRIM(LOYALTY)) AS LOYALTY
+        FROM DAAS_PROD.DAAS_CORE_HOTEL.LMS73_HOTEL_RESERVATIONS_FACT
+        WHERE DELETE_IND = 'N'
+        AND TRIM(LOYALTY) IN ('LUX')
+        GROUP BY PROPERTY_CD, RESERVATION_ID
+    ) LUX
+        ON LUX.PROPERTY_CD = A.UNIT_ID
+        AND LUX.RESERVATION_ID = TRY_TO_NUMBER(A.RESERVATION_NUMBER)
+    WHERE A.CREATED_DTTM = (SELECT MAX(CREATED_DTTM)
+                            FROM DAAS_PROD.HPDB.MEDALLIA_PROSPECT_INVITATION_FILE_ARCHIVE
+                            WHERE TO_DATE(CREATED_DTTM) = TO_DATE($PROSPECT_FILE_DATE))
+)
+FILE_FORMAT = (TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY = 'NONE' COMPRESSION = NONE NULL_IF = '' FIELD_DELIMITER = '|' EMPTY_FIELD_AS_NULL = FALSE ENCODING = 'iso-8859-1')
+HEADER = TRUE SINGLE = TRUE MAX_FILE_SIZE = 5368709120 OVERWRITE = TRUE;
+
+
+-- 4. See the files, then fetch them.
+LIST @~/DAASI-3811/;
+-- GET @~/DAASI-3811/ file://C:/temp/DAASI-3811/;     -- from SnowSQL or the Snowflake CLI; GET does not run in a Snowsight worksheet
+-- REMOVE @~/DAASI-3811/;                             -- once Marlene has them
