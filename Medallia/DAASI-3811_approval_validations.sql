@@ -9,10 +9,10 @@
 --   3. The tables gain one column, at the end. UAT (where the change is deployed) against PROD: same columns in
 --      the same order, plus LOYALTY last. The exports send every column of the file tables, so the daily files
 --      gain exactly that one column, at the end.
---   4. Nothing else is affected. Lists everything else in PROD that reads the five tables: views, dynamic
---      tables, streams, other procedures. A view written as SELECT * over a table stops working when the table
---      gains a column, so anything listed is looked at before the deploy. None listed is a PASS.
---   Every line of every result ends in PASS or INVESTIGATE (PASS or REVIEW on the fourth).
+--   4. Nothing else is affected. Step 1 lists everything else in PROD that reads the five tables: views,
+--      dynamic tables, streams, other procedures. A view written as SELECT * over a table stops working when
+--      the table gains a column, so step 2 shows how each one listed reads the tables.
+--   Every result line ends in PASS or INVESTIGATE. On the fourth it is PASS or REVIEW, then NOT AFFECTED or LOOK.
 --
 -- HOW IT IS DONE
 --   OLD code = the three Medallia procedures as PROD runs them today.
@@ -1550,6 +1550,7 @@ ORDER BY CHECKED_ROWS;
 --   PASS = every PROD column is unchanged in UAT, and UAT has one more: LOYALTY, in the last position.
 -- The export tasks send every column of the two file tables in table order, so this is also what happens to the
 -- daily files: the same columns in the same order, plus LOYALTY at the end.
+-- It reads the column catalogue of both databases and took about seven minutes on 11/21.
 WITH PROD_COLS AS (
     SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE
     FROM DAAS_PROD.INFORMATION_SCHEMA.COLUMNS
@@ -1656,7 +1657,89 @@ ORDER BY 1;
 
 
 -- ===========================================================================================================
--- CLEAN-UP. Run when you have the four results.
+-- VALIDATION 4, STEP 2. How each object that step 1 listed reads the tables. Needs no set-up.
+-- ===========================================================================================================
+
+-- One line for every object that step 1 listed, with three counts taken from its own text.
+--   ASTERISKS: asterisks in its text, COUNT(*) aside. With none, it cannot hold a SELECT * of any kind, so it
+--   names every column it reads.
+--   INSERTS and INSERTS_NAMING_COLUMNS: how many INSERT statements it has, and how many of those list the
+--   columns they fill.
+--   NOT AFFECTED = no asterisk, and every insert lists its columns. An object like that reads and writes the same
+--   columns after a table gains one, so the new column cannot reach it or break it.
+--   LOOK = one of those is not so, which can be harmless (an asterisk used to multiply, the word insert in a
+--   comment). TEXT NOT SHOWN = this role is not shown the object's text. Send me the result for either.
+-- LAST_CHANGED is the day the object was last altered.
+WITH TABLES_CHANGED AS (
+    SELECT 'DAAS_CORE' AS TABLE_SCHEMA, 'MEDALLIA_V_CUSTOMER_INVITATION_HOTEL' AS TABLE_NAME
+    UNION ALL SELECT 'DAAS_CORE', 'MEDALLIA_V_CUSTOMER_INVITATION_COMPLETE'
+    UNION ALL SELECT 'DAAS_CORE', 'MEDALLIA_V_CUSTOMER_INVITATION_ARCHIVE'
+    UNION ALL SELECT 'HPDB', 'MEDALLIA_PROSPECT_INVITATION_FILE'
+    UNION ALL SELECT 'HPDB', 'MEDALLIA_PROSPECT_INVITATION_FILE_ARCHIVE'
+),
+LISTED_IN_STEP_1 AS (
+    SELECT DISTINCT D.REFERENCING_OBJECT_DOMAIN AS OBJECT_KIND,
+           D.REFERENCING_DATABASE AS OBJECT_DATABASE,
+           D.REFERENCING_SCHEMA AS OBJECT_SCHEMA,
+           D.REFERENCING_OBJECT_NAME AS OBJECT_NAME
+    FROM TABLES_CHANGED T
+    JOIN SNOWFLAKE.ACCOUNT_USAGE.OBJECT_DEPENDENCIES D
+        ON D.REFERENCED_DATABASE = 'DAAS_PROD'
+        AND D.REFERENCED_SCHEMA = T.TABLE_SCHEMA
+        AND D.REFERENCED_OBJECT_NAME = T.TABLE_NAME
+),
+OBJECT_TEXT AS (
+    SELECT L.OBJECT_KIND || ' ' || L.OBJECT_DATABASE || '.' || L.OBJECT_SCHEMA || '.' || L.OBJECT_NAME AS LISTED_OBJECT,
+           V.LAST_ALTERED AS LAST_ALTERED,
+           V.VIEW_DEFINITION AS FULL_TEXT
+    FROM LISTED_IN_STEP_1 L
+    LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.VIEWS V
+        ON V.TABLE_CATALOG = L.OBJECT_DATABASE
+        AND V.TABLE_SCHEMA = L.OBJECT_SCHEMA
+        AND V.TABLE_NAME = L.OBJECT_NAME
+        AND V.DELETED IS NULL
+    UNION ALL
+    SELECT DISTINCT 'PROCEDURE ' || P.PROCEDURE_CATALOG || '.' || P.PROCEDURE_SCHEMA || '.' || P.PROCEDURE_NAME,
+           P.LAST_ALTERED,
+           P.PROCEDURE_DEFINITION
+    FROM TABLES_CHANGED T
+    JOIN SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES P
+        ON CONTAINS(UPPER(P.PROCEDURE_DEFINITION), T.TABLE_NAME)
+    WHERE P.DELETED IS NULL
+    AND P.PROCEDURE_CATALOG = 'DAAS_PROD'
+    AND NOT (P.PROCEDURE_SCHEMA = 'DAAS_COMMON' AND P.PROCEDURE_NAME IN ('MEDALLIA_V_CUSTOMER_INVITATION_HOTEL_PROC',
+                                                                        'MEDALLIA_V_CUSTOMER_INVITATION_COMPLETE_PROC'))
+    AND NOT (P.PROCEDURE_SCHEMA = 'HPDB' AND P.PROCEDURE_NAME = 'MEDALLIA_PROSPECT_INVITATION_FILE_PROC')
+),
+ON_ONE_LINE AS (
+    SELECT LISTED_OBJECT,
+           TO_DATE(LAST_ALTERED) AS LAST_CHANGED,
+           TRANSLATE(FULL_TEXT, CHAR(9) || CHAR(10) || CHAR(13), '   ') AS FLAT_TEXT
+    FROM OBJECT_TEXT
+),
+COUNTED AS (
+    SELECT LISTED_OBJECT,
+           LAST_CHANGED,
+           REGEXP_COUNT(FLAT_TEXT, '[*]') - REGEXP_COUNT(FLAT_TEXT, 'COUNT *[(] *[*] *[)]', 1, 'i') AS ASTERISKS,
+           REGEXP_COUNT(FLAT_TEXT, 'INSERT ', 1, 'i') AS INSERTS,
+           REGEXP_COUNT(FLAT_TEXT,
+                        'INSERT +(OVERWRITE +)?INTO +[A-Za-z0-9_.]+ *[(] *[A-Za-z0-9_"]+ *[,)]',
+                        1, 'i') AS INSERTS_NAMING_COLUMNS
+    FROM ON_ONE_LINE
+)
+SELECT LISTED_OBJECT,
+       LAST_CHANGED,
+       ASTERISKS,
+       INSERTS,
+       INSERTS_NAMING_COLUMNS,
+       IFF(ASTERISKS IS NULL, 'TEXT NOT SHOWN',
+           IFF(ASTERISKS = 0 AND INSERTS = INSERTS_NAMING_COLUMNS, 'NOT AFFECTED', 'LOOK')) AS RESULT
+FROM COUNTED
+ORDER BY LISTED_OBJECT;
+
+
+-- ===========================================================================================================
+-- CLEAN-UP. Run when you have the results.
 -- ===========================================================================================================
 
 DROP TABLE IF EXISTS DAAS_PROD.DAAS_TEMP_WORK.T3811_OLD_INVITATION_HOTEL;
